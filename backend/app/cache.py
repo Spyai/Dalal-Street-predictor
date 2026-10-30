@@ -22,9 +22,9 @@ KV = redis.Redis | PostgresKV
 def get_kv() -> KV:
     s = get_settings()
     if s.kv_backend == "postgres":
-        from app.db import get_engine
+        from app.db import get_kv_engine
 
-        return PostgresKV(get_engine())
+        return PostgresKV(get_kv_engine())
     return redis.Redis.from_url(
         s.cache_url,
         decode_responses=True,

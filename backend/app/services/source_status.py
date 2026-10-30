@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
+from sqlalchemy.orm import Session
 
 from app.db import session_scope
 from app.logging import get_logger
@@ -79,7 +80,10 @@ def mark_error(source: str, err: Exception) -> None:
     log.warning("source_error", source=source, status=status, error=str(err))
 
 
-def all_statuses() -> dict[str, SourceStatus]:
-    with session_scope() as db:
-        rows = db.scalars(select(SourceStatus)).all()
-        return {r.source: r for r in rows}
+def all_statuses(db: Session | None = None) -> dict[str, SourceStatus]:
+    """Pass the caller's session when there is one: a second connection per request can
+    exhaust a small serverless pool."""
+    if db is not None:
+        return {r.source: r for r in db.scalars(select(SourceStatus)).all()}
+    with session_scope() as own:
+        return {r.source: r for r in own.scalars(select(SourceStatus)).all()}

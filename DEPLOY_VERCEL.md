@@ -14,12 +14,13 @@ at ₹0/month. A GitHub Actions workflow does the setup; you add one token.
 4. **Run the deploy.** Repo → **Actions → Deploy to Vercel**, open the latest run →
    **Re-run all jobs** (or **Run workflow** once it's on `main`). It takes about 5 minutes,
    and the run's **Summary** shows your link.
-5. **Create your login.** Vercel → **dalal-api → Settings → Environment Variables** → copy
+5. **Create your login.** Vercel → **dalal-streetpredictor → Settings → Environment Variables** → copy
    `SETUP_TOKEN`, then open `https://<your link>/setup?token=<SETUP_TOKEN>`. Choose a username
    and a 12+ character password, and scan the QR code with an authenticator app.
-6. **Add your keys** (Kite, Telegram; see SETUP.md §1 and §3) in **dalal-api → Settings →
-   Environment Variables**, set the Kite redirect URL to `https://<your link>/api/kite/callback`,
-   and re-run the deploy so the API picks them up.
+6. **Add your keys** (Kite, Telegram; see SETUP.md §1 and §3) in **dalal-streetpredictor →
+   Settings → Environment Variables**, for Production and Preview. Leave **Sensitive** off: the
+   scheduled jobs read these values, and Vercel won't hand out Sensitive ones. Set the Kite
+   redirect URL to `https://<your link>/api/kite/callback`, and re-run the deploy.
 7. **Merge the PR into `main`.** GitHub only runs scheduled workflows from the default
    branch, so the daily jobs start then. Pushes to `main` redeploy automatically.
 
@@ -27,8 +28,8 @@ at ₹0/month. A GitHub Actions workflow does the setup; you add one token.
 
 | Step | First run | Later runs |
 |---|---|---|
-| Projects | creates `dalal-api` (from `backend/`) and `dalal` (from `frontend/`) | reuses them |
-| Database | creates a free Neon Postgres (`dalal-db`) and connects it to `dalal-api` | reuses it |
+| Projects | uses `dalal-street-predictor` for the web app (`frontend/`) and `dalal-streetpredictor` for the API (`backend/`), the two projects already imported from this repo, creating them if missing; sets each one's Root Directory so Vercel's own Git builds match | same |
+| Database | creates a free Neon Postgres (`dalal-db`) and connects it to the API project | reuses it |
 | Secrets | generates `SECRET_KEY` and `SETUP_TOKEN`, stored only in Vercel | never rotates them |
 | Migrations | runs `app.cli migrate` | same |
 | Deploy | API in the Vercel region next to the database, then the web app pointed at it | same |
@@ -36,8 +37,10 @@ at ₹0/month. A GitHub Actions workflow does the setup; you add one token.
 
 There's no Redis on this setup. Sessions, login throttling and rate limits use a small
 Postgres table instead (`app/kv.py`), so the database is the only extra service. The
-scheduled jobs (`dalal-jobs.yml`) read their settings from the `dalal-api` project with
-the same token, so every key lives in one place: Vercel's environment variables.
+scheduled jobs (`dalal-jobs.yml`) read their settings from the API project with
+the same token, so every key lives in one place: Vercel's environment variables. To use
+other project names, set the repository variables `DALAL_WEB_PROJECT` and
+`DALAL_API_PROJECT`.
 
 ## What you trade for free hosting
 
@@ -68,26 +71,27 @@ The workflow stops with a red run and a plain-English message in its Summary.
 |---|---|
 | "VERCEL_TOKEN isn't set" | Step 3 above |
 | "Couldn't create Vercel project" | The token expired or has the wrong scope. Make a new one |
-| "Couldn't create or connect the Neon database" | Vercel → `dalal-api` → Storage → Create Database → Neon (Free) → Connect, then re-run |
-| "SECRET_KEY … is marked Sensitive" | Someone marked it Sensitive in Vercel. The jobs need to read it |
-| "/healthz didn't answer" | Vercel → `dalal-api` → Logs shows the error |
-| Login page says "Can't reach the API" | Re-run the deploy; `BACKEND_URL` on `dalal` must point at `dalal-api` |
+| "Couldn't create or connect the Neon database" | Vercel → `dalal-streetpredictor` → Storage → Create Database → Neon (Free) → Connect, then re-run |
+| "… is stored as Sensitive" | Change that variable to a normal one with the same value. The jobs need to read it |
+| "/healthz didn't answer" | Vercel → `dalal-streetpredictor` → Logs shows the error |
+| Login page says "Can't reach the API" | Re-run the deploy; `BACKEND_URL` on `dalal-street-predictor` must point at the API project |
 
 ## The manual way (Vercel dashboard)
 
-If you'd rather click than run the workflow:
+If you'd rather click than run the workflow, reuse the two projects you already imported:
 
-1. Vercel → **Add New → Project** → import this repo → name `dalal-api`, **Root Directory**
-   `backend`, Framework **Other**. Variables: `SECRET_KEY` (64 random chars), `SETUP_TOKEN`
-   (24+ random chars), `SCHEDULER_MODE=external`, `COOKIE_SECURE=true`. Deploy.
-2. `dalal-api` → **Storage → Create Database → Neon (Free)** → Connect → Redeploy.
+1. **dalal-streetpredictor** (the API) → Settings → General → **Root Directory** `backend`,
+   Framework **Other**. Environment Variables (Production + Preview, not Sensitive):
+   `SECRET_KEY` (64 random chars), `SETUP_TOKEN` (24+ random chars), `SCHEDULER_MODE=external`,
+   `COOKIE_SECURE=true`.
+2. Same project → **Storage → Create Database → Neon (Free)** → Connect.
 3. Run the migrations once. GitHub → Settings → Secrets → add `VERCEL_TOKEN`, then Actions →
    **Dalal jobs** → Run workflow → `migrate`. Or put `DATABASE_URL` (the unpooled Neon URL) and
    `SECRET_KEY` there as secrets instead.
-4. **Add New → Project** → same repo → name `dalal`, **Root Directory** `frontend`,
-   Framework **Next.js**, variable `BACKEND_URL` = the `dalal-api` URL. Deploy. That's your link.
-5. On `dalal-api`, add `APP_BASE_URL` = your link and redeploy. Then do steps 5 to 7 of the
-   short way.
+4. **dalal-street-predictor** (the web app) → **Root Directory** `frontend`, Framework
+   **Next.js**, variable `BACKEND_URL` = the API project's production URL.
+5. On the API project, add `APP_BASE_URL=https://dalal-street-predictor.vercel.app`. Redeploy
+   both, then do steps 5 to 7 of the short way.
 
 Vercel's Python functions may be up to 500 MB uncompressed
 ([Vercel KB](https://vercel.com/kb/guide/troubleshooting-function-250mb-limit)).

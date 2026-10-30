@@ -157,3 +157,62 @@ def test_empty_redis_url_does_not_select_redis(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.setenv("REDIS_URL", "")
     monkeypatch.delenv("KV_URL", raising=False)
     assert Settings().kv_backend == "postgres"
+
+
+def test_concurrent_requests_cannot_starve_kv_of_connections(
+    db: Session, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Regression: KV calls used the request pool, so requests holding a session while
+    making KV calls could exhaust it and wait on each other (seen as 30 s hangs, 401s)."""
+    import threading
+
+    from sqlalchemy import text
+
+    from app import cache
+    from app import db as app_db
+    from app.config import get_settings
+
+    monkeypatch.setenv("VERCEL", "1")
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    caches = (
+        get_settings,
+        app_db.get_engine,
+        app_db.get_kv_engine,
+        app_db.get_sessionmaker,
+        cache.get_kv,
+    )
+    for fn in caches:
+        fn.cache_clear()
+    try:
+        assert get_settings().kv_backend == "postgres"
+        kv_store = cache.get_kv()
+        assert isinstance(kv_store, PostgresKV)
+        assert kv_store._engine is not app_db.get_engine(), "KV must not share the request pool"
+        n = 12  # the request pool's full capacity (2 + 10 overflow)
+        held = threading.Barrier(n)
+        errors: list[BaseException] = []
+
+        def request(i: int) -> None:
+            session = app_db.get_sessionmaker()()
+            try:
+                session.execute(text("SELECT 1"))  # the request now holds a connection
+                held.wait(timeout=20)  # ...and so does every other request
+                kv_store.set(f"session:{i}", "1", ex=60)
+                assert kv_store.get(f"session:{i}") == "1"
+            except BaseException as exc:  # noqa: BLE001
+                errors.append(exc)
+            finally:
+                session.close()
+
+        threads = [threading.Thread(target=request, args=(i,)) for i in range(n)]
+        start = time.monotonic()
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=60)
+        assert not errors, errors
+        assert time.monotonic() - start < 15
+    finally:
+        monkeypatch.undo()
+        for fn in caches:
+            fn.cache_clear()

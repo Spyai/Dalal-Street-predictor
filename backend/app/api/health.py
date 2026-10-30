@@ -157,7 +157,7 @@ def health(
         hb = last_run
     else:
         alive = hb is not None and (datetime.now(UTC) - hb).total_seconds() < 180
-    statuses = all_statuses()
+    statuses = all_statuses(db)
     sources = [
         SourceHealthOut(
             source=name,

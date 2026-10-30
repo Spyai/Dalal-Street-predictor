@@ -100,12 +100,14 @@ def setup(body: SetupIn, db: Session = Depends(get_db), r: KV = Depends(kv_dep))
     expected = get_settings().setup_token
     if len(expected) < MIN_SETUP_TOKEN:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Web setup is off. Set SETUP_TOKEN.")
-    attempts = r.incr("auth:setup_attempts")
-    if attempts == 1:
-        r.expire("auth:setup_attempts", SETUP_WINDOW_SECONDS)
-    if attempts > SETUP_MAX_ATTEMPTS:
-        raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Too many setup attempts.")
+    # Only wrong tokens count, so strangers hammering the endpoint can't lock out the
+    # owner, who holds the right token. (128 random bits can't be brute-forced anyway.)
     if not secrets.compare_digest(body.token.encode(), expected.encode()):
+        attempts = r.incr("auth:setup_attempts")
+        if attempts == 1:
+            r.expire("auth:setup_attempts", SETUP_WINDOW_SECONDS)
+        if attempts > SETUP_MAX_ATTEMPTS:
+            raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Too many setup attempts.")
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Wrong setup token.")
     if _has_user(db):
         raise HTTPException(status.HTTP_409_CONFLICT, "Already set up. Log in instead.")

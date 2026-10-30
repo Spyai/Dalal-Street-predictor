@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import secrets
+import unicodedata
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -89,8 +90,15 @@ def authenticate(db: Session, r: KV, username: str, password: str, totp_code: st
     ok = user is not None and verify_password(user.password_hash, password)
     if ok and user is not None:
         totp = pyotp.TOTP(decrypt(user.totp_secret_enc))
-        code = totp_code.strip().replace(" ", "")
-        ok = totp.verify(code, valid_window=1)
+        # Canonical ASCII digits only. pyotp compares NFKC-normalised strings, so
+        # full-width digits would otherwise pass verify() under a different replay key.
+        code = unicodedata.normalize("NFKC", totp_code).strip().replace(" ", "")
+        ok = (
+            code.isascii()
+            and code.isdigit()
+            and len(code) == totp.digits
+            and totp.verify(code, valid_window=1)
+        )
         if ok:
             # Replay protection: each code (time-step) is single-use.
             step = int(datetime.now(UTC).timestamp() // totp.interval)

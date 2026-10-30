@@ -291,3 +291,101 @@ def test_workflows_pass_actionlint() -> None:
         text=True,
     )
     assert res.returncode == 0, res.stdout + res.stderr
+
+
+# ------------------------------------------- regressions from the adversarial review
+
+
+def test_deploy_json_output_is_parsed_not_tail_of_pretty_json(
+    migrated_db: None, fake_cli: dict[str, str]
+) -> None:
+    """`vercel deploy --non-interactive` prints pretty JSON; `tail -n 1` gave '}'."""
+    res = _deploy({**fake_cli, "FAKE_DOMAINS_FAIL": "1"})  # force the deploy-URL path
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert _var(fake_cli, "dalal", "BACKEND_URL") == "https://dalal-api-me.vercel.app"
+    assert _var(fake_cli, "dalal-api", "APP_BASE_URL") == "https://dalal-me.vercel.app"
+
+
+def test_failed_deploy_reports_vercels_error(migrated_db: None, fake_cli: dict[str, str]) -> None:
+    res = _deploy({**fake_cli, "FAKE_DEPLOY_FAIL": "dalal"})
+    assert res.returncode == 1
+    assert "::error::Vercel deploy of dalal failed: Build failed for dalal" in res.stdout
+    summary = Path(fake_cli["GITHUB_STEP_SUMMARY"]).read_text()
+    assert "pip resolution error" in summary
+
+
+def test_sensitive_database_url_falls_back_to_development(
+    migrated_db: None, fake_cli: dict[str, str]
+) -> None:
+    env = {**fake_cli, "FAKE_SENSITIVE": "DATABASE_URL,DATABASE_URL_UNPOOLED"}
+    res = _deploy(env)
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "Database migrated" in res.stdout
+
+
+def test_sensitive_secret_key_stops_without_regenerating(
+    migrated_db: None, fake_cli: dict[str, str]
+) -> None:
+    assert _deploy(fake_cli).returncode == 0
+    secret = _var(fake_cli, "dalal-api", "SECRET_KEY")
+    res = _deploy({**fake_cli, "FAKE_SENSITIVE": "SECRET_KEY"})
+    assert res.returncode == 1 and "SECRET_KEY on dalal-api is stored as Sensitive" in res.stdout
+    assert _var(fake_cli, "dalal-api", "SECRET_KEY") == secret, "must never rotate SECRET_KEY"
+    # The placeholder is never handed to anything as if it were the key.
+    assert "[SENSITIVE]" not in res.stdout.replace("stored as Sensitive", "")
+
+
+def test_jobs_fail_loudly_when_secret_key_is_sensitive(
+    migrated_db: None, fake_cli: dict[str, str]
+) -> None:
+    assert _deploy(fake_cli).returncode == 0
+    res, github_env, out = _jobs_env({**fake_cli, "FAKE_SENSITIVE": "SECRET_KEY"})
+    assert res.returncode == 4
+    assert "configured=true" not in out and "SECRET_KEY" not in github_env
+
+
+def test_jobs_skip_sensitive_optional_keys_with_warning(
+    migrated_db: None, fake_cli: dict[str, str]
+) -> None:
+    assert _deploy(fake_cli).returncode == 0
+    (Path(fake_cli["FAKE_STATE"]) / "env" / "dalal-api" / "KITE_API_KEY").write_text("kk-123")
+    res, github_env, out = _jobs_env({**fake_cli, "FAKE_SENSITIVE": "KITE_API_KEY"})
+    assert res.returncode == 0 and "configured=true" in out
+    assert "KITE_API_KEY" not in github_env
+    assert "Sensitive in Vercel, so not available to jobs: KITE_API_KEY" in res.stderr
+
+
+def test_private_identifiers_are_masked(tmp_path: Path) -> None:
+    f = tmp_path / ".env"
+    f.write_text('KITE_USER_ID="AB1234"\nTELEGRAM_CHAT_ID="987654321"\nWATCHLIST="INFY,TCS"\n')
+    out = subprocess.run(
+        [sys.executable, str(SCRIPTS / "vercel_env.py"), "mask", str(f)],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout
+    for value in ("AB1234", "987654321", "INFY,TCS"):
+        assert f"::add-mask::{value}" in out
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        ("", "CACHE_BACKEND=postgres"),
+        ('KV_URL="rediss://up"\n', "CACHE_BACKEND=redis"),
+        ('KV_URL="rediss://up"\nCACHE_BACKEND="postgres"\n', "CACHE_BACKEND=postgres"),
+    ],
+)
+def test_jobs_use_the_same_cache_backend_as_the_api(
+    tmp_path: Path, extra: str, expected: str
+) -> None:
+    f = tmp_path / ".env"
+    f.write_text('DATABASE_URL="postgres://x"\nSECRET_KEY="s"\n' + extra)
+    out = subprocess.run(
+        [sys.executable, str(SCRIPTS / "vercel_env.py"), "export", str(f)],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
+    assert expected in out
+    assert sum(line.startswith("CACHE_BACKEND=") for line in out) == 1

@@ -22,14 +22,22 @@ not_configured() {
 
 if [ -n "${VERCEL_TOKEN:-}" ]; then
   command -v vercel >/dev/null || npm install -g --silent --no-audit --no-fund "vercel@${VERCEL_CLI_VERSION:-64.5.0}" >/dev/null
-  vercel --token "$VERCEL_TOKEN" --non-interactive ${VERCEL_SCOPE:+--scope "$VERCEL_SCOPE"} \
-    env pull "$WORK/api.env" --environment production --project "$API" --yes >/dev/null \
+  vc() { vercel --token "$VERCEL_TOKEN" --non-interactive ${VERCEL_SCOPE:+--scope "$VERCEL_SCOPE"} "$@"; }
+  vc env pull "$WORK/api.env" --environment production --project "$API" --yes >/dev/null \
     || not_configured "Couldn't read settings from Vercel project $API. Run the 'Deploy to Vercel' workflow first."
-  python3 "$HERE/vercel_env.py" mask "$WORK/api.env"
-  if ! python3 "$HERE/vercel_env.py" export "$WORK/api.env" > "$WORK/export"; then
-    not_configured "Vercel project $API has no database yet. Run the 'Deploy to Vercel' workflow."
+  # Sensitive database URLs can't be pulled for production; use development's (same DB).
+  if vc env pull "$WORK/api-dev.env" --environment development --project "$API" --yes \
+    >/dev/null 2>&1; then
+    python3 "$HERE/vercel_env.py" fill "$WORK/api.env" "$WORK/api-dev.env"
   fi
-  cat "$WORK/export" >> "$ENV_OUT"
+  python3 "$HERE/vercel_env.py" mask "$WORK/api.env"
+  status=0
+  python3 "$HERE/vercel_env.py" export "$WORK/api.env" > "$WORK/export" || status=$?
+  case $status in
+    0) cat "$WORK/export" >> "$ENV_OUT" ;;
+    3) not_configured "Vercel project $API has no database yet. Run the 'Deploy to Vercel' workflow." ;;
+    *) exit "$status" ;;  # settings exist but are unreadable: a real misconfiguration
+  esac
 else
   [ -n "${GH_DATABASE_URL:-}" ] \
     || not_configured "Dalal isn't deployed yet (no VERCEL_TOKEN or DATABASE_URL secret); nothing to run."

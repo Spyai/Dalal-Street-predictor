@@ -61,7 +61,15 @@ class PostgresKV:
         nx: bool = False,
     ) -> bool | None:
         with self._tx() as c:
-            return self._set(c, key, value, ex=ex, px=px, nx=nx)
+            result = self._set(c, key, value, ex=ex, px=px, nx=nx)
+        # Housekeeping in its own transaction, so it never holds row locks another set()
+        # needs. Reads already ignore expired rows; this just keeps the table small.
+        try:
+            with self._tx() as c:
+                c.execute(text("DELETE FROM kv_entry WHERE expires_at <= now()"))
+        except KVError:
+            pass
+        return result
 
     def delete(self, *keys: str) -> int:
         with self._tx() as c:
@@ -130,8 +138,6 @@ class PostgresKV:
         nx: bool,
     ) -> bool | None:
         expiry, params = _expiry_sql(ex, px)
-        # Housekeeping: drop expired rows so the table stays small.
-        c.execute(text("DELETE FROM kv_entry WHERE expires_at <= now()"))
         guard = f" WHERE {EXPIRED}" if nx else ""
         row = c.execute(
             text(

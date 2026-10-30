@@ -210,6 +210,9 @@ def test_setup_attempts_are_rate_limited(
         for _ in range(11)
     ]
     assert codes[:10] == [403] * 10 and codes[10] == 429
+    # Strangers exhausting the limit must not lock out the owner, who has the token.
+    owner = client.post("/api/auth/setup", json={"token": TOKEN, "username": "me", "password": PW})
+    assert owner.status_code == 200, owner.text
 
 
 def test_health_external_scheduler_mode(

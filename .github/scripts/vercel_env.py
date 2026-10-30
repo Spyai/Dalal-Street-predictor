@@ -1,14 +1,21 @@
 """Helpers for the Vercel deploy and job workflows. Reads `vercel env pull` files
 without evaluating them in a shell, so values containing $ or quotes are safe.
 
-  vercel_env.py has FILE KEY              exit 0 if KEY is present (even if empty)
-  vercel_env.py get FILE KEY [KEY ...]    print the first non-empty value
-  vercel_env.py mask FILE                 print ::add-mask:: for secret-looking values
+  vercel_env.py has FILE KEY              exit 0 if KEY is present (even if Sensitive)
+  vercel_env.py get FILE KEY [KEY ...]    print the first readable value
+  vercel_env.py fill FILE FALLBACK        copy readable database URLs from FALLBACK into
+                                          FILE where FILE's are missing or Sensitive
+  vercel_env.py mask FILE                 print ::add-mask:: for private values
   vercel_env.py export FILE               print app settings as $GITHUB_ENV lines;
-                                          exit 3 if no database is configured
+                                          exit 3 if no database, 4 if it's unreadable
   vercel_env.py region FILE               Vercel region code closest to the database
   vercel_env.py domain < projects-domains.json
                                           print https://<production domain>
+  vercel_env.py deploy FILE               read `vercel deploy` JSON output: print the
+                                          production URL, or the error and exit 1
+
+`vercel env pull` writes the placeholder "[SENSITIVE]" for variables stored as
+Sensitive; those are treated as present but unreadable, never as real values.
 """
 
 from __future__ import annotations
@@ -19,7 +26,11 @@ import sys
 from pathlib import Path
 from urllib.parse import urlsplit
 
-SECRETISH = re.compile(r"SECRET|TOKEN|PASSWORD|KEY|URL|PG|POSTGRES|DATABASE|KV_|REDIS", re.I)
+SECRETISH = re.compile(
+    r"SECRET|TOKEN|PASSWORD|KEY|URL|PG|POSTGRES|DATABASE|KV_|REDIS|USER_ID|CHAT_ID|WATCHLIST",
+    re.I,
+)
+UNREADABLE = "[SENSITIVE]"
 # Public by design; masking them would hide your own link in the logs.
 PUBLIC = {"APP_BASE_URL", "BACKEND_URL"}
 
@@ -93,9 +104,14 @@ def parse(path: str) -> dict[str, str]:
     return out
 
 
+def readable(env: dict[str, str], key: str) -> str | None:
+    value = env.get(key)
+    return value if value and value != UNREADABLE else None
+
+
 def first(env: dict[str, str], keys: list[str]) -> str | None:
     for k in keys:
-        if env.get(k):
+        if readable(env, k):
             return env[k]
     return None
 
@@ -138,11 +154,32 @@ def production_domain(payload: dict[str, object]) -> str | None:
     return "https://" + str(min(pool, key=lambda d: len(str(d["name"])))["name"])
 
 
+def deploy_result(text: str) -> tuple[str | None, str]:
+    """(production URL or None, message) from `vercel deploy --non-interactive` output."""
+    try:
+        start = text.index("{")
+        payload = json.loads(text[start : text.rindex("}") + 1])
+    except ValueError:
+        return None, text.strip()[-500:] or "no output from vercel deploy"
+    message = str(payload.get("message") or payload.get("reason") or "")
+    if payload.get("status") != "ok":
+        return None, message or "vercel deploy failed"
+    deployment = payload.get("deployment") or {}
+    return deployment.get("productionUrl") or None, message
+
+
 def main(argv: list[str]) -> int:
     if len(argv) < 2:
         print(__doc__, file=sys.stderr)
         return 2
     cmd = argv[1]
+    if cmd == "deploy":
+        url, message = deploy_result(Path(argv[2]).read_text(encoding="utf-8"))
+        if url is None:
+            print(message, file=sys.stderr)
+            return 1
+        print(url)
+        return 0
     if cmd == "domain":
         found = production_domain(json.load(sys.stdin))
         if not found:
@@ -158,9 +195,18 @@ def main(argv: list[str]) -> int:
             return 1
         print(value)
         return 0
+    if cmd == "fill":
+        fallback = parse(argv[3])
+        filled = [k for k in DB_KEYS if not readable(env, k) and readable(fallback, k)]
+        if filled:
+            with Path(argv[2]).open("a", encoding="utf-8") as fh:
+                for k in filled:
+                    fh.write(f"{k}={json.dumps(fallback[k])}\n")
+            print(f"read {', '.join(filled)} from the development environment", file=sys.stderr)
+        return 0
     if cmd == "mask":
         for k, v in env.items():
-            if k not in PUBLIC and SECRETISH.search(k) and len(v) >= 6:
+            if k not in PUBLIC and v != UNREADABLE and SECRETISH.search(k) and len(v) >= 4:
                 for part in v.splitlines():
                     if part:
                         print(f"::add-mask::{part}")
@@ -171,11 +217,28 @@ def main(argv: list[str]) -> int:
     if cmd == "export":
         db = first(env, DB_KEYS)
         if not db:
+            if any(env.get(k) == UNREADABLE for k in DB_KEYS):
+                print("::error::The database URL is stored as Sensitive in Vercel, so jobs "
+                      "can't read it.", file=sys.stderr)
+                return 4
             return 3
+        hidden = [k for k in APP_KEYS if env.get(k) == UNREADABLE]
+        if "SECRET_KEY" in hidden:
+            print("::error::SECRET_KEY is stored as Sensitive in Vercel, so jobs can't read it.",
+                  file=sys.stderr)
+            return 4
+        if hidden:
+            print(f"::warning::Sensitive in Vercel, so not available to jobs: {', '.join(hidden)}",
+                  file=sys.stderr)
         lines = [env_line("DATABASE_URL", db)]
-        lines += [env_line(k, env[k]) for k in APP_KEYS if env.get(k)]
-        if not (env.get("REDIS_URL") or env.get("KV_URL")):
-            lines.append("CACHE_BACKEND=postgres")
+        lines += [env_line(k, env[k]) for k in APP_KEYS if readable(env, k)]
+        # Same choice Settings.kv_backend makes on Vercel, so jobs and the API share one
+        # store (NSE throttle slots and block cooldowns live there).
+        forced = (readable(env, "CACHE_BACKEND") or "").strip().lower()
+        if forced not in {"redis", "postgres"}:
+            has_redis = readable(env, "REDIS_URL") or readable(env, "KV_URL")
+            forced = "redis" if has_redis else "postgres"
+        lines.append(f"CACHE_BACKEND={forced}")
         print("\n".join(lines))
         return 0
     print(f"unknown command {cmd}", file=sys.stderr)

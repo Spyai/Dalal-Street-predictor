@@ -10,6 +10,9 @@
 # Needs VERCEL_TOKEN. Optional: VERCEL_SCOPE (team slug), DALAL_API_PROJECT,
 # DALAL_WEB_PROJECT (existing projects are reused and re-pointed at backend/ and
 # frontend/), DALAL_DB_NAME, DALAL_SKIP_HEALTHCHECK=1 (local tests only).
+#
+# Helpers set variables rather than echoing results through $(...): fail() inside a
+# command substitution would swallow its own error message.
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
@@ -36,17 +39,26 @@ fail() {
   exit 1
 }
 
+# Production settings of the API project in $WORK/api.env. Database URLs stored as
+# Sensitive can't be pulled for production; the development environment (which the
+# Neon integration also connects) is used for those instead.
 pull_api_env() {
-  vc env pull "$WORK/api.env" --environment production --project "$API" --yes >/dev/null
+  vc env pull "$WORK/api.env" --environment production --project "$API" --yes >/dev/null \
+    || fail "Couldn't read environment variables of Vercel project $API."
+  if vc env pull "$WORK/api-dev.env" --environment development --project "$API" --yes \
+    >/dev/null 2>&1; then
+    py fill "$WORK/api.env" "$WORK/api-dev.env"
+  fi
   py mask "$WORK/api.env"
 }
 
-# set_var NAME VALUE PROJECT [--force]. Stored as readable config (not "Sensitive"),
+# set_var NAME VALUE PROJECT [--force]. Stored as readable config (not Sensitive),
 # because the scheduled jobs pull these values to run.
 set_var() {
   local name=$1 value=$2 project=$3
   shift 3
-  vc env add "$name" "$TARGETS" --value "$value" --project "$project" --no-sensitive --yes "$@" >/dev/null
+  vc env add "$name" "$TARGETS" --value "$value" --project "$project" --no-sensitive --yes "$@" \
+    >/dev/null || fail "Couldn't set $name on Vercel project $project."
 }
 
 ensure_project() {
@@ -69,21 +81,32 @@ configure_project() { # PROJECT ROOT_DIR FRAMEWORK
   echo "project $1: root directory $2, framework $3"
 }
 
-prod_url() { # PROJECT FALLBACK_URL
-  local found
-  if found=$(vc api "/v9/projects/$1/domains" --raw 2>/dev/null | py domain); then
-    echo "$found"
-  else
-    echo "::warning::Couldn't read the production domain of $1; using the deployment URL." >&2
-    echo "$2"
+# deploy PROJECT [flags...]: sets DEPLOYED_URL to the production URL Vercel reports.
+# Deploys from the repo root: Vercel applies the project's Root Directory itself.
+deploy() {
+  local project=$1 out="$WORK/deploy-$1.json"
+  shift
+  if ! vc deploy "$ROOT" --prod --yes --project "$project" "$@" >"$out" 2>"$out.err"; then
+    cat "$out.err" >&2 || true
+    fail "Vercel deploy of $project failed: $(py deploy "$out" 2>&1 >/dev/null || true)"
+  fi
+  if ! DEPLOYED_URL=$(py deploy "$out" 2>"$out.msg"); then
+    DEPLOYED_URL=""
+    echo "::warning::$project deployed but Vercel reported no production URL: $(cat "$out.msg")"
   fi
 }
 
-deploy() { # PROJECT [vercel deploy flags...]; prints the deployment URL
-  # Deploy from the repo root: Vercel applies the project's Root Directory itself.
-  local project=$1
-  shift
-  vc deploy "$ROOT" --prod --yes --project "$project" "$@" | tail -n 1
+# prod_url PROJECT DEPLOY_REPORTED_URL: sets PROD_URL. Never falls back to a
+# per-deployment URL, which sits behind Vercel Authentication.
+prod_url() {
+  local found
+  if found=$(vc api "/v9/projects/$1/domains" --raw 2>/dev/null | py domain); then
+    PROD_URL=$found
+  elif [ -n "$2" ]; then
+    PROD_URL=$2
+  else
+    fail "Couldn't find the production domain of $1. Open Vercel → $1 → Settings → Domains, then re-run."
+  fi
 }
 
 step "Projects"
@@ -95,6 +118,9 @@ configure_project "$WEB" frontend nextjs
 step "Database"
 pull_api_env
 if ! py get "$WORK/api.env" DATABASE_URL POSTGRES_URL >/dev/null; then
+  if py has "$WORK/api.env" DATABASE_URL || py has "$WORK/api.env" POSTGRES_URL; then
+    fail "$API has a database, but its URL is stored as Sensitive, so this workflow can't run migrations. In Vercel → $API → Settings → Environment Variables, make DATABASE_URL non-sensitive (or re-add it), then re-run."
+  fi
   echo "No database on $API yet; creating a free Neon Postgres database ($DB_NAME)."
   vc integration accept-terms neon --yes >/dev/null 2>&1 || true
   vc integration add neon --name "$DB_NAME" --no-connect --no-env-pull \
@@ -105,7 +131,7 @@ if ! py get "$WORK/api.env" DATABASE_URL POSTGRES_URL >/dev/null; then
   fi
   pull_api_env
   py get "$WORK/api.env" DATABASE_URL POSTGRES_URL >/dev/null \
-    || fail "Neon was connected but no DATABASE_URL reached $API. Check $API → Storage in Vercel, then re-run."
+    || fail "Neon was connected but no readable DATABASE_URL reached $API. Check $API → Storage in Vercel, then re-run."
 fi
 echo "database: connected"
 
@@ -128,11 +154,12 @@ set_var SCHEDULER_MODE external "$API" --force
 set_var COOKIE_SECURE true "$API" --force
 pull_api_env
 SECRET=$(py get "$WORK/api.env" SECRET_KEY) \
-  || fail "SECRET_KEY on $API is marked Sensitive, so scheduled jobs can't read it. In Vercel → $API → Settings → Environment Variables, delete SECRET_KEY only if you haven't created your login yet, then re-run."
+  || fail "SECRET_KEY on $API is stored as Sensitive, so scheduled jobs can't read it. In Vercel → $API → Settings → Environment Variables, change it to a normal variable with the same value, then re-run."
 
 step "Migrate"
 DB=$(py get "$WORK/api.env" DATABASE_URL_UNPOOLED POSTGRES_URL_NON_POOLING DATABASE_URL POSTGRES_URL)
-(cd "$ROOT/backend" && DATABASE_URL="$DB" SECRET_KEY="$SECRET" python -m app.cli migrate)
+(cd "$ROOT/backend" && DATABASE_URL="$DB" SECRET_KEY="$SECRET" python -m app.cli migrate) \
+  || fail "Database migration failed; see the log above."
 
 step "Deploy API"
 REGION=$(py region "$WORK/api.env")
@@ -140,20 +167,22 @@ echo "functions region: $REGION (next to the database)"
 # Same region for Vercel's own Git builds (best effort; the deploy flag is what counts).
 vc api "/v9/projects/$API" -X PATCH -f "serverlessFunctionRegion=$REGION" >/dev/null 2>&1 \
   || echo "::warning::Couldn't set the default function region on $API; Git builds may use iad1."
-API_DEPLOY=$(deploy "$API" --regions "$REGION")
-API_URL=$(prod_url "$API" "$API_DEPLOY")
+deploy "$API" --regions "$REGION"
+prod_url "$API" "$DEPLOYED_URL"
+API_URL=$PROD_URL
 echo "API: $API_URL"
 
 step "Deploy web"
 set_var BACKEND_URL "$API_URL" "$WEB" --force
-WEB_DEPLOY=$(deploy "$WEB" --build-env "BACKEND_URL=$API_URL")
-WEB_URL=$(prod_url "$WEB" "$WEB_DEPLOY")
+deploy "$WEB" --build-env "BACKEND_URL=$API_URL"
+prod_url "$WEB" "$DEPLOYED_URL"
+WEB_URL=$PROD_URL
 echo "web: $WEB_URL"
 
 if [ "$(py get "$WORK/api.env" APP_BASE_URL || true)" != "$WEB_URL" ]; then
   step "Point the API at the web URL"
   set_var APP_BASE_URL "$WEB_URL" "$API" --force
-  deploy "$API" --regions "$REGION" >/dev/null
+  deploy "$API" --regions "$REGION"
 fi
 
 NEEDS_SETUP=unknown
@@ -190,9 +219,11 @@ echo "url=$WEB_URL" >> "$OUTPUT"
   fi
   echo "**Next:**"
   echo "- Kite developer console → Redirect URL: \`$WEB_URL/api/kite/callback\`"
-  echo "- Add \`KITE_API_KEY\`, \`KITE_API_SECRET\`, \`KITE_USER_ID\`, \`TELEGRAM_BOT_TOKEN\`, \`TELEGRAM_CHAT_ID\` in **$API → Settings → Environment Variables**, then re-run this workflow."
+  echo "- Add \`KITE_API_KEY\`, \`KITE_API_SECRET\`, \`KITE_USER_ID\`, \`TELEGRAM_BOT_TOKEN\`, \`TELEGRAM_CHAT_ID\` in **$API → Settings → Environment Variables** (as normal, not Sensitive, so the scheduled jobs can read them), then re-run this workflow."
   echo "- Scheduled jobs start once this branch is merged into \`main\` (GitHub only runs schedules there)."
 } >> "$SUMMARY"
-[ "$NEW_SETUP_TOKEN" = 1 ] && echo "A new SETUP_TOKEN was created; it's in Vercel, not in this log."
+if [ "$NEW_SETUP_TOKEN" = 1 ]; then
+  echo "A new SETUP_TOKEN was created; it's in Vercel, not in this log."
+fi
 echo
 echo "Dalal: $WEB_URL"

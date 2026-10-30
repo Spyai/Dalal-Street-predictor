@@ -80,3 +80,17 @@ def test_sessions(db: Session) -> None:
     assert auth.resolve_session(r, "forged") is None
     auth.destroy_session(r, tok)
     assert auth.resolve_session(r, tok) is None
+
+
+def test_totp_replay_cannot_use_unicode_lookalike_digits(db: Session) -> None:
+    """Regression: pyotp NFKC-normalises codes, so full-width digits of a used code
+    passed verify() under a different replay key."""
+    _, totp = _setup(db)
+    r = get_kv()
+    code = totp.now()
+    auth.authenticate(db, r, "me", PW, code)
+    fullwidth = "".join(chr(ord(ch) - ord("0") + 0xFF10) for ch in code)
+    with pytest.raises(auth.InvalidCredentials):
+        auth.authenticate(db, r, "me", PW, fullwidth)
+    with pytest.raises(auth.InvalidCredentials):
+        auth.authenticate(db, r, "me", PW, code)
