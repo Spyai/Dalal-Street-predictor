@@ -1,0 +1,88 @@
+@import "tailwindcss";
+
+/* Dark is the default. Light is opt-in via the toggle (data-theme="light"). */
+:root {
+  --bg: #0a0e13;
+  --panel: #11171f;
+  --panel-2: #161e28;
+  --border: #1f2a37;
+  --text: #e6e9ee;
+  --muted: #8a97a8;
+  --faint: #5b6778;
+  --accent: #7aa2f7;
+  --up: #22c55e;
+  --down: #f05252;
+  --warn: #f2a93b;
+  --grid: #18212c;
+  color-scheme: dark;
+}
+
+:root[data-theme="light"] {
+  --bg: #f6f7f9;
+  --panel: #ffffff;
+  --panel-2: #f1f3f6;
+  --border: #dde2e8;
+  --text: #121820;
+  --muted: #5b6676;
+  --faint: #8c96a3;
+  --accent: #3360d6;
+  --up: #15803d;
+  --down: #c62828;
+  --warn: #b45309;
+  --grid: #eef1f4;
+  color-scheme: light;
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-panel: var(--panel);
+  --color-panel-2: var(--panel-2);
+  --color-line: var(--border);
+  --color-fg: var(--text);
+  --color-muted: var(--muted);
+  --color-faint: var(--faint);
+  --color-accent: var(--accent);
+  --color-up: var(--up);
+  --color-down: var(--down);
+  --color-warn: var(--warn);
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue",
+    Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+html,
+body {
+  background: var(--bg);
+  color: var(--text);
+}
+
+body {
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+.num {
+  font-variant-numeric: tabular-nums;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+.label {
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+a {
+  color: inherit;
+}
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
