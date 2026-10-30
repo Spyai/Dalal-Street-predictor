@@ -9,8 +9,8 @@ from fastapi import APIRouter, Depends
 from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
-from app.api.deps import current_user, redis_dep
-from app.cache import HEARTBEAT_KEY
+from app.api.deps import current_user, kv_dep
+from app.cache import HEARTBEAT_KEY, KV
 from app.config import IST, get_settings
 from app.db import get_db
 from app.jobs.definitions import job_specs
@@ -141,7 +141,7 @@ def _fresh(name: str, latest: object, expected: object) -> FreshnessOut:
 @router.get("/api/health", response_model=HealthOut)
 def health(
     db: Session = Depends(get_db),
-    r: redis.Redis = Depends(redis_dep),
+    r: KV = Depends(kv_dep),
     _: AppUser = Depends(current_user),
 ) -> HealthOut:
     try:
@@ -179,6 +179,7 @@ def health(
         scheduler_heartbeat=hb,
         database="ok",
         redis=redis_state,
+        cache_backend=get_settings().kv_backend,
         jobs=_jobs(db),
         sources=sources,
         freshness=_freshness(db, cal),

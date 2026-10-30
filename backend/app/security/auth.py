@@ -19,6 +19,7 @@ from argon2.exceptions import InvalidHashError, VerifyMismatchError
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.cache import KV
 from app.models import AppUser
 from app.security.crypto import decrypt, encrypt
 
@@ -78,9 +79,7 @@ def _fail_key(username: str) -> str:
     return f"auth:fail:{username.lower()}"
 
 
-def authenticate(
-    db: Session, r: redis.Redis, username: str, password: str, totp_code: str
-) -> AppUser:
+def authenticate(db: Session, r: KV, username: str, password: str, totp_code: str) -> AppUser:
     fail_key = _fail_key(username)
     failures = int(r.get(fail_key) or 0)
     if failures >= MAX_FAILURES:
@@ -110,13 +109,13 @@ def authenticate(
     return user
 
 
-def create_session(r: redis.Redis, user_id: int, ttl_hours: int) -> str:
+def create_session(r: KV, user_id: int, ttl_hours: int) -> str:
     token = secrets.token_urlsafe(32)
     r.set(f"session:{token}", str(user_id), ex=ttl_hours * 3600)
     return token
 
 
-def resolve_session(r: redis.Redis, token: str | None) -> int | None:
+def resolve_session(r: KV, token: str | None) -> int | None:
     if not token:
         return None
     try:
@@ -126,6 +125,6 @@ def resolve_session(r: redis.Redis, token: str | None) -> int | None:
     return int(raw) if raw else None
 
 
-def destroy_session(r: redis.Redis, token: str | None) -> None:
+def destroy_session(r: KV, token: str | None) -> None:
     if token:
         r.delete(f"session:{token}")

@@ -2,23 +2,22 @@
 
 from __future__ import annotations
 
-import redis
 from fastapi import Cookie, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
-from app.cache import get_redis
+from app.cache import KV, get_kv
 from app.db import get_db
 from app.models import AppUser
 from app.security.auth import SESSION_COOKIE, resolve_session
 
 
-def redis_dep() -> redis.Redis:
-    return get_redis()
+def kv_dep() -> KV:
+    return get_kv()
 
 
 def current_user(
     db: Session = Depends(get_db),
-    r: redis.Redis = Depends(redis_dep),
+    r: KV = Depends(kv_dep),
     session_token: str | None = Cookie(default=None, alias=SESSION_COOKIE),
 ) -> AppUser:
     user_id = resolve_session(r, session_token)
@@ -30,7 +29,7 @@ def current_user(
 
 def optional_user(
     db: Session = Depends(get_db),
-    r: redis.Redis = Depends(redis_dep),
+    r: KV = Depends(kv_dep),
     session_token: str | None = Cookie(default=None, alias=SESSION_COOKIE),
 ) -> AppUser | None:
     user_id = resolve_session(r, session_token)

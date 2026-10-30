@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     postgres_host: str = "db"
     postgres_port: int = 5432
     redis_url: str = "redis://redis:6379/0"
+    # auto: Redis, except on Vercel with no REDIS_URL/KV_URL, where a Postgres table is
+    # used instead (see app/kv.py). Or force "redis" / "postgres".
+    cache_backend: str = "auto"
 
     # Broker
     broker: str = "kite"
@@ -106,9 +109,21 @@ class Settings(BaseSettings):
 
     @property
     def cache_url(self) -> str:
-        if "redis_url" in self.model_fields_set or not self.kv_url:
+        if self._redis_url_given or not self.kv_url:
             return self.redis_url
         return self.kv_url
+
+    @property
+    def _redis_url_given(self) -> bool:
+        # An empty REDIS_URL (e.g. an unset GitHub secret) counts as not given.
+        return "redis_url" in self.model_fields_set and bool(self.redis_url)
+
+    @property
+    def kv_backend(self) -> str:
+        if self.cache_backend in {"redis", "postgres"}:
+            return self.cache_backend
+        explicit_redis = self._redis_url_given or bool(self.kv_url)
+        return "postgres" if self.is_serverless and not explicit_redis else "redis"
 
     @property
     def is_serverless(self) -> bool:

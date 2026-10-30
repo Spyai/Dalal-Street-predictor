@@ -9,7 +9,7 @@ from apscheduler.events import EVENT_JOB_ERROR, JobExecutionEvent
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from app.cache import HEARTBEAT_KEY, get_redis
+from app.cache import HEARTBEAT_KEY, get_kv
 from app.config import IST, get_settings
 from app.db import session_scope
 from app.jobs.definitions import get_spec, job_specs
@@ -22,7 +22,7 @@ log = get_logger(__name__)
 
 def heartbeat() -> None:
     try:
-        get_redis().set(HEARTBEAT_KEY, datetime.now(UTC).isoformat(), ex=300)
+        get_kv().set(HEARTBEAT_KEY, datetime.now(UTC).isoformat(), ex=300)
     except Exception as exc:
         log.warning("heartbeat_failed", error=str(exc))
 

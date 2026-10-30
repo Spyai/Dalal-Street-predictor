@@ -86,13 +86,13 @@ def db(migrated_db: None) -> Iterator[object]:
     """A clean database + Redis for each test."""
     from sqlalchemy import text
 
-    from app.cache import get_redis
+    from app.cache import get_kv
     from app.db import Base, get_engine, get_sessionmaker
 
     tables = ", ".join(f'"{t.name}"' for t in Base.metadata.sorted_tables)
     with get_engine().begin() as conn:
         conn.execute(text(f"TRUNCATE {tables} RESTART IDENTITY CASCADE"))
-    get_redis().flushdb()
+    get_kv().flushdb()
     session = get_sessionmaker()()
     try:
         yield session

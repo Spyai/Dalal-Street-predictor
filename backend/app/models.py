@@ -190,6 +190,16 @@ class SourceStatus(Base):
     )
 
 
+class KVEntry(Base):
+    """Key-value rows for hosts without Redis (see app/kv.py)."""
+
+    __tablename__ = "kv_entry"
+
+    key: Mapped[str] = mapped_column(String(512), primary_key=True)
+    value: Mapped[str] = mapped_column(Text)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), index=True)
+
+
 class KiteSession(Base):
     """Daily Kite access token (Fernet-encrypted). Expires ~06:00 IST next day."""
 

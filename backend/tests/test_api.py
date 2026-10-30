@@ -10,7 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
-from app.cache import get_redis
+from app.cache import get_kv
 from app.main import app
 from app.providers.base import Bar
 from app.security.auth import create_user
@@ -121,7 +121,7 @@ def _seed_bars(db: Session, symbol: str, n: int = 400) -> date:
 def test_stock_page_returns_candles_indicators_levels(db: Session, logged_in: TestClient) -> None:
     last_day = _seed_bars(db, "TESTCO", n=600)
     # Pretend we fetched recently so the endpoint doesn't call any provider.
-    get_redis().set("stockfetch:NSE:TESTCO", "1", ex=60)
+    get_kv().set("stockfetch:NSE:TESTCO", "1", ex=60)
     body = logged_in.get("/api/stocks/NSE/TESTCO?range=1y").json()
     assert body["instrument"]["symbol"] == "TESTCO"
     assert body["candles"] and body["candles"][-1]["time"] == last_day.isoformat()
@@ -227,3 +227,38 @@ def test_health_external_scheduler_mode(
     assert body["scheduler_alive"] is True
     cues = next(j for j in body["jobs"] if j["name"] == "global_cues_refresh")
     assert "GitHub Actions" in cues["schedule"]
+
+
+def test_full_login_flow_on_postgres_kv(
+    db: Session, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sessions, TOTP replay and lockout work with no Redis at all (the Vercel setup)."""
+    from app.cache import get_kv
+    from app.config import get_settings
+    from app.kv import PostgresKV
+
+    monkeypatch.setattr(get_settings(), "cache_backend", "postgres")
+    get_kv.cache_clear()
+    try:
+        assert isinstance(get_kv(), PostgresKV)
+        new = create_user(db, "me", PW)
+        db.commit()
+        code = pyotp.TOTP(new.totp_secret).now()
+        ok = client.post("/api/auth/login", json={"username": "me", "password": PW, "totp": code})
+        assert ok.status_code == 200
+        assert client.get("/api/auth/me").json() == {"username": "me"}
+        client.cookies.clear()
+        replay = client.post(
+            "/api/auth/login", json={"username": "me", "password": PW, "totp": code}
+        )
+        assert replay.status_code == 401, "a TOTP code works once"
+        for _ in range(5):
+            client.post(
+                "/api/auth/login", json={"username": "me", "password": "x", "totp": "000000"}
+            )
+        locked = client.post(
+            "/api/auth/login", json={"username": "me", "password": PW, "totp": code}
+        )
+        assert locked.status_code == 429, "failure counter survives the failing requests"
+    finally:
+        get_kv.cache_clear()

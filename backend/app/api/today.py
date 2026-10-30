@@ -4,12 +4,12 @@ from __future__ import annotations
 
 from dataclasses import asdict
 
-import redis
 from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
 
-from app.api.deps import current_user, redis_dep
+from app.api.deps import current_user, kv_dep
 from app.api.kite import kite_status
+from app.cache import KV
 from app.db import get_db
 from app.jobs.definitions import get_spec
 from app.jobs.runner import run_job
@@ -55,9 +55,7 @@ def today(db: Session = Depends(get_db), _: AppUser = Depends(current_user)) -> 
 
 
 @router.post("/refresh-cues", status_code=202)
-def refresh_cues(
-    r: redis.Redis = Depends(redis_dep), _: AppUser = Depends(current_user)
-) -> dict[str, str]:
+def refresh_cues(r: KV = Depends(kv_dep), _: AppUser = Depends(current_user)) -> dict[str, str]:
     """Run the global-cue refresh now. Limited to once a minute."""
     if not r.set("ratelimit:manual_cues", "1", nx=True, ex=60):
         raise HTTPException(status.HTTP_429_TOO_MANY_REQUESTS, "Refreshed less than a minute ago.")

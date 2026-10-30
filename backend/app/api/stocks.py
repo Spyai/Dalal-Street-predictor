@@ -5,11 +5,11 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, timedelta
 
 import pandas as pd
-import redis
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy.orm import Session
 
-from app.api.deps import current_user, redis_dep
+from app.api.deps import current_user, kv_dep
+from app.cache import KV
 from app.config import get_settings
 from app.db import get_db
 from app.models import AppUser
@@ -62,7 +62,7 @@ def stock(
     symbol: str,
     range_: str = Query(default="1y", alias="range"),
     db: Session = Depends(get_db),
-    r: redis.Redis = Depends(redis_dep),
+    r: KV = Depends(kv_dep),
     _: AppUser = Depends(current_user),
 ) -> StockOut:
     exchange, symbol = exchange.upper(), symbol.upper().strip()

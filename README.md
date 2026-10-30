@@ -61,8 +61,9 @@ Two ways to run it:
 - **Private (recommended):** Docker Compose on your laptop or a VPS, reachable only over
   Tailscale. Full walkthrough, including every key and the daily Kite login:
   **[SETUP.md](SETUP.md)**.
-- **Free public link:** Vercel (web + API) + Neon + Upstash + GitHub Actions for jobs.
-  Step by step, with the trade-offs: **[DEPLOY_VERCEL.md](DEPLOY_VERCEL.md)**.
+- **Free public link:** Vercel (web + API) + Neon Postgres + GitHub Actions for jobs. Add one
+  secret (`VERCEL_TOKEN`) and the "Deploy to Vercel" workflow sets everything up:
+  **[DEPLOY_VERCEL.md](DEPLOY_VERCEL.md)**.
 
 ```bash
 cp .env.example .env                 # fill in SECRET_KEY, POSTGRES_PASSWORD, Kite, Telegram
@@ -84,10 +85,12 @@ backend/
   app/security/    argon2 + TOTP auth, Fernet encryption for stored secrets
   alembic/         migrations (daily_bar and intraday_bar are hypertables)
   api/index.py      Vercel entrypoint (vercel.json, requirements.txt)
-  tests/           100 tests (4 skip until real fixtures are recorded): adapters, lookahead
-                   safety, calendar, auth, job runner, API, deploy config
+  tests/           144 tests (4 skip until real fixtures are recorded): adapters, lookahead
+                   safety, calendar, auth, KV store (Redis vs Postgres), job runner, API,
+                   deploy scripts
 frontend/          Next.js App Router + Tailwind + lightweight-charts (dark by default)
-.github/workflows/ dalal-jobs.yml: the job schedule when hosted on Vercel
+.github/workflows/ vercel-deploy.yml (one-secret deploy), dalal-jobs.yml (job schedule on Vercel)
+.github/scripts/   the deploy/job scripts those workflows run (tested with a fake Vercel CLI)
 imports/           manual CSV drop-in (holidays, index lists, Screener exports); gitignored
 data/              backups, fixtures, later model artifacts; gitignored
 ```

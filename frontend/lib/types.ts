@@ -156,6 +156,7 @@ export interface Health {
   scheduler_heartbeat: string | null;
   database: string;
   redis: string;
+  cache_backend: "redis" | "postgres";
   jobs: JobHealth[];
   sources: SourceHealth[];
   freshness: Freshness[];

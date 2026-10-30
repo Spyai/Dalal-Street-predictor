@@ -5,7 +5,7 @@ from __future__ import annotations
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.cache import get_redis, wait_for_slot
+from app.cache import get_kv, wait_for_slot
 from app.config import get_settings
 from app.models import Instrument
 from app.providers.base import MarketDataProvider, NotConfigured, ProviderError
@@ -19,7 +19,7 @@ from app.services.source_status import mark_error
 
 def nse_provider() -> NSEProvider:
     s = get_settings()
-    r = get_redis()
+    r = get_kv()
     client = PoliteClient(
         source="nse",
         user_agent=s.nse_user_agent,

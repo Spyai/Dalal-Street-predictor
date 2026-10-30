@@ -7,12 +7,12 @@ import secrets
 
 import qrcode
 import qrcode.image.svg
-import redis
 from fastapi import APIRouter, Cookie, Depends, HTTPException, Response, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.api.deps import current_user, redis_dep
+from app.api.deps import current_user, kv_dep
+from app.cache import KV
 from app.config import get_settings
 from app.db import get_db
 from app.models import AppUser
@@ -39,7 +39,7 @@ def login(
     body: LoginIn,
     response: Response,
     db: Session = Depends(get_db),
-    r: redis.Redis = Depends(redis_dep),
+    r: KV = Depends(kv_dep),
 ) -> MeOut:
     s = get_settings()
     try:
@@ -64,7 +64,7 @@ def login(
 @router.post("/logout", status_code=204)
 def logout(
     response: Response,
-    r: redis.Redis = Depends(redis_dep),
+    r: KV = Depends(kv_dep),
     session_token: str | None = Cookie(default=None, alias=SESSION_COOKIE),
 ) -> Response:
     destroy_session(r, session_token)
@@ -91,9 +91,7 @@ def setup_status(db: Session = Depends(get_db)) -> SetupStatusOut:
 
 
 @router.post("/setup", response_model=SetupOut)
-def setup(
-    body: SetupIn, db: Session = Depends(get_db), r: redis.Redis = Depends(redis_dep)
-) -> SetupOut:
+def setup(body: SetupIn, db: Session = Depends(get_db), r: KV = Depends(kv_dep)) -> SetupOut:
     """Create the single login from the browser, for hosts without a terminal (Vercel).
 
     Needs SETUP_TOKEN (>= 16 chars) from the server environment and only works while no

@@ -1,30 +1,51 @@
 # Deploy on Vercel (free tier)
 
-This gives you a link like `https://dalal-yourname.vercel.app` that works from any phone or
-laptop, at ₹0/month. It takes about 20 minutes of clicking.
+You get a link like `https://dalal-yourname.vercel.app` that works on any phone or laptop,
+at ₹0/month. A GitHub Actions workflow does the setup; you add one token.
 
-## How it fits together
+## The short way: one secret
 
-| Piece | Runs on | Free tier (check current limits) |
+1. **Make the repo private** (recommended). On a public repo, GitHub Actions logs are
+   readable by anyone. GitHub → repo → Settings → General → Danger Zone → Change visibility.
+2. **Create a Vercel token.** Sign up at <https://vercel.com/signup> (Hobby, free), then
+   **Account Settings → Tokens → Create**. Scope: your account.
+3. **Give it to GitHub.** Repo → **Settings → Secrets and variables → Actions → New
+   repository secret**. Name: `VERCEL_TOKEN`. Value: the token.
+4. **Run the deploy.** Repo → **Actions → Deploy to Vercel**, open the latest run →
+   **Re-run all jobs** (or **Run workflow** once it's on `main`). It takes about 5 minutes,
+   and the run's **Summary** shows your link.
+5. **Create your login.** Vercel → **dalal-api → Settings → Environment Variables** → copy
+   `SETUP_TOKEN`, then open `https://<your link>/setup?token=<SETUP_TOKEN>`. Choose a username
+   and a 12+ character password, and scan the QR code with an authenticator app.
+6. **Add your keys** (Kite, Telegram; see SETUP.md §1 and §3) in **dalal-api → Settings →
+   Environment Variables**, set the Kite redirect URL to `https://<your link>/api/kite/callback`,
+   and re-run the deploy so the API picks them up.
+7. **Merge the PR into `main`.** GitHub only runs scheduled workflows from the default
+   branch, so the daily jobs start then. Pushes to `main` redeploy automatically.
+
+### What the workflow does (`.github/workflows/vercel-deploy.yml`)
+
+| Step | First run | Later runs |
 |---|---|---|
-| Web app (Next.js) | Vercel project **dalal** | Hobby plan |
-| API (FastAPI) | Vercel project **dalal-api**, Mumbai region (`bom1`) | Hobby plan |
-| Database | Neon Postgres, added from Vercel's Storage tab | 0.5 GB; 5 years × 500 stocks is ~100 MB |
-| Cache, sessions | Upstash Redis, added from Vercel's Storage tab | ~500k commands/month |
-| Scheduled jobs | GitHub Actions (`.github/workflows/dalal-jobs.yml`) | Free on public repos; 2,000 min/month private (Dalal uses ~1,200) |
+| Projects | creates `dalal-api` (from `backend/`) and `dalal` (from `frontend/`) | reuses them |
+| Database | creates a free Neon Postgres (`dalal-db`) and connects it to `dalal-api` | reuses it |
+| Secrets | generates `SECRET_KEY` and `SETUP_TOKEN`, stored only in Vercel | never rotates them |
+| Migrations | runs `app.cli migrate` | same |
+| Deploy | API in the Vercel region next to the database, then the web app pointed at it | same |
+| Check | `GET /healthz` through the web link must answer | same |
 
-Vercel can't run Dalal's always-on scheduler, so the scheduled jobs run in GitHub Actions
-instead, against the same database.
+There's no Redis on this setup. Sessions, login throttling and rate limits use a small
+Postgres table instead (`app/kv.py`), so the database is the only extra service. The
+scheduled jobs (`dalal-jobs.yml`) read their settings from the `dalal-api` project with
+the same token, so every key lives in one place: Vercel's environment variables.
 
 ## What you trade for free hosting
 
-Read this before you start. The Docker + Tailscale setup in SETUP.md has none of these issues.
+The Docker + Tailscale setup in SETUP.md has none of these issues.
 
 - **The URL is public.** Anyone can reach the login page. It's protected by password + TOTP,
   a lockout after 5 failed attempts, and a one-time setup token. Your brief asked for no
   public URL; this setup reverses that.
-- **Make the repo private.** On a public repo, GitHub Actions logs (job results, errors) are
-  readable by anyone. GitHub → repo → Settings → General → Danger Zone → Change visibility.
 - **Jobs can start late.** GitHub's scheduled runs often start 5 to 30 minutes late, and
   global cues refresh every 30 minutes instead of 10.
 - **NSE may refuse GitHub's US servers.** Holiday list, FII/DII and bhavcopy may then show as
@@ -33,108 +54,41 @@ Read this before you start. The Docker + Tailscale setup in SETUP.md has none of
   two names.
 - **Phase 3 intraday alerts (every minute) won't fit here.** At that point you'll need a small
   always-on machine (e.g. a free Oracle Cloud VM running the Docker setup).
-- **GitHub pauses schedules after 60 days without commits** on public repos. Re-enable
-  from the Actions tab.
+- **GitHub pauses schedules after 60 days without commits.** Re-enable from the Actions tab.
 
----
+Free-tier limits (check the providers' current pages): Vercel Hobby, Neon about 0.5 GB
+(5 years × 500 stocks of daily bars is ~100 MB), GitHub Actions free on public repos and
+2,000 min/month on private ones (Dalal uses ~1,200).
 
-## 1. Generate two secrets
+## When something goes wrong
 
-Use your password manager's generator (or `openssl rand -base64 48`):
+The workflow stops with a red run and a plain-English message in its Summary.
 
-- `SECRET_KEY`: 64+ random characters. It must be **identical** in Vercel and GitHub,
-  because it encrypts your Kite token.
-- `SETUP_TOKEN`: 24+ random characters. Used once to create your login.
-
-## 2. Create the API project
-
-1. Go to <https://vercel.com/signup> and sign up with GitHub (Hobby plan, free).
-2. **Add New… → Project** → import **Spyai/Dalal-Street-predictor**.
-3. Configure:
-   - Project name: `dalal-api`
-   - **Root Directory:** `backend`
-   - Framework Preset: **Other**
-   - Environment Variables:
-
-     | Name | Value |
-     |---|---|
-     | `SECRET_KEY` | from step 1 |
-     | `SETUP_TOKEN` | from step 1 |
-     | `SCHEDULER_MODE` | `external` |
-     | `COOKIE_SECURE` | `true` |
-     | `KITE_API_KEY`, `KITE_API_SECRET`, `KITE_USER_ID` | from Kite (SETUP.md §1) |
-     | `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | from BotFather (SETUP.md §3) |
-     | `APP_BASE_URL` | leave for now; set in step 5 |
-4. **Deploy.** It will deploy but can't work yet; there's no database.
-5. In `dalal-api` → **Storage** → **Create Database**:
-   - **Neon** (Postgres) → Free plan → pick the region closest to India (Singapore, or Mumbai if
-     listed) → connect it to `dalal-api`.
-   - **Create Database** again → **Upstash for Redis** → Free → same region → connect it.
-6. **Deployments** → the latest one → **⋯ → Redeploy**, so it picks up the new variables.
-7. Copy the project's URL, e.g. `https://dalal-api-abc123.vercel.app`.
-
-## 3. Create the database tables (GitHub Actions)
-
-1. Find the two connection strings: Vercel → `dalal-api` → **Storage** → click each database
-   → **.env.local** tab → **Show secret**.
-   - From Neon, copy **`DATABASE_URL_UNPOOLED`** (the direct connection, needed for migrations).
-   - From Upstash, copy **`REDIS_URL`** (or `KV_URL`; it starts with `rediss://`).
-2. GitHub → your repo → **Settings → Secrets and variables → Actions**:
-   - **Secrets** tab → New repository secret, one by one:
-     `DATABASE_URL` (the unpooled Neon URL), `REDIS_URL`, `SECRET_KEY` (same as Vercel),
-     `KITE_API_KEY`, `KITE_API_SECRET`, `KITE_USER_ID`, `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`.
-   - **Variables** tab → New repository variable: `DALAL_JOBS_ENABLED` = `true`.
-3. **Actions** tab → **Dalal jobs** → **Run workflow** → command `migrate` → Run.
-   It should go green in about a minute.
-4. Check `https://dalal-api-abc123.vercel.app/healthz`. It should say `{"ok":true}`.
-
-## 4. Create the web project (this is your link)
-
-1. Vercel → **Add New… → Project** → import **the same repo** again.
-2. Configure:
-   - Project name: `dalal` (this becomes `dalal-….vercel.app`)
-   - **Root Directory:** `frontend`
-   - Framework Preset: **Next.js**
-   - Environment Variable: `BACKEND_URL` = the API URL from step 2.7
-3. **Deploy.** When it finishes, Vercel shows your link, e.g. `https://dalal-xyz.vercel.app`.
-
-## 5. Point everything at the link
-
-- Vercel → `dalal-api` → **Settings → Environment Variables** → add
-  `APP_BASE_URL` = your web link → **Redeploy** the API.
-- GitHub → **Settings → Secrets and variables → Actions → Variables** → add
-  `APP_BASE_URL` = your web link.
-- Kite developer console → your app → **Redirect URL** = `https://<your link>/api/kite/callback`.
-
-## 6. Create your login
-
-Open `https://<your link>/setup?token=<SETUP_TOKEN>` → choose a username and a 12+ character
-password → scan the QR code with your authenticator app → **Log in**.
-
-Setup switches itself off once a login exists. You can then delete `SETUP_TOKEN` from the
-API project's variables.
-
-## 7. Load data
-
-GitHub → **Actions → Dalal jobs → Run workflow**:
-
-1. Log in to Kite first (Today page banner), so instrument tokens and history come from Kite.
-2. `sync-instruments`: Kite instrument tokens and the Nifty 500 list.
-3. `backfill`: 5 years of daily history. Takes 5 to 15 minutes. Safe to re-run.
-
-From then on the schedule runs by itself. `/health` shows the last run of every job.
-
-## When something's wrong
-
-| Symptom | Check |
+| Message | Fix |
 |---|---|
-| Web build fails: "Set BACKEND_URL" | Step 4.2: the variable is missing from the `dalal` project |
-| Login page says "Can't reach the API" | Open `<API URL>/healthz`. If it errors, re-run `migrate` and redeploy the API |
-| `/health` says Scheduler (GitHub Actions): down | Actions tab: is `DALAL_JOBS_ENABLED` = `true`? Did the last run fail? |
-| Kite login loops back with "failed" | Redirect URL in Kite console must exactly match `<link>/api/kite/callback` |
-| Kite says "token invalid" in jobs | `SECRET_KEY` differs between Vercel and GitHub |
+| "VERCEL_TOKEN isn't set" | Step 3 above |
+| "Couldn't create Vercel project" | The token expired or has the wrong scope. Make a new one |
+| "Couldn't create or connect the Neon database" | Vercel → `dalal-api` → Storage → Create Database → Neon (Free) → Connect, then re-run |
+| "SECRET_KEY … is marked Sensitive" | Someone marked it Sensitive in Vercel. The jobs need to read it |
+| "/healthz didn't answer" | Vercel → `dalal-api` → Logs shows the error |
+| Login page says "Can't reach the API" | Re-run the deploy; `BACKEND_URL` on `dalal` must point at `dalal-api` |
 
-Sources for the limits above: Vercel raised the Python function bundle limit to 500 MB in
-2026 ([Vercel KB](https://vercel.com/kb/guide/troubleshooting-function-250mb-limit)). Neon,
-Upstash and GitHub Actions free-tier numbers were correct when this was written; check their
-pricing pages if anything looks off.
+## The manual way (Vercel dashboard)
+
+If you'd rather click than run the workflow:
+
+1. Vercel → **Add New → Project** → import this repo → name `dalal-api`, **Root Directory**
+   `backend`, Framework **Other**. Variables: `SECRET_KEY` (64 random chars), `SETUP_TOKEN`
+   (24+ random chars), `SCHEDULER_MODE=external`, `COOKIE_SECURE=true`. Deploy.
+2. `dalal-api` → **Storage → Create Database → Neon (Free)** → Connect → Redeploy.
+3. Run the migrations once. GitHub → Settings → Secrets → add `VERCEL_TOKEN`, then Actions →
+   **Dalal jobs** → Run workflow → `migrate`. Or put `DATABASE_URL` (the unpooled Neon URL) and
+   `SECRET_KEY` there as secrets instead.
+4. **Add New → Project** → same repo → name `dalal`, **Root Directory** `frontend`,
+   Framework **Next.js**, variable `BACKEND_URL` = the `dalal-api` URL. Deploy. That's your link.
+5. On `dalal-api`, add `APP_BASE_URL` = your link and redeploy. Then do steps 5 to 7 of the
+   short way.
+
+Vercel's Python functions may be up to 500 MB uncompressed
+([Vercel KB](https://vercel.com/kb/guide/troubleshooting-function-250mb-limit)).
+Dalal's API bundle is well under that.

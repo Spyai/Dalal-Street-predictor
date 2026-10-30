@@ -41,7 +41,11 @@ export default function HealthPage() {
           }
         />
         <Chip label="Database" ok={data.database === "ok"} detail={data.database} />
-        <Chip label="Redis" ok={data.redis === "ok"} detail={data.redis} />
+        <Chip
+          label={data.cache_backend === "postgres" ? "Cache (Postgres)" : "Redis"}
+          ok={data.redis === "ok"}
+          detail={data.redis}
+        />
       </div>
       {!data.scheduler_alive && (
         <Notice tone="down">

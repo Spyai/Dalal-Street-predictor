@@ -34,6 +34,7 @@ dev = [
     "mypy>=1.11",
     "pandas-stubs>=2.2",
     "types-redis",
+    "pyyaml>=6",
 ]
 
 [build-system]

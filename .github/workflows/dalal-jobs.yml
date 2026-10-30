@@ -1,8 +1,9 @@
 # Dalal's scheduled jobs for the Vercel deployment (SCHEDULER_MODE=external).
 # Docker Compose users don't need this: the scheduler container runs the same jobs.
 #
-# Off until you set the repository variable DALAL_JOBS_ENABLED=true (see DEPLOY_VERCEL.md),
-# so the schedule doesn't fail every 30 minutes before the secrets exist.
+# Does nothing (and stays green) until Dalal is deployed: settings are read from the
+# Vercel API project via VERCEL_TOKEN, or from GitHub secrets. Set the repository
+# variable DALAL_JOBS_ENABLED=false to pause the schedule.
 #
 # Times are UTC; IST = UTC+5:30. GitHub can start scheduled runs several minutes late.
 name: Dalal jobs
@@ -40,28 +41,18 @@ concurrency:
 
 jobs:
   run:
-    if: vars.DALAL_JOBS_ENABLED == 'true'
+    if: vars.DALAL_JOBS_ENABLED != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     defaults:
       run:
         working-directory: backend
     env:
-      DATABASE_URL: ${{ secrets.DATABASE_URL }}
-      REDIS_URL: ${{ secrets.REDIS_URL }}
-      SECRET_KEY: ${{ secrets.SECRET_KEY }}
-      KITE_API_KEY: ${{ secrets.KITE_API_KEY }}
-      KITE_API_SECRET: ${{ secrets.KITE_API_SECRET }}
-      KITE_USER_ID: ${{ secrets.KITE_USER_ID }}
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      APP_BASE_URL: ${{ vars.APP_BASE_URL }}
-      WATCHLIST: ${{ vars.WATCHLIST }}
       SCHEDULER_MODE: external
       IMPORTS_DIR: ${{ github.workspace }}/imports
       DATA_DIR: ${{ runner.temp }}
       LOG_LEVEL: info
+      VERCEL_TELEMETRY_DISABLED: "1"
     steps:
       - uses: actions/checkout@v4
 
@@ -71,11 +62,33 @@ jobs:
           cache: pip
           cache-dependency-path: backend/pyproject.toml
 
+      # Settings come from the Vercel API project (VERCEL_TOKEN), or from GitHub secrets.
+      - name: Load settings
+        id: cfg
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_SCOPE: ${{ vars.VERCEL_SCOPE }}
+          DALAL_API_PROJECT: ${{ vars.DALAL_API_PROJECT }}
+          GH_DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          GH_REDIS_URL: ${{ secrets.REDIS_URL }}
+          GH_SECRET_KEY: ${{ secrets.SECRET_KEY }}
+          GH_KITE_API_KEY: ${{ secrets.KITE_API_KEY }}
+          GH_KITE_API_SECRET: ${{ secrets.KITE_API_SECRET }}
+          GH_KITE_USER_ID: ${{ secrets.KITE_USER_ID }}
+          GH_TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          GH_TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          GH_ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          GH_APP_BASE_URL: ${{ vars.APP_BASE_URL }}
+          GH_WATCHLIST: ${{ vars.WATCHLIST }}
+        run: bash ../.github/scripts/jobs-env.sh
+
       - name: Install
+        if: steps.cfg.outputs.configured == 'true'
         run: pip install .
 
       - name: Choose command
         id: pick
+        if: steps.cfg.outputs.configured == 'true'
         env:
           SCHEDULE: ${{ github.event.schedule }}
           INPUT: ${{ inputs.command }}
@@ -95,6 +108,7 @@ jobs:
           echo "cmd=$CMD" >> "$GITHUB_OUTPUT"
 
       - name: Run
+        if: steps.cfg.outputs.configured == 'true'
         env:
           CMD: ${{ steps.pick.outputs.cmd }}
         run: python -m app.cli $CMD

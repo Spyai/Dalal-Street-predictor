@@ -190,6 +190,7 @@ class HealthOut(BaseModel):
     scheduler_heartbeat: datetime | None
     database: str
     redis: str
+    cache_backend: str
     jobs: list[JobHealthOut]
     sources: list[SourceHealthOut]
     freshness: list[FreshnessOut]

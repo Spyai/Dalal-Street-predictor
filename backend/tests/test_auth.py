@@ -6,7 +6,7 @@ import pyotp
 import pytest
 from sqlalchemy.orm import Session
 
-from app.cache import get_redis
+from app.cache import get_kv
 from app.security import auth
 from app.security.crypto import SecretKeyMissing, decrypt, encrypt
 
@@ -45,7 +45,7 @@ def test_create_user_is_single_user(db: Session) -> None:
 
 def test_login_requires_password_and_totp(db: Session) -> None:
     _, totp = _setup(db)
-    r = get_redis()
+    r = get_kv()
     with pytest.raises(auth.InvalidCredentials):
         auth.authenticate(db, r, "me", "wrong password", totp.now())
     with pytest.raises(auth.InvalidCredentials):
@@ -56,7 +56,7 @@ def test_login_requires_password_and_totp(db: Session) -> None:
 
 def test_totp_code_is_single_use(db: Session) -> None:
     _, totp = _setup(db)
-    r = get_redis()
+    r = get_kv()
     code = totp.now()
     auth.authenticate(db, r, "me", PW, code)
     with pytest.raises(auth.InvalidCredentials):
@@ -65,7 +65,7 @@ def test_totp_code_is_single_use(db: Session) -> None:
 
 def test_lockout_after_repeated_failures(db: Session) -> None:
     _, totp = _setup(db)
-    r = get_redis()
+    r = get_kv()
     for _ in range(auth.MAX_FAILURES):
         with pytest.raises(auth.InvalidCredentials):
             auth.authenticate(db, r, "me", "nope", "123456")
@@ -74,7 +74,7 @@ def test_lockout_after_repeated_failures(db: Session) -> None:
 
 
 def test_sessions(db: Session) -> None:
-    r = get_redis()
+    r = get_kv()
     tok = auth.create_session(r, 42, ttl_hours=1)
     assert auth.resolve_session(r, tok) == 42
     assert auth.resolve_session(r, "forged") is None
