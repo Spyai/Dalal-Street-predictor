@@ -35,6 +35,8 @@ dev = [
     "pandas-stubs>=2.2",
     "types-redis",
     "pyyaml>=6",
+    "actionlint-py>=1.7",
+    "shellcheck-py>=0.10",
 ]
 
 [build-system]

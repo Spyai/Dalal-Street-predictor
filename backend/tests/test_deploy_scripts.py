@@ -265,3 +265,20 @@ def test_workflows_reference_existing_scripts() -> None:
         for script in ("vercel-deploy.sh", "jobs-env.sh"):
             if script in runs:
                 assert (SCRIPTS / script).exists()
+
+
+def test_workflows_pass_actionlint() -> None:
+    """Catches what GitHub would reject at load time (e.g. contexts not allowed in env)."""
+    linter = shutil.which("actionlint") or str(Path(sys.executable).parent / "actionlint")
+    checker = shutil.which("shellcheck") or str(Path(sys.executable).parent / "shellcheck")
+    if not Path(linter).exists():
+        pytest.skip("actionlint not installed (pip install actionlint-py)")
+    args = [linter]
+    if Path(checker).exists():
+        args.append(f"-shellcheck={checker}")
+    res = subprocess.run(
+        [*args, *sorted(str(p) for p in (REPO / ".github" / "workflows").glob("*.yml"))],
+        capture_output=True,
+        text=True,
+    )
+    assert res.returncode == 0, res.stdout + res.stderr

@@ -49,8 +49,8 @@ jobs:
         working-directory: backend
     env:
       SCHEDULER_MODE: external
-      IMPORTS_DIR: ${{ github.workspace }}/imports
-      DATA_DIR: ${{ runner.temp }}
+      IMPORTS_DIR: ../imports  # relative to backend/, the working directory
+      DATA_DIR: /tmp/dalal-data
       LOG_LEVEL: info
       VERCEL_TELEMETRY_DISABLED: "1"
     steps:
@@ -111,4 +111,7 @@ jobs:
         if: steps.cfg.outputs.configured == 'true'
         env:
           CMD: ${{ steps.pick.outputs.cmd }}
-        run: python -m app.cli $CMD
+        # CMD was checked against an allowlist above; split it into arguments.
+        run: |
+          read -ra ARGS <<< "$CMD"
+          python -m app.cli "${ARGS[@]}"
