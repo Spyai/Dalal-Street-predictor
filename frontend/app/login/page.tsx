@@ -1,8 +1,9 @@
 "use client";
 
-import { Suspense, useState } from "react";
+import { Suspense, useEffect, useState } from "react";
 import { useSearchParams } from "next/navigation";
 import { api, ApiError } from "@/lib/api";
+import type { SetupStatus } from "@/lib/types";
 
 function LoginForm() {
   const params = useSearchParams();
@@ -11,6 +12,13 @@ function LoginForm() {
   const [totp, setTotp] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [needsSetup, setNeedsSetup] = useState(false);
+
+  useEffect(() => {
+    api<SetupStatus>("/api/auth/setup-status")
+      .then((s) => setNeedsSetup(s.needs_setup))
+      .catch(() => undefined);
+  }, []);
 
   async function submit(e: React.FormEvent) {
     e.preventDefault();
@@ -52,6 +60,15 @@ function LoginForm() {
         autoComplete="one-time-code"
         inputMode="numeric"
       />
+      {needsSetup && (
+        <p className="text-sm text-warn">
+          No login exists yet.{" "}
+          <a href="/setup" className="underline">
+            Set up Dalal
+          </a>{" "}
+          first.
+        </p>
+      )}
       {error && <p className="text-sm text-down">{error}</p>}
       <button
         type="submit"

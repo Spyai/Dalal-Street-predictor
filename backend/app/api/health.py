@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time, timedelta
 
 import redis
 from fastapi import APIRouter, Depends
@@ -10,9 +10,10 @@ from sqlalchemy import func, select, text
 from sqlalchemy.orm import Session
 
 from app.api.deps import current_user, redis_dep
+from app.cache import HEARTBEAT_KEY
+from app.config import IST, get_settings
 from app.db import get_db
 from app.jobs.definitions import job_specs
-from app.jobs.scheduler import HEARTBEAT_KEY
 from app.models import AppUser, DailyBar, FiiDiiFlow, GlobalCueSnapshot, Instrument, JobRun
 from app.schemas import FreshnessOut, HealthOut, JobHealthOut, SourceHealthOut
 from app.services import calendar, flows
@@ -27,6 +28,19 @@ def healthz(db: Session = Depends(get_db)) -> dict[str, bool]:
     """Unauthenticated liveness probe for Docker. Reveals nothing."""
     db.execute(text("SELECT 1"))
     return {"ok": True}
+
+
+def external_scheduler_alive(last_run: datetime | None, now: datetime) -> bool:
+    """GitHub Actions has no heartbeat; judge it by the last job run.
+
+    Cues run every 30 minutes from 05:30 to 23:30 IST, so a run older than 75 minutes
+    in that window means the schedule stopped. Overnight there is a ~6 hour gap.
+    """
+    if last_run is None:
+        return False
+    local = now.astimezone(IST).time()
+    limit = timedelta(minutes=75) if time(6, 45) <= local <= time(23, 59) else timedelta(hours=7)
+    return now - last_run <= limit
 
 
 def _jobs(db: Session) -> list[JobHealthOut]:
@@ -136,6 +150,13 @@ def health(
     except redis.RedisError as exc:
         hb_raw, redis_state = None, f"error: {exc.__class__.__name__}"
     hb = datetime.fromisoformat(str(hb_raw)) if hb_raw else None
+    mode = get_settings().scheduler_mode
+    if mode == "external":
+        last_run = db.scalar(select(func.max(JobRun.started_at)))
+        alive = external_scheduler_alive(last_run, datetime.now(UTC))
+        hb = last_run
+    else:
+        alive = hb is not None and (datetime.now(UTC) - hb).total_seconds() < 180
     statuses = all_statuses()
     sources = [
         SourceHealthOut(
@@ -153,7 +174,8 @@ def health(
     cal = TradingCalendar.load(db)
     return HealthOut(
         now=datetime.now(UTC),
-        scheduler_alive=hb is not None and (datetime.now(UTC) - hb).total_seconds() < 180,
+        scheduler_mode=mode,
+        scheduler_alive=alive,
         scheduler_heartbeat=hb,
         database="ok",
         redis=redis_state,

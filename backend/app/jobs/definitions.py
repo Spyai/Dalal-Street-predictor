@@ -37,7 +37,11 @@ def job_specs() -> list[JobSpec]:
         JobSpec(
             "global_cues_refresh",
             "Global cues refresh",
-            f"every {s.global_cues_refresh_minutes} min",
+            (
+                "every 30 min, 05:30-23:30 (GitHub Actions)"
+                if s.scheduler_mode == "external"
+                else f"every {s.global_cues_refresh_minutes} min"
+            ),
             {"minute": f"*/{s.global_cues_refresh_minutes}"},
             phase=1,
             fn=tasks.global_cues_refresh,

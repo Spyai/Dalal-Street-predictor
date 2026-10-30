@@ -9,7 +9,7 @@ from apscheduler.events import EVENT_JOB_ERROR, JobExecutionEvent
 from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from app.cache import get_redis
+from app.cache import HEARTBEAT_KEY, get_redis
 from app.config import IST, get_settings
 from app.db import session_scope
 from app.jobs.definitions import get_spec, job_specs
@@ -18,7 +18,6 @@ from app.logging import configure_logging, get_logger
 from app.services import calendar, instruments
 
 log = get_logger(__name__)
-HEARTBEAT_KEY = "scheduler:heartbeat"
 
 
 def heartbeat() -> None:

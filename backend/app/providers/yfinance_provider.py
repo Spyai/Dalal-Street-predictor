@@ -6,6 +6,7 @@ surfaces as SourceUnavailable and is shown as such, never papered over.
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
@@ -50,6 +51,9 @@ def yf_ticker(symbol: str, exchange: str) -> str:
 def _default_downloader(**kwargs: Any) -> pd.DataFrame | None:
     import yfinance as yf
 
+    if os.environ.get("VERCEL"):
+        # Serverless filesystems are read-only except /tmp; yfinance caches timezones.
+        yf.set_tz_cache_location("/tmp/yfinance-cache")
     return yf.download(progress=False, **kwargs)
 
 

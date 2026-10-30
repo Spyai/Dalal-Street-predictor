@@ -10,7 +10,9 @@ export class ApiError extends Error {
 }
 
 function toLogin(): void {
-  if (typeof window === "undefined" || window.location.pathname.startsWith("/login")) return;
+  if (typeof window === "undefined") return;
+  const here = window.location.pathname;
+  if (here.startsWith("/login") || here.startsWith("/setup")) return;
   const next = encodeURIComponent(window.location.pathname + window.location.search);
   window.location.replace(`/login?next=${next}`);
 }

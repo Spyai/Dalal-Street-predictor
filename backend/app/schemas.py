@@ -19,6 +19,24 @@ class MeOut(BaseModel):
     username: str
 
 
+class SetupStatusOut(BaseModel):
+    needs_setup: bool
+    setup_enabled: bool
+
+
+class SetupIn(BaseModel):
+    token: str = Field(min_length=1, max_length=256)
+    username: str = Field(min_length=1, max_length=64)
+    password: str = Field(min_length=12, max_length=256)
+
+
+class SetupOut(BaseModel):
+    username: str
+    totp_secret: str
+    provisioning_uri: str
+    qr_svg_data_url: str
+
+
 # ----------------------------------------------------------------------------- today
 
 
@@ -167,6 +185,7 @@ class FreshnessOut(BaseModel):
 
 class HealthOut(BaseModel):
     now: datetime
+    scheduler_mode: str
     scheduler_alive: bool
     scheduler_heartbeat: datetime | None
     database: str

@@ -1,5 +1,9 @@
 # Setup
 
+This is the private setup: Docker on your laptop or a VPS, over Tailscale. For a free public
+link on Vercel instead, follow [DEPLOY_VERCEL.md](DEPLOY_VERCEL.md); sections 1-5 below
+(getting the keys) apply to both.
+
 You need: Docker (with Compose), a Zerodha account, a Telegram account, and about 30 minutes.
 Every secret goes into `.env`. Never paste a key into a chat, issue or commit.
 

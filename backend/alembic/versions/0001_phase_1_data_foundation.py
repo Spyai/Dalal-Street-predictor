@@ -239,15 +239,27 @@ def _create_hypertables() -> None:
     if not available:
         print("WARNING: timescaledb extension not available; candle tables stay plain tables")
         return
-    op.execute("CREATE EXTENSION IF NOT EXISTS timescaledb")
-    op.execute(
-        "SELECT create_hypertable('daily_bar', 'trade_date', "
-        "chunk_time_interval => INTERVAL '1 year', if_not_exists => TRUE, migrate_data => TRUE)"
-    )
-    op.execute(
-        "SELECT create_hypertable('intraday_bar', 'ts', "
-        "chunk_time_interval => INTERVAL '7 days', if_not_exists => TRUE, migrate_data => TRUE)"
-    )
+    # Hosted Postgres (e.g. Neon) may list the extension but restrict it; a savepoint keeps
+    # a refusal from aborting the whole migration.
+    try:
+        with bind.begin_nested():
+            bind.execute(sa.text("CREATE EXTENSION IF NOT EXISTS timescaledb"))
+            bind.execute(
+                sa.text(
+                    "SELECT create_hypertable('daily_bar', 'trade_date', "
+                    "chunk_time_interval => INTERVAL '1 year', if_not_exists => TRUE, "
+                    "migrate_data => TRUE)"
+                )
+            )
+            bind.execute(
+                sa.text(
+                    "SELECT create_hypertable('intraday_bar', 'ts', "
+                    "chunk_time_interval => INTERVAL '7 days', if_not_exists => TRUE, "
+                    "migrate_data => TRUE)"
+                )
+            )
+    except sa.exc.DBAPIError as exc:
+        print(f"WARNING: TimescaleDB unavailable ({exc.orig}); candle tables stay plain tables")
 
 
 def downgrade() -> None:

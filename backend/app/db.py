@@ -8,6 +8,7 @@ from functools import lru_cache
 
 from sqlalchemy import Engine, create_engine
 from sqlalchemy.orm import DeclarativeBase, Session, sessionmaker
+from sqlalchemy.pool import NullPool
 
 from app.config import get_settings
 
@@ -18,7 +19,14 @@ class Base(DeclarativeBase):
 
 @lru_cache
 def get_engine() -> Engine:
-    return create_engine(get_settings().sqlalchemy_url, pool_pre_ping=True, pool_size=5)
+    s = get_settings()
+    if s.is_serverless:
+        # Each serverless invocation is short-lived: no pool, and no server-side prepared
+        # statements (they break behind a transaction-mode pooler such as Neon's).
+        return create_engine(
+            s.sqlalchemy_url, poolclass=NullPool, connect_args={"prepare_threshold": None}
+        )
+    return create_engine(s.sqlalchemy_url, pool_pre_ping=True, pool_size=5)
 
 
 @lru_cache

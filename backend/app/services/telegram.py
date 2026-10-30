@@ -29,7 +29,8 @@ def send(
     """
     s = settings or get_settings()
     if not s.telegram_configured:
-        log.info("telegram_not_configured", preview=text[:120])
+        # Never log message text: job logs may be public (GitHub Actions on a public repo).
+        log.info("telegram_not_configured", chars=len(text))
         return False
     url = f"https://api.telegram.org/bot{s.telegram_bot_token}/sendMessage"
     chunks = [text[i : i + MAX_LEN] for i in range(0, len(text), MAX_LEN)] or [""]

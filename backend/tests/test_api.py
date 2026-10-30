@@ -155,3 +155,75 @@ def test_health_lists_all_jobs_and_sources(logged_in: TestClient) -> None:
     assert "Phase 2" in body["models_note"]
     datasets = {f["dataset"]: f for f in body["freshness"]}
     assert datasets["NSE holiday calendar"]["status"] == "missing"
+
+
+# ----------------------------------------------------------------- web setup
+
+
+TOKEN = "s3tup-token-with-enough-length"
+
+
+def test_setup_disabled_without_token(client: TestClient) -> None:
+    assert client.get("/api/auth/setup-status").json() == {
+        "needs_setup": True,
+        "setup_enabled": False,
+    }
+    resp = client.post("/api/auth/setup", json={"token": "x", "username": "me", "password": PW})
+    assert resp.status_code == 403
+
+
+def test_setup_creates_single_user_once(
+    db: Session, client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "setup_token", TOKEN)
+    bad = client.post("/api/auth/setup", json={"token": "wrong", "username": "me", "password": PW})
+    assert bad.status_code == 403
+    ok = client.post("/api/auth/setup", json={"token": TOKEN, "username": "me", "password": PW})
+    assert ok.status_code == 200, ok.text
+    body = ok.json()
+    assert body["qr_svg_data_url"].startswith("data:image/svg+xml;base64,")
+    assert body["provisioning_uri"].startswith("otpauth://totp/Dalal:me")
+    # The new login works with the returned secret.
+    login = client.post(
+        "/api/auth/login",
+        json={"username": "me", "password": PW, "totp": pyotp.TOTP(body["totp_secret"]).now()},
+    )
+    assert login.status_code == 200
+    # Setup can never run again once a user exists.
+    again = client.post("/api/auth/setup", json={"token": TOKEN, "username": "x", "password": PW})
+    assert again.status_code == 409
+    assert client.get("/api/auth/setup-status").json()["needs_setup"] is False
+
+
+def test_setup_attempts_are_rate_limited(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.config import get_settings
+
+    monkeypatch.setattr(get_settings(), "setup_token", TOKEN)
+    codes = [
+        client.post(
+            "/api/auth/setup", json={"token": "nope", "username": "me", "password": PW}
+        ).status_code
+        for _ in range(11)
+    ]
+    assert codes[:10] == [403] * 10 and codes[10] == 429
+
+
+def test_health_external_scheduler_mode(
+    db: Session, logged_in: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from app.config import get_settings
+    from app.models import JobRun
+
+    monkeypatch.setattr(get_settings(), "scheduler_mode", "external")
+    body = logged_in.get("/api/health").json()
+    assert body["scheduler_mode"] == "external" and body["scheduler_alive"] is False
+    db.add(JobRun(job_name="global_cues_refresh", run_date=date.today(), status="success"))
+    db.commit()
+    body = logged_in.get("/api/health").json()
+    assert body["scheduler_alive"] is True
+    cues = next(j for j in body["jobs"] if j["name"] == "global_cues_refresh")
+    assert "GitHub Actions" in cues["schedule"]

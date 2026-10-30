@@ -20,6 +20,7 @@ imports/*
 *.sqlite
 *.db
 *.dump
+*.rdb
 *.sql.gz
 mlruns/
 mlartifacts/
@@ -51,3 +52,7 @@ next-env.d.ts
 .idea/
 .vscode/
 *.swp
+
+# Public exchange files may be committed so GitHub Actions can use them (Vercel setup).
+!imports/nse_holidays_*.csv
+!imports/ind_*list.csv

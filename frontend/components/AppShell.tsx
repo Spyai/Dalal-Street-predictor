@@ -13,7 +13,7 @@ const NAV = [
 
 export default function AppShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
-  const isLogin = pathname.startsWith("/login");
+  const isLogin = pathname.startsWith("/login") || pathname.startsWith("/setup");
   const [user, setUser] = useState<string | null>(null);
 
   useEffect(() => {

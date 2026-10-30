@@ -137,8 +137,21 @@ export interface Freshness {
   detail: string | null;
 }
 
+export interface SetupStatus {
+  needs_setup: boolean;
+  setup_enabled: boolean;
+}
+
+export interface SetupResult {
+  username: string;
+  totp_secret: string;
+  provisioning_uri: string;
+  qr_svg_data_url: string;
+}
+
 export interface Health {
   now: string;
+  scheduler_mode: "internal" | "external";
   scheduler_alive: boolean;
   scheduler_heartbeat: string | null;
   database: string;

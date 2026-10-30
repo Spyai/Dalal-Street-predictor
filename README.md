@@ -56,7 +56,13 @@ Swapping brokers means writing one adapter.
 
 ## Quick start
 
-Full walkthrough, including every key and the daily Kite login: **[SETUP.md](SETUP.md)**.
+Two ways to run it:
+
+- **Private (recommended):** Docker Compose on your laptop or a VPS, reachable only over
+  Tailscale. Full walkthrough, including every key and the daily Kite login:
+  **[SETUP.md](SETUP.md)**.
+- **Free public link:** Vercel (web + API) + Neon + Upstash + GitHub Actions for jobs.
+  Step by step, with the trade-offs: **[DEPLOY_VERCEL.md](DEPLOY_VERCEL.md)**.
 
 ```bash
 cp .env.example .env                 # fill in SECRET_KEY, POSTGRES_PASSWORD, Kite, Telegram
@@ -77,9 +83,11 @@ backend/
   app/api/         FastAPI routers: auth, today, stocks, kite, health
   app/security/    argon2 + TOTP auth, Fernet encryption for stored secrets
   alembic/         migrations (daily_bar and intraday_bar are hypertables)
-  tests/           88 tests (4 skip until real fixtures are recorded): adapters, lookahead
-                   safety, calendar, auth, job runner, API
+  api/index.py      Vercel entrypoint (vercel.json, requirements.txt)
+  tests/           100 tests (4 skip until real fixtures are recorded): adapters, lookahead
+                   safety, calendar, auth, job runner, API, deploy config
 frontend/          Next.js App Router + Tailwind + lightweight-charts (dark by default)
+.github/workflows/ dalal-jobs.yml: the job schedule when hosted on Vercel
 imports/           manual CSV drop-in (holidays, index lists, Screener exports); gitignored
 data/              backups, fixtures, later model artifacts; gitignored
 ```

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from datetime import time
 from functools import lru_cache
 from zoneinfo import ZoneInfo
@@ -22,8 +23,11 @@ class Settings(BaseSettings):
     session_ttl_hours: int = 168
     log_level: str = "info"
 
-    # Database / cache
+    # Database / cache. On Vercel the Neon/Upstash integrations inject POSTGRES_URL /
+    # KV_URL; DATABASE_URL / REDIS_URL win when both are set.
     database_url: str | None = None
+    postgres_url: str | None = None
+    kv_url: str | None = None
     postgres_user: str = "dalal"
     postgres_password: str = ""
     postgres_db: str = "dalal"
@@ -62,7 +66,9 @@ class Settings(BaseSettings):
     backfill_years: int = 5
     min_avg_turnover_cr: float = 10.0
 
-    # Jobs
+    # Jobs. "internal": the scheduler container runs APScheduler (Docker Compose).
+    # "external": something else triggers `app.cli run-job` (GitHub Actions on Vercel).
+    scheduler_mode: str = "internal"
     job_max_attempts: int = 3
     job_backoff_seconds: float = 30.0
     global_cues_refresh_minutes: int = 10
@@ -72,6 +78,9 @@ class Settings(BaseSettings):
     paper_capital: float = 1_000_000.0
     risk_per_trade_pct: float = 1.0
     min_sample_size: int = 100
+
+    # One-time first-user setup through the web UI (/setup?token=...). Empty = disabled.
+    setup_token: str = ""
 
     # Paths
     imports_dir: str = "/imports"
@@ -87,12 +96,23 @@ class Settings(BaseSettings):
 
     @property
     def sqlalchemy_url(self) -> str:
-        if self.database_url:
-            return self.database_url
+        url = self.database_url or self.postgres_url
+        if url:
+            return normalize_db_url(url)
         return (
             f"postgresql+psycopg://{self.postgres_user}:{self.postgres_password}"
             f"@{self.postgres_host}:{self.postgres_port}/{self.postgres_db}"
         )
+
+    @property
+    def cache_url(self) -> str:
+        if "redis_url" in self.model_fields_set or not self.kv_url:
+            return self.redis_url
+        return self.kv_url
+
+    @property
+    def is_serverless(self) -> bool:
+        return bool(os.environ.get("VERCEL"))
 
     @property
     def watchlist_symbols(self) -> list[str]:
@@ -109,6 +129,14 @@ class Settings(BaseSettings):
     @property
     def kite_redirect_url(self) -> str:
         return f"{self.app_base_url.rstrip('/')}/api/kite/callback"
+
+
+def normalize_db_url(url: str) -> str:
+    """Hosted Postgres (Neon, Vercel) hands out postgres:// URLs; SQLAlchemy needs a driver."""
+    for prefix in ("postgres://", "postgresql://"):
+        if url.startswith(prefix):
+            return "postgresql+psycopg://" + url[len(prefix) :]
+    return url
 
 
 @lru_cache

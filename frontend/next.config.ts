@@ -2,7 +2,13 @@ import type { NextConfig } from "next";
 
 // The browser only ever talks to this Next.js server; /api/* is proxied to FastAPI so
 // the session cookie stays same-origin. BACKEND_URL is read at build time.
-const backend = process.env.BACKEND_URL ?? "http://backend:8000";
+//   Docker Compose: http://backend:8000 (default)
+//   Vercel: the URL of the dalal-api project, e.g. https://dalal-api.vercel.app
+const onVercel = Boolean(process.env.VERCEL);
+if (onVercel && !process.env.BACKEND_URL) {
+  throw new Error("Set BACKEND_URL in this Vercel project to the dalal-api URL (see DEPLOY_VERCEL.md).");
+}
+const backend = (process.env.BACKEND_URL ?? "http://backend:8000").replace(/\/$/, "");
 
 const securityHeaders = [
   { key: "X-Frame-Options", value: "DENY" },
@@ -12,7 +18,8 @@ const securityHeaders = [
 ];
 
 const config: NextConfig = {
-  output: "standalone",
+  // Standalone output is for the Docker image; Vercel builds its own output.
+  output: onVercel ? undefined : "standalone",
   poweredByHeader: false,
   async rewrites() {
     return [

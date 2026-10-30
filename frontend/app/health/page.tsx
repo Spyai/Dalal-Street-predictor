@@ -29,15 +29,34 @@ export default function HealthPage() {
     <div className="space-y-6">
       <div className="flex flex-wrap items-center gap-3">
         <h1 className="text-xl font-semibold">Health</h1>
-        <Chip label="Scheduler" ok={data.scheduler_alive}
-              detail={data.scheduler_heartbeat ? `heartbeat ${ago(data.scheduler_heartbeat)}` : "no heartbeat"} />
+        <Chip
+          label={data.scheduler_mode === "external" ? "Scheduler (GitHub Actions)" : "Scheduler"}
+          ok={data.scheduler_alive}
+          detail={
+            data.scheduler_heartbeat
+              ? `${data.scheduler_mode === "external" ? "last job" : "heartbeat"} ${ago(data.scheduler_heartbeat)}`
+              : data.scheduler_mode === "external"
+                ? "no job has run yet"
+                : "no heartbeat"
+          }
+        />
         <Chip label="Database" ok={data.database === "ok"} detail={data.database} />
         <Chip label="Redis" ok={data.redis === "ok"} detail={data.redis} />
       </div>
       {!data.scheduler_alive && (
         <Notice tone="down">
-          The scheduler isn&apos;t running, so no scheduled job will fire. Check{" "}
-          <code>docker compose logs scheduler</code>.
+          {data.scheduler_mode === "external" ? (
+            <>
+              No scheduled job has run recently. Check the &quot;Dalal jobs&quot; workflow in
+              your GitHub repo&apos;s Actions tab, and that the <code>DALAL_JOBS_ENABLED</code>{" "}
+              variable is <code>true</code>.
+            </>
+          ) : (
+            <>
+              The scheduler isn&apos;t running, so no scheduled job will fire. Check{" "}
+              <code>docker compose logs scheduler</code>.
+            </>
+          )}
         </Notice>
       )}
 

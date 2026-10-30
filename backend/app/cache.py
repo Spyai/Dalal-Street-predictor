@@ -12,10 +12,17 @@ import redis
 
 from app.config import get_settings
 
+HEARTBEAT_KEY = "scheduler:heartbeat"
+
 
 @lru_cache
 def get_redis() -> redis.Redis:
-    return redis.Redis.from_url(get_settings().redis_url, decode_responses=True)
+    return redis.Redis.from_url(
+        get_settings().cache_url,
+        decode_responses=True,
+        socket_timeout=5,
+        socket_connect_timeout=5,
+    )
 
 
 def cache_get_json(key: str, r: redis.Redis | None = None) -> Any | None:
