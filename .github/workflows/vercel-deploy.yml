@@ -27,8 +27,9 @@ jobs:
     env:
       VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
       VERCEL_SCOPE: ${{ vars.VERCEL_SCOPE }}
-      DALAL_API_PROJECT: ${{ vars.DALAL_API_PROJECT }}
-      DALAL_WEB_PROJECT: ${{ vars.DALAL_WEB_PROJECT }}
+      # The two Vercel projects already connected to this repo; override with repo variables.
+      DALAL_API_PROJECT: ${{ vars.DALAL_API_PROJECT || 'dalal-streetpredictor' }}
+      DALAL_WEB_PROJECT: ${{ vars.DALAL_WEB_PROJECT || 'dalal-street-predictor' }}
       VERCEL_TELEMETRY_DISABLED: "1"
     steps:
       - name: Check for VERCEL_TOKEN

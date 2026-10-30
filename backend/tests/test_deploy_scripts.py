@@ -172,6 +172,15 @@ def test_first_deploy_creates_everything_then_redeploy_is_idempotent(
     assert first.returncode == 0, first.stdout + first.stderr
     calls = _calls(fake_cli)
     assert any("project create dalal-api" in c for c in calls)
+    # Each project is pointed at its folder, so Vercel's own Git builds work too.
+    assert any(
+        "project update dalal-api --root-directory backend --framework other" in c for c in calls
+    )
+    assert any(
+        "project update dalal --root-directory frontend --framework nextjs" in c for c in calls
+    )
+    deploys = [c for c in calls if " deploy " in f" {c} "]
+    assert deploys and all(f"deploy {REPO} --prod" in c for c in deploys), "deploy from repo root"
     assert any("integration add neon --name dalal-db" in c for c in calls)
     assert any("integration resource connect dalal-db dalal-api --yes" in c for c in calls)
     secret = _var(fake_cli, "dalal-api", "SECRET_KEY")
@@ -198,7 +207,7 @@ def test_first_deploy_creates_everything_then_redeploy_is_idempotent(
     calls = _calls(fake_cli)
     assert not any("project create" in c or "integration add" in c for c in calls)
     assert _var(fake_cli, "dalal-api", "SECRET_KEY") == secret, "SECRET_KEY must never rotate"
-    api_deploys = [c for c in calls if c.split()[3:4] == ["deploy"] and "/backend" in c]
+    api_deploys = [c for c in calls if " deploy " in f" {c} " and "--project dalal-api" in c]
     assert len(api_deploys) == 1, "no extra API redeploy when APP_BASE_URL is unchanged"
 
 

@@ -68,7 +68,7 @@ jobs:
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           VERCEL_SCOPE: ${{ vars.VERCEL_SCOPE }}
-          DALAL_API_PROJECT: ${{ vars.DALAL_API_PROJECT }}
+          DALAL_API_PROJECT: ${{ vars.DALAL_API_PROJECT || 'dalal-streetpredictor' }}
           GH_DATABASE_URL: ${{ secrets.DATABASE_URL }}
           GH_REDIS_URL: ${{ secrets.REDIS_URL }}
           GH_SECRET_KEY: ${{ secrets.SECRET_KEY }}

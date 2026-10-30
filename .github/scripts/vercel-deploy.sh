@@ -8,13 +8,17 @@
 # encrypts the stored TOTP seed and Kite token.
 #
 # Needs VERCEL_TOKEN. Optional: VERCEL_SCOPE (team slug), DALAL_API_PROJECT,
-# DALAL_WEB_PROJECT, DALAL_DB_NAME, DALAL_SKIP_HEALTHCHECK=1 (local tests only).
+# DALAL_WEB_PROJECT (existing projects are reused and re-pointed at backend/ and
+# frontend/), DALAL_DB_NAME, DALAL_SKIP_HEALTHCHECK=1 (local tests only).
 set -euo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 HERE="$ROOT/.github/scripts"
 API=${DALAL_API_PROJECT:-dalal-api}
 WEB=${DALAL_WEB_PROJECT:-dalal}
+# Variables are set for production and preview, so Vercel's own Git builds of pull
+# requests get the same settings as production deploys.
+TARGETS=production,preview
 DB_NAME=${DALAL_DB_NAME:-dalal-db}
 SUMMARY=${GITHUB_STEP_SUMMARY:-/dev/null}
 OUTPUT=${GITHUB_OUTPUT:-/dev/null}
@@ -42,7 +46,7 @@ pull_api_env() {
 set_var() {
   local name=$1 value=$2 project=$3
   shift 3
-  vc env add "$name" production --value "$value" --project "$project" --no-sensitive --yes "$@" >/dev/null
+  vc env add "$name" "$TARGETS" --value "$value" --project "$project" --no-sensitive --yes "$@" >/dev/null
 }
 
 ensure_project() {
@@ -57,6 +61,14 @@ ensure_project() {
   fi
 }
 
+# Both projects build from this monorepo: point each at its folder, so Vercel's Git
+# integration (if connected) builds the same thing this script deploys.
+configure_project() { # PROJECT ROOT_DIR FRAMEWORK
+  vc project update "$1" --root-directory "$2" --framework "$3" --yes >/dev/null \
+    || fail "Couldn't set Root Directory '$2' on Vercel project '$1'."
+  echo "project $1: root directory $2, framework $3"
+}
+
 prod_url() { # PROJECT FALLBACK_URL
   local found
   if found=$(vc api "/v9/projects/$1/domains" --raw 2>/dev/null | py domain); then
@@ -67,15 +79,18 @@ prod_url() { # PROJECT FALLBACK_URL
   fi
 }
 
-deploy() { # PROJECT DIR [vercel deploy flags...]; prints the deployment URL
-  local project=$1 dir=$2
-  shift 2
-  vc deploy "$ROOT/$dir" --prod --yes --project "$project" "$@" | tail -n 1
+deploy() { # PROJECT [vercel deploy flags...]; prints the deployment URL
+  # Deploy from the repo root: Vercel applies the project's Root Directory itself.
+  local project=$1
+  shift
+  vc deploy "$ROOT" --prod --yes --project "$project" "$@" | tail -n 1
 }
 
 step "Projects"
 ensure_project "$API"
 ensure_project "$WEB"
+configure_project "$API" backend other
+configure_project "$WEB" frontend nextjs
 
 step "Database"
 pull_api_env
@@ -122,20 +137,23 @@ DB=$(py get "$WORK/api.env" DATABASE_URL_UNPOOLED POSTGRES_URL_NON_POOLING DATAB
 step "Deploy API"
 REGION=$(py region "$WORK/api.env")
 echo "functions region: $REGION (next to the database)"
-API_DEPLOY=$(deploy "$API" backend --regions "$REGION")
+# Same region for Vercel's own Git builds (best effort; the deploy flag is what counts).
+vc api "/v9/projects/$API" -X PATCH -f "serverlessFunctionRegion=$REGION" >/dev/null 2>&1 \
+  || echo "::warning::Couldn't set the default function region on $API; Git builds may use iad1."
+API_DEPLOY=$(deploy "$API" --regions "$REGION")
 API_URL=$(prod_url "$API" "$API_DEPLOY")
 echo "API: $API_URL"
 
 step "Deploy web"
 set_var BACKEND_URL "$API_URL" "$WEB" --force
-WEB_DEPLOY=$(deploy "$WEB" frontend --build-env "BACKEND_URL=$API_URL")
+WEB_DEPLOY=$(deploy "$WEB" --build-env "BACKEND_URL=$API_URL")
 WEB_URL=$(prod_url "$WEB" "$WEB_DEPLOY")
 echo "web: $WEB_URL"
 
 if [ "$(py get "$WORK/api.env" APP_BASE_URL || true)" != "$WEB_URL" ]; then
   step "Point the API at the web URL"
   set_var APP_BASE_URL "$WEB_URL" "$API" --force
-  deploy "$API" backend --regions "$REGION" >/dev/null
+  deploy "$API" --regions "$REGION" >/dev/null
 fi
 
 NEEDS_SETUP=unknown

@@ -43,6 +43,13 @@ if cmd == ["project", "create"]:
     (state / "projects").mkdir(exist_ok=True)
     (state / "projects" / clean[2]).touch()
     sys.exit(0)
+if cmd == ["project", "update"]:
+    project = clean[2]
+    if not (state / "projects" / project).exists():
+        sys.exit(1)
+    settings = {"root": opt("--root-directory"), "framework": opt("--framework")}
+    (state / "projects" / project).write_text(json.dumps(settings))
+    sys.exit(0)
 if cmd == ["env", "pull"]:
     out = pathlib.Path(clean[2])
     d = envdir(opt("--project"))
@@ -50,7 +57,10 @@ if cmd == ["env", "pull"]:
     out.write_text("# Created by Vercel CLI\n" + "\n".join(lines) + "\n")
     sys.exit(0)
 if cmd == ["env", "add"]:
-    name, project, value = clean[2], opt("--project"), opt("--value")
+    name, targets, project, value = clean[2], clean[3], opt("--project"), opt("--value")
+    if targets != "production,preview":
+        print(f"Error: unexpected targets {targets}", file=sys.stderr)
+        sys.exit(2)
     d = envdir(project)
     d.mkdir(parents=True, exist_ok=True)
     if (d / name).exists() and "--force" not in clean:
@@ -80,11 +90,18 @@ if cmd == ["integration", "resource"] and clean[2] == "connect":
     sys.exit(0)
 if clean and clean[0] == "deploy":
     project = opt("--project")
+    root = json.loads((state / "projects" / project).read_text() or "{}").get("root")
+    target = pathlib.Path(clean[1]) / (root or "")
+    if not target.is_dir():
+        print(f"Error: {target} does not exist", file=sys.stderr)
+        sys.exit(1)
     n = len(list(state.glob("deploy-*")))
     (state / f"deploy-{project}-{n}").write_text(" ".join(clean))
     print(f"Inspect: https://vercel.com/x/{project}/{n}", file=sys.stderr)
     print(f"https://{project}-{n}abc-me.vercel.app")
     sys.exit(0)
+if clean and clean[0] == "api" and "-X" in clean:
+    sys.exit(0)  # PATCH project settings
 if clean and clean[0] == "api":
     p = clean[1].split("/")[3]
     print(
