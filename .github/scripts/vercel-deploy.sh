@@ -126,6 +126,14 @@ MANUAL_DB="In Vercel, open $API → Storage → Create Database → Neon, choose
 # creates anything that costs money without asking.
 create_neon() {
   local ids plan iid pid target
+  # A database left by an earlier, interrupted run only needs connecting.
+  if vc integration resource connect "$DB_NAME" "$API" --yes >"$WORK/neon-connect.log" 2>&1; then
+    echo "connected the existing $DB_NAME"
+    return
+  fi
+  grep -qi "already connected" "$WORK/neon-connect.log" \
+    && fail "$DB_NAME is already connected to $API, but no DATABASE_URL reached $API (an env-var prefix?). In Vercel → $API → Storage, disconnect $DB_NAME, then re-run this workflow."
+  vc integration accept-terms neon --yes >/dev/null 2>&1 || true
   if ! vc api /v2/integrations/integration/neon --raw >"$WORK/neon.json" 2>"$WORK/neon.err" \
     || ! ids=$(py neon-product <"$WORK/neon.json"); then
     cat "$WORK/neon.err" >&2
@@ -138,17 +146,13 @@ create_neon() {
   plan=$(py free-plan <"$WORK/plans.json") \
     || fail "Neon offers no free plan to this account, and Dalal won't create a paid database. $MANUAL_DB"
   echo "Neon plan: free ($plan)"
-  vc integration accept-terms neon --yes >/dev/null 2>&1 || true
   # From a scratch directory: `integration add` may install agent skill files into the
   # current directory, and the repo root is what gets deployed.
   (cd "$WORK" && vc_logged neon-add integration add "$target" --name "$DB_NAME" --plan "$plan" \
     --no-connect --no-env-pull) \
     || echo "::warning::'integration add' failed; $DB_NAME may already exist. Trying to connect it."
-  if ! vc_logged neon-connect integration resource connect "$DB_NAME" "$API" --yes; then
-    grep -qi "already connected" "$WORK/neon-connect.log" \
-      && fail "$DB_NAME is already connected to $API, but no DATABASE_URL reached $API (an env-var prefix?). In Vercel → $API → Storage, disconnect $DB_NAME, then re-run this workflow."
-    fail "Couldn't create or connect the Neon database automatically. $MANUAL_DB"
-  fi
+  vc_logged neon-connect integration resource connect "$DB_NAME" "$API" --yes \
+    || fail "Couldn't create or connect the Neon database automatically. $MANUAL_DB"
 }
 
 step "Projects"

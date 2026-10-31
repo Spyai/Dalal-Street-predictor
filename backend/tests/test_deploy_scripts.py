@@ -71,6 +71,11 @@ def test_neon_free_plan_is_picked_and_paid_plans_never_are() -> None:
     }
     assert h.free_plan(plans) == "p_free"
     assert h.free_plan({"plans": [{"id": "x", "name": "Free trial", "cost": "$5/month"}]}) is None
+    assert h.free_plan({"plans": [{"id": "z", "name": "Free", "cost": "$0.00/month"}]}) == "z"
+    for usage_priced in ("$0.106/CU-hour", "0.5 USD", "$0 for 14 days, then $19/month"):
+        assert h.free_plan({"plans": [{"id": "x", "name": "Free", "cost": usage_priced}]}) is None
+    card = {"id": "x", "name": "Free", "cost": "$0", "paymentMethodRequired": True}
+    assert h.free_plan({"plans": [card]}) is None
     assert h.free_plan({"plans": [{"id": "x", "name": "Scale"}]}) is None
     assert h.free_plan({"error": {"code": "forbidden"}}) is None
     one = {"id": "oac_1", "slug": "neon", "products": [{"id": "iap_1", "slug": "neon"}]}
@@ -274,6 +279,18 @@ def test_deploy_never_creates_a_paid_database(fake_cli: dict[str, str]) -> None:
     assert "won't create a paid database" in res.stdout
     assert "Free plan" in Path(fake_cli["GITHUB_STEP_SUMMARY"]).read_text()
     assert not any("integration add" in c for c in _calls(fake_cli))
+
+
+def test_rerun_connects_a_database_left_by_an_interrupted_run(
+    migrated_db: None, fake_cli: dict[str, str]
+) -> None:
+    state = Path(fake_cli["FAKE_STATE"], "resources")
+    state.mkdir(parents=True)
+    (state / "dalal-db").touch()  # created, never connected
+    res = _deploy({**fake_cli, "FAKE_NO_FREE_PLAN": "1"})  # plan lookup must not matter
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "connected the existing dalal-db" in res.stdout
+    assert not any("integration add" in c or " api /v1/" in f" {c}" for c in _calls(fake_cli))
 
 
 def test_already_connected_database_without_url_explains_itself(fake_cli: dict[str, str]) -> None:

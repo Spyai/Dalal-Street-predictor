@@ -25,7 +25,8 @@ if [ -n "${VERCEL_TOKEN:-}" ]; then
   vc() { vercel --token "$VERCEL_TOKEN" --non-interactive ${VERCEL_SCOPE:+--scope "$VERCEL_SCOPE"} "$@"; }
   if ! vc env pull "$WORK/api.env" --environment production --project "$API" --yes \
     >"$WORK/pull.log" 2>&1; then
-    grep -qi "not found" "$WORK/pull.log" \
+    # The CLI's own wording only: "vercel: command not found" must not count.
+    grep -qiE 'was not found in the current scope|project_not_found' "$WORK/pull.log" \
       && not_configured "Vercel project $API doesn't exist yet. Run the 'Deploy to Vercel' workflow first."
     # Anything else (expired token, no access) must turn the run red, not skip it.
     cat "$WORK/pull.log" >&2

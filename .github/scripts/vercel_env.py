@@ -193,7 +193,8 @@ def neon_product(integration: dict[str, Any]) -> tuple[str, str, str] | None:
 
 
 FREE = re.compile(r"\bfree\b", re.I)
-ZERO_COST = re.compile(r"^\s*(free|\$?0+(\.0+)?)\b", re.I)
+# The whole cost must be zero: "$0", "$0.00/month", "Free". "$0.106/CU-hour" is not.
+ZERO_COST = re.compile(r"^\s*(free|\$?\s*0+(\.0+)?)\s*(/\s*[a-z]+)?\s*$", re.I)
 
 
 def free_plan(payload: dict[str, Any]) -> str | None:
@@ -201,7 +202,11 @@ def free_plan(payload: dict[str, Any]) -> str | None:
     plans = [p for p in dicts(payload.get("plans")) if not p.get("disabled")]
     for plan in plans:
         cost = str(plan.get("cost") or "")
-        if FREE.search(str(plan.get("name") or "")) and (not cost or ZERO_COST.match(cost)):
+        if (
+            FREE.search(str(plan.get("name") or ""))
+            and (not cost or ZERO_COST.match(cost))
+            and plan.get("paymentMethodRequired") is not True
+        ):
             return str(plan["id"])
     return None
 
