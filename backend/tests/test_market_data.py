@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
+import pandas as pd
 import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.config import IST
 from app.models import DailyBar, GlobalCueSnapshot, Instrument
 from app.providers.base import (
     Bar,
@@ -19,9 +22,16 @@ from app.providers.base import (
     Quote,
     SourceUnavailable,
 )
+from app.providers.yfinance_provider import YFinanceProvider, capture_yf_errors, request_failures
 from app.services import global_cues, instruments
 from app.services.backfill import run_backfill
-from app.services.market_data import ingest_bhavcopy, upsert_daily_bars
+from app.services.market_data import (
+    ensure_recent,
+    fetch_daily,
+    ingest_bhavcopy,
+    last_final_global_day,
+    upsert_daily_bars,
+)
 
 D = date(2026, 10, 29)
 
@@ -170,3 +180,152 @@ def test_global_cues_snapshot_and_staleness(db: Session) -> None:
     assert v.last == 5000 and v.status == "stale" and "latest refresh failed" in (v.note or "")
     n = len(db.scalars(select(GlobalCueSnapshot).where(GlobalCueSnapshot.key == "sp500")).all())
     assert n == 2, "every attempt is kept as a snapshot"
+
+
+# ------------------------------------------------------------------ provisional bars (B)
+
+
+def test_same_source_overwrites_its_own_earlier_bar(db: Session) -> None:
+    """A bar stored while its market was open (a provisional print) is replaced by the final
+    one from the same source; a lower-priority source still cannot touch it."""
+    inst = _inst(db, "^GSPC")
+    upsert_daily_bars(db, inst.id, [_bar(D, 5000)], "yfinance")
+    db.commit()
+    upsert_daily_bars(db, inst.id, [_bar(D, 5050)], "yfinance")
+    db.commit()
+    row = _get(db, inst.id, D)
+    assert row.close == 5050 and row.source == "yfinance"
+    upsert_daily_bars(db, inst.id, [_bar(D, 1)], "unknown_source")
+    db.commit()
+    assert _get(db, inst.id, D).close == 5050
+
+
+class ClosesProvider(FakeProvider):
+    """Returns the bars it is given (date -> close) and records every request."""
+
+    def __init__(self, closes: dict[date, float]) -> None:
+        super().__init__("yfinance", set())
+        self.closes = closes
+
+    def daily_bars(self, symbol: str, exchange: str, start: date, end: date) -> list[Bar]:
+        self.requests.append((symbol, start, end))
+        return [_bar(d, c) for d, c in sorted(self.closes.items()) if start <= d <= end]
+
+
+def test_ensure_recent_refetch_window_replaces_a_provisional_bar(db: Session) -> None:
+    inst = _inst(db, "ES=F")
+    for i in range(5):  # history through D, with D's bar a mid-session print
+        upsert_daily_bars(db, inst.id, [_bar(D - timedelta(days=i), 100 + i)], "yfinance")
+    db.commit()
+    final = ClosesProvider({D - timedelta(days=2): 102, D - timedelta(days=1): 101, D: 123.0})
+
+    # Default: a bar for D exists, nothing is requested, the provisional print stays.
+    assert ensure_recent(db, inst, D, [final], years=1) == (None, [])
+    assert final.requests == [] and _get(db, inst.id, D).close == 100
+
+    # With a re-fetch window the last three calendar days are requested again and the
+    # same-source upsert replaces the provisional D bar with the final one.
+    source, errors = ensure_recent(db, inst, D, [final], years=1, refetch_days=3)
+    db.commit()
+    assert (source, errors) == ("yfinance", [])
+    assert final.requests == [("ES=F", D - timedelta(days=2), D)]
+    assert _get(db, inst.id, D).close == 123.0
+
+    # Behind by more than the window: the request starts where the history ends.
+    later = D + timedelta(days=5)
+    final.closes[later] = 130.0
+    ensure_recent(db, inst, later, [final], years=1, refetch_days=3)
+    assert final.requests[-1] == ("ES=F", D + timedelta(days=1), later)
+
+    # No history at all: the usual multi-year request, the window changes nothing.
+    fresh = _inst(db, "NQ=F")
+    ensure_recent(db, fresh, D, [final], years=1, refetch_days=3)
+    assert final.requests[-1] == ("NQ=F", D - timedelta(days=365 + 7), D)
+
+
+def test_last_final_global_day_is_the_previous_utc_day() -> None:
+    assert last_final_global_day(datetime(2026, 10, 30, 14, 0, tzinfo=UTC)) == date(2026, 10, 29)
+    ist_1930 = datetime(2026, 10, 30, 19, 30, tzinfo=IST)  # 14:00 UTC: US session open
+    assert last_final_global_day(ist_1930) == date(2026, 10, 30 - 1)
+    ist_0730 = datetime(2026, 10, 30, 7, 30, tzinfo=IST)  # 02:00 UTC: US closed hours ago
+    assert last_final_global_day(ist_0730) == date(2026, 10, 29)
+    ist_0400 = datetime(2026, 10, 30, 4, 0, tzinfo=IST)  # still 29 Oct in UTC
+    assert last_final_global_day(ist_0400) == date(2026, 10, 28)
+    with pytest.raises(ValueError, match="timezone"):
+        last_final_global_day(datetime(2026, 10, 30, 14, 0))
+
+
+# ------------------------------------------------------------------ "no rows" vs failure (C)
+
+
+def _logging_downloader(messages: list[str], frame: pd.DataFrame | None = None) -> Any:
+    """A stand-in for yfinance.download that complains the way yfinance does (ERROR records
+    on the `yfinance` logger) and returns `frame` (empty by default)."""
+
+    def dl(**kw: Any) -> pd.DataFrame | None:
+        log = logging.getLogger("yfinance")
+        for m in messages:
+            log.error(m)
+        return pd.DataFrame() if frame is None else frame
+
+    return dl
+
+
+NO_ROWS = [
+    "\n1 Failed download:",
+    "['^N225']: possibly delisted; no price data found  (1d 2026-10-29 -> 2026-10-30)",
+]
+RATE_LIMITED = [
+    "\n1 Failed download:",
+    "['^N225']: YFRateLimitError('Too Many Requests. Rate limited. Try after a while.')",
+]
+
+
+def test_yfinance_empty_range_is_no_rows_not_a_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    errors: list[str] = []
+    monkeypatch.setattr("app.services.market_data.mark_error", lambda s, e: errors.append(s))
+    monkeypatch.setattr("app.services.market_data.mark_ok", lambda *a, **k: None)
+
+    closed = YFinanceProvider(downloader=_logging_downloader(NO_ROWS))
+    assert closed.daily_bars("^N225", "GLOBAL", D, D) == []
+    inst = Instrument(id=1, symbol="^N225", exchange="GLOBAL")
+    n, source, reasons = fetch_daily(None, inst, D, D, [closed])  # type: ignore[arg-type]
+    assert (n, source) == (0, None)
+    assert reasons == ["yfinance: no bars for GLOBAL:^N225 2026-10-29..2026-10-29"]
+    assert errors == [], "a closed market is not a source error"
+
+    limited = YFinanceProvider(downloader=_logging_downloader(RATE_LIMITED))
+    with pytest.raises(SourceUnavailable, match="Rate limited"):
+        limited.daily_bars("^N225", "GLOBAL", D, D)
+    n, source, reasons = fetch_daily(None, inst, D, D, [limited])  # type: ignore[arg-type]
+    assert (n, source) == (0, None) and "Rate limited" in reasons[0]
+    assert errors == ["yfinance"], "a refused request is"
+
+    # An empty frame with no explanation at all is still treated as unavailable, and a
+    # 10-day quote window with nothing in it is never "no rows".
+    silent = YFinanceProvider(downloader=_logging_downloader([]))
+    with pytest.raises(SourceUnavailable, match="blocked, rate-limited or delisted"):
+        silent.daily_bars("^N225", "GLOBAL", D, D)
+    with pytest.raises(SourceUnavailable):
+        closed.quotes([("^N225", "GLOBAL")])
+
+
+def test_yfinance_error_classification() -> None:
+    assert request_failures(NO_ROWS) == []
+    assert (
+        request_failures(
+            ["2 Failed downloads:", "['A']: Data doesn't exist for startDate = 1, endDate = 2"]
+        )
+        == []
+    )
+    assert request_failures(RATE_LIMITED) == [RATE_LIMITED[1]]
+    assert request_failures(["['A']: possibly delisted; no timezone found"]) == [
+        "['A']: possibly delisted; no timezone found"
+    ]
+    assert request_failures(["['A']: ConnectionError(...)", "", "['B']: no price data found"]) == [
+        "['A']: ConnectionError(...)"
+    ]
+    with capture_yf_errors() as got:
+        logging.getLogger("yfinance").error("boom")
+        logging.getLogger("yfinance").warning("not captured")
+    assert got == ["boom"]

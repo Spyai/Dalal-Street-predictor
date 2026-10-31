@@ -86,7 +86,6 @@ class Settings(BaseSettings):
     wf_min_train_days: int = 500  # walk-forward: first fold trains on this many sessions
     wf_step_days: int = 21  # walk-forward: refit every N sessions
     retrain_min_brier_gain: float = 0.005  # challenger must beat champion's Brier by this
-    nifty_expiry_weekday: int = 1  # 0=Mon; weekly index expiry day (Tuesday since 2025)
     mlflow_tracking_uri: str = ""  # optional; empty = models are registered in Postgres only
     paper_capital: float = 1_000_000.0
     risk_per_trade_pct: float = 1.0

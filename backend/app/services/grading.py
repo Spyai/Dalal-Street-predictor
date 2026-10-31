@@ -9,6 +9,15 @@ metrics (`app.ml.metrics`), so a live grade and an out-of-sample metric are dire
 comparable. `actual_pct` is rounded through `core.finite()` *before* it is classified,
 so the number shown and the class it produced always agree; with the default threshold a
 move of exactly +0.30 % is FLAT.
+
+Provenance: `source` names where the close came from once the close is graded, and the
+gap's own source and time are kept in `notes` ("gap graded from kite at 2026-11-02 09:20
+IST; close from nse_bhavcopy"), so neither grade overwrites the other's origin.
+
+A call that can never be graded (its session never happened, or the data is unusable)
+is *voided* with `void_grade`: `actual_close` stays NULL, `error_category` says why and
+`notes` carry the operator's reason; the ledger row itself is untouched and
+`ledger.ungraded` stops listing it.
 """
 
 from __future__ import annotations
@@ -22,7 +31,7 @@ from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.orm import Session
 
-from app.config import Settings, get_settings
+from app.config import IST, Settings, get_settings
 from app.ml.core import (
     BASELINE_NAMES,
     CLASS_INDEX,
@@ -35,6 +44,10 @@ from app.ml.core import (
 from app.ml.metrics import brier, log_loss
 from app.models import Prediction, PredictionGrade
 from app.services.ledger import calls_for_session
+
+# Why a call was voided instead of graded (stored in PredictionGrade.error_category).
+VOID_CATEGORIES: tuple[str, ...] = ("no_session", "data_error")
+VOID_SOURCE = "manual"
 
 
 @dataclass
@@ -100,12 +113,36 @@ def _upsert(db: Session, prediction_id: int, values: dict[str, Any]) -> Predicti
     ).scalar_one()
 
 
+def _ist(at: datetime) -> str:
+    return at.astimezone(IST).strftime("%Y-%m-%d %H:%M IST")
+
+
+def gap_provenance(source: str, at: datetime) -> str:
+    """The note that records where and when the gap was graded."""
+    return f"gap graded from {source} at {_ist(at)}"
+
+
+def _gap_provenance_of(existing: PredictionGrade) -> str | None:
+    """The gap's own provenance from an existing grade row, or None if the gap is ungraded.
+
+    Taken from `notes` when the row already carries it; otherwise the row was written by
+    `grade_gap` alone, so its `source` is the gap's source.
+    """
+    if existing.gap_graded_at is None:
+        return None
+    notes = existing.notes or ""
+    if notes.startswith("gap graded from "):
+        return notes.split("; close from ", 1)[0]
+    return gap_provenance(existing.source, existing.gap_graded_at)
+
+
 def grade_gap(
     db: Session, p: Prediction, actual_open: float, *, now: datetime, source: str
 ) -> PredictionGrade:
     """Grade the opening-gap call against the actual open (09:20 job).
 
-    Only the gap fields are written; an existing close grade is left untouched.
+    Only the gap fields are written. An existing close grade is left untouched, including
+    its `source`: the gap's source then goes into `notes` instead.
     """
     open_ = finite(actual_open)
     if open_ is None:
@@ -118,8 +155,12 @@ def grade_gap(
         "gap_actual_pct": gap_pct,
         "gap_correct": gap_correct,
         "gap_graded_at": now,
-        "source": source,
     }
+    if existing is not None and existing.actual_close is not None:
+        values["source"] = existing.source  # the close's; the gap's goes into notes
+        values["notes"] = f"{gap_provenance(source, now)}; close from {existing.source}"
+    else:
+        values["source"] = source
     return _upsert(db, p.id, values)
 
 
@@ -136,8 +177,10 @@ def grade_close(
     """Grade the market call against the session close (15:45 job).
 
     Writes actual_pct, actual_class, correct, Brier, log loss and every baseline's
-    correctness. If `actual_open` is given and the gap was not graded yet, the gap is
-    graded too; a gap grade already in place is kept as it was.
+    correctness; `source` becomes the close's source. If `actual_open` is given and the
+    gap was not graded yet, the gap is graded too; a gap grade already in place is kept
+    as it was, and its own source and time are preserved in `notes`. Grading a voided
+    call clears the void.
     """
     close = finite(actual_close)
     if close is None:
@@ -162,13 +205,50 @@ def grade_close(
         "source": source,
     }
     open_ = finite(actual_open)
-    if existing is not None and existing.gap_graded_at is not None:
+    gap_note = _gap_provenance_of(existing) if existing is not None else None
+    if gap_note is not None:
         pass  # the 09:20 grade stands
     elif open_ is not None:
         gap_pct, gap_correct = gap_outcome(p, open_)
         values.update(
             actual_open=open_, gap_actual_pct=gap_pct, gap_correct=gap_correct, gap_graded_at=now
         )
+        gap_note = gap_provenance(source, now)
+    if existing is not None and existing.actual_close is None and existing.error_category:
+        values["error_category"] = None  # a real close supersedes the void
+    values["notes"] = f"{gap_note}; close from {source}" if gap_note is not None else None
+    return _upsert(db, p.id, values)
+
+
+def void_grade(
+    db: Session,
+    p: Prediction,
+    *,
+    now: datetime,
+    reason: str,
+    category: str = "no_session",
+    source: str = VOID_SOURCE,
+) -> PredictionGrade:
+    """Record that a call cannot be graded: no close will come (`no_session`) or the data
+    is unusable (`data_error`). `actual_close` stays NULL; an existing gap grade is kept.
+
+    Refuses to void a call that already has a close grade, and requires a reason: a
+    voided call shows in the history with the reason next to it, never as a silent gap.
+    """
+    if category not in VOID_CATEGORIES:
+        raise ValueError(f"category must be one of {', '.join(VOID_CATEGORIES)}: {category!r}")
+    if not reason or not reason.strip():
+        raise ValueError("a reason is required to void a call")
+    existing = _existing(db, p.id)
+    if existing is not None and existing.actual_close is not None:
+        raise ValueError(f"seq {p.seq} already has a close grade; nothing to void")
+    keep_gap_source = existing is not None and existing.gap_graded_at is not None
+    values: dict[str, Any] = {
+        "graded_at": now,
+        "error_category": category,
+        "notes": f"voided ({category}): {reason.strip()}",
+        "source": existing.source if keep_gap_source and existing is not None else source,
+    }
     return _upsert(db, p.id, values)
 
 

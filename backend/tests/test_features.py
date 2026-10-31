@@ -23,6 +23,7 @@ from sqlalchemy.orm import Session
 from app.config import Settings, get_settings
 from app.ml import events, features
 from app.ml.core import class_of, finite, pct_change
+from app.ml.events import EVENT_KEYS
 from app.ml.features import FEATURE_LABELS, FEATURE_NAMES, build_frame, frame_to_matrix, live_row
 from app.models import Instrument
 from app.providers.base import Bar, FlowRecord, HolidayRecord
@@ -469,8 +470,6 @@ def test_calendar_features(world: World) -> None:
     assert frame.at[date(2024, 8, 9), "sessions_to_month_end"] == 14  # 15 Aug is a holiday
     assert frame.at[date(2024, 8, 29), "is_month_last_week"] == 1.0
     assert frame.at[date(2024, 8, 23), "is_month_last_week"] == 0.0  # 5 sessions left
-    expiry_wd = get_settings().nifty_expiry_weekday
-    assert all(frame.at[d, "is_expiry_day"] == float(d.weekday() == expiry_wd) for d in frame.index)
     # Budget days are known without events.csv; everything else is unknown (0, not loaded).
     assert frame.at[date(2024, 2, 1), "budget_day"] == 1.0
     assert frame.at[date(2024, 7, 23), "budget_day"] == 1.0
@@ -479,6 +478,18 @@ def test_calendar_features(world: World) -> None:
     assert (frame["events_loaded"] == 0.0).all()
     for col in ("rbi_policy_day", "fomc_overnight", "us_cpi_overnight"):
         assert (frame[col] == 0.0).all()
+
+
+def test_no_expiry_day_feature(world: World) -> None:
+    """The weekly expiry weekday moved in 2023, 2024 and 2025, so one weekday flag mislabels
+    most of the history; the feature is gone and `dow` carries the day-of-week effect."""
+    assert "is_expiry_day" not in FEATURE_NAMES and "is_expiry_day" not in FEATURE_LABELS
+    frame = build_frame(world.db, TARGET)
+    assert "is_expiry_day" not in frame.columns
+    block = features._calendar_block(world.cal, world.sessions[:3], get_settings())
+    calendar_keys = ["dow", "sessions_to_month_end", "is_month_last_week"]
+    assert list(block.columns) == [*calendar_keys, *EVENT_KEYS]
+    assert "nifty_expiry_weekday" not in Path(features.__file__).read_text(encoding="utf-8")
 
 
 def test_event_flags_without_events_csv(tmp_path: Path) -> None:

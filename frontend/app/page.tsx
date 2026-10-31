@@ -59,7 +59,9 @@ export default function TodayPage() {
           {data.market_call.length === 0 ? (
             <MarketCallEmpty note={data.market_call_note} />
           ) : (
-            data.market_call.map((c) => <MarketCallCard key={c.id} call={c} />)
+            data.market_call.map((c) => (
+              <MarketCallCard key={c.id} call={c} upcomingSession={data.market_call_session} />
+            ))
           )}
         </div>
         {data.market_call.length > 0 && data.market_call_note && (

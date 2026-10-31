@@ -11,6 +11,11 @@ whitespace, ASCII only, NaN/inf forbidden. Every float goes through `core.finite
 (10 decimals) before it is stored *and* before it is hashed, so a row re-read from
 Postgres (double precision columns, JSON columns) hashes to exactly the same digest.
 Datetimes are hashed as UTC ISO strings, dates as ISO dates.
+
+One current call per (kind, target, session): `record_market_call` checks for an existing,
+non-superseded record *inside* the ledger lock and raises `LedgerConflict` instead of
+appending a duplicate, so two overlapping 07:30 runs cannot both record. A correction
+must name a record of the same target and session that nobody has corrected yet.
 """
 
 from __future__ import annotations
@@ -65,6 +70,21 @@ HASHED_FIELDS: tuple[str, ...] = (
 )
 _DATE_FIELDS = {"session_date", "reference_date"}
 _DATETIME_FIELDS = {"as_of"}
+
+
+class LedgerConflict(Exception):
+    """A current (non-superseded) record already exists for this kind, target and session.
+
+    Raised under the ledger lock, so the caller can trust `existing` is the row the
+    other writer committed; the caller reports "already recorded" and moves on.
+    """
+
+    def __init__(self, existing: Prediction) -> None:
+        super().__init__(
+            f"{existing.kind} for {existing.target} on {existing.session_date.isoformat()} "
+            f"already recorded as seq {existing.seq}"
+        )
+        self.existing = existing
 
 
 @dataclass(frozen=True)
@@ -164,7 +184,9 @@ def record_market_call(
 
     Takes a transaction-scoped advisory lock so two writers cannot pick the same `seq`
     or the same `prev_hash`; the second one waits until the first commits or rolls back.
-    Never touches an existing row.
+    Under the same lock, a non-correction is refused with `LedgerConflict` when a current
+    record for (kind, target, session_date) already exists, and a correction is validated
+    against the record it names (ValueError). Never touches an existing row.
     """
     if rec.as_of.tzinfo is None:
         raise ValueError("as_of must be timezone-aware")
@@ -176,6 +198,12 @@ def record_market_call(
         raise ValueError(f"unknown predicted_class {rec.output.predicted_class!r}")
 
     db.execute(LOCK_SQL)
+    if rec.corrects_prediction_id is None:
+        existing = _current(db, kind, rec.target, rec.session_date)
+        if existing is not None:
+            raise LedgerConflict(existing)
+    else:
+        _check_correction(db, rec)
     last = db.scalars(select(Prediction).order_by(Prediction.seq.desc()).limit(1)).first()
     seq = (last.seq if last is not None else 0) + 1
     prev_hash = last.hash if last is not None else GENESIS
@@ -220,6 +248,39 @@ def _superseded() -> Any:
     return exists().where(later.corrects_prediction_id == Prediction.id)
 
 
+def _current(db: Session, kind: str, target: str, session_date: date) -> Prediction | None:
+    """The non-superseded record of one kind for a target and session (highest `seq`)."""
+    return db.scalars(
+        select(Prediction)
+        .where(
+            Prediction.kind == kind,
+            Prediction.target == target,
+            Prediction.session_date == session_date,
+            ~_superseded(),
+        )
+        .order_by(Prediction.seq.desc())
+        .limit(1)
+    ).first()
+
+
+def _check_correction(db: Session, rec: MarketCallRecordIn) -> None:
+    """A correction must point at an existing record of the same target and session that
+    has not been corrected already; anything else is a caller bug, not a ledger entry."""
+    original = db.get(Prediction, rec.corrects_prediction_id)
+    if original is None:
+        raise ValueError(f"corrects_prediction_id {rec.corrects_prediction_id} does not exist")
+    if original.target != rec.target or original.session_date != rec.session_date:
+        raise ValueError(
+            f"correction targets {rec.target} {rec.session_date.isoformat()} but seq "
+            f"{original.seq} is {original.target} {original.session_date.isoformat()}"
+        )
+    superseded = db.scalar(
+        select(Prediction.seq).where(Prediction.corrects_prediction_id == original.id).limit(1)
+    )
+    if superseded is not None:
+        raise ValueError(f"seq {original.seq} is already corrected by seq {superseded}")
+
+
 def latest_call(db: Session, target: str, session_date: date) -> Prediction | None:
     """The current call for a target and session: highest `seq` that no correction supersedes."""
     return db.scalars(
@@ -234,6 +295,11 @@ def latest_call(db: Session, target: str, session_date: date) -> Prediction | No
     ).first()
 
 
+def head(db: Session) -> Prediction | None:
+    """The last record in the chain (highest `seq`), or None for an empty ledger."""
+    return db.scalars(select(Prediction).order_by(Prediction.seq.desc()).limit(1)).first()
+
+
 def calls_for_session(db: Session, session_date: date) -> list[Prediction]:
     """Every record for a session (corrections and originals alike), in ledger order."""
     return list(
@@ -246,11 +312,20 @@ def calls_for_session(db: Session, session_date: date) -> list[Prediction]:
 
 
 def ungraded(db: Session, *, through: date | None = None) -> list[Prediction]:
-    """Records with no close grade yet (no grade row, or one without `actual_close`)."""
+    """Records still waiting for a close grade: no grade row, or one without `actual_close`.
+
+    Leaves out records a correction superseded (the correction is graded instead) and
+    records that were voided (`grading.void_grade`: `actual_close` NULL with an
+    `error_category` saying why no close will ever come).
+    """
     stmt = (
         select(Prediction)
         .outerjoin(PredictionGrade, PredictionGrade.prediction_id == Prediction.id)
-        .where(PredictionGrade.actual_close.is_(None))
+        .where(
+            PredictionGrade.actual_close.is_(None),
+            PredictionGrade.error_category.is_(None),
+            ~_superseded(),
+        )
         .order_by(Prediction.seq.asc())
     )
     if through is not None:

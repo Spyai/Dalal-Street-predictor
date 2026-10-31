@@ -2,12 +2,23 @@
 
 yfinance wraps Yahoo's unofficial endpoints. Treat it as best-effort: every failure
 surfaces as SourceUnavailable and is shown as such, never papered over.
+
+"No rows" is not a failure. `yfinance.download` never raises: it logs each ticker's
+problem on the `yfinance` logger and returns an empty frame both when Yahoo refused or
+rate-limited the request and when the range simply holds no session (a foreign market
+holiday). `_fetch` captures those log records while the download runs: an empty frame
+whose only complaints are "no price data found" for the range is returned as *no rows*
+(`daily_bars` -> `[]`), while a rate limit, HTTP or connection error, or an empty frame
+with no explanation at all, raises SourceUnavailable.
 """
 
 from __future__ import annotations
 
+import logging
 import os
-from collections.abc import Callable
+import re
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, date, datetime, timedelta
 from typing import Any
 
@@ -34,6 +45,53 @@ INDEX_TICKERS: dict[str, str] = {
 }
 
 Downloader = Callable[..., pd.DataFrame | None]
+
+YF_LOGGER = "yfinance"
+# yfinance's wording when Yahoo answered but had no session in the requested range
+# (YFPricesMissingError, or Yahoo's own explanation). Anything else it logs at ERROR
+# level is a failed request.
+NO_ROWS_MARKERS: tuple[str, ...] = ("no price data found", "data doesn't exist", "no data found")
+
+
+@contextmanager
+def capture_yf_errors() -> Iterator[list[str]]:
+    """Collect what yfinance logs at ERROR level (its only error channel) during a call."""
+    messages: list[str] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            messages.append(record.getMessage().strip())
+
+    logger = logging.getLogger(YF_LOGGER)
+    handler = _Collect(level=logging.ERROR)
+    previous_level = logger.level
+    if logger.getEffectiveLevel() > logging.ERROR:
+        logger.setLevel(logging.ERROR)  # a silenced logger would hide the failure from us
+    logger.addHandler(handler)
+    try:
+        yield messages
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+
+
+def is_no_rows_message(message: str) -> bool:
+    """True for yfinance's "nothing in this range" complaint, False for a real failure."""
+    text = message.lower()
+    return any(marker in text for marker in NO_ROWS_MARKERS)
+
+
+_FAILED_HEADER = re.compile(r"^\d+ failed downloads?:$", re.IGNORECASE)
+
+
+def request_failures(messages: list[str]) -> list[str]:
+    """The captured messages that describe a failed request (not merely an empty range).
+
+    yfinance prefixes the per-ticker lines with a "N Failed download(s):" header; that
+    header carries no reason of its own and is dropped.
+    """
+    stripped = [m.strip() for m in messages]
+    return [m for m in stripped if m and not _FAILED_HEADER.match(m) and not is_no_rows_message(m)]
 
 
 def yf_ticker(symbol: str, exchange: str) -> str:
@@ -97,25 +155,42 @@ class YFinanceProvider:
     def __init__(self, downloader: Downloader | None = None) -> None:
         self._download = downloader or _default_downloader
 
-    def _fetch(self, **kwargs: Any) -> pd.DataFrame:
-        try:
-            df = self._download(**kwargs)
-        except Exception as exc:  # yfinance raises a wide variety of things
-            raise SourceUnavailable(SOURCE, f"download failed: {exc}") from exc
-        if df is None or df.empty:
-            tickers = kwargs.get("tickers")
-            what = (
-                f"{len(tickers)} tickers"
-                if isinstance(tickers, list) and len(tickers) > 2
-                else tickers
-            )
-            raise SourceUnavailable(
-                SOURCE, f"Yahoo returned no data for {what} (blocked, rate-limited or delisted)"
-            )
-        return df
+    def _fetch(self, *, allow_no_rows: bool = False, **kwargs: Any) -> pd.DataFrame:
+        """One download. Raises SourceUnavailable for a failed request; with
+        `allow_no_rows` an empty answer that yfinance explains as "no price data" for the
+        range comes back as an empty frame instead (the market was closed)."""
+        with capture_yf_errors() as reported:
+            try:
+                df = self._download(**kwargs)
+            except Exception as exc:  # yfinance raises a wide variety of things
+                raise SourceUnavailable(SOURCE, f"download failed: {exc}") from exc
+        failures = request_failures(reported)
+        if df is not None and not df.empty:
+            return df
+        tickers = kwargs.get("tickers")
+        what = (
+            f"{len(tickers)} tickers" if isinstance(tickers, list) and len(tickers) > 2 else tickers
+        )
+        if failures:
+            raise SourceUnavailable(SOURCE, f"download failed for {what}: {failures[0]}")
+        if allow_no_rows and reported:
+            return pd.DataFrame()  # Yahoo answered: no session in this range
+        raise SourceUnavailable(
+            SOURCE, f"Yahoo returned no data for {what} (blocked, rate-limited or delisted)"
+        )
 
-    def _fetch_many(self, tickers: list[str], **kwargs: Any) -> dict[str, pd.DataFrame]:
-        df = self._fetch(tickers=tickers, group_by="ticker", multi_level_index=True, **kwargs)
+    def _fetch_many(
+        self, tickers: list[str], *, allow_no_rows: bool = False, **kwargs: Any
+    ) -> dict[str, pd.DataFrame]:
+        df = self._fetch(
+            tickers=tickers,
+            group_by="ticker",
+            multi_level_index=True,
+            allow_no_rows=allow_no_rows,
+            **kwargs,
+        )
+        if df.empty:
+            return {}
         frames = split_by_ticker(df, tickers)
         return {t: f.dropna(how="all") for t, f in frames.items() if not f.dropna(how="all").empty}
 
@@ -125,10 +200,15 @@ class YFinanceProvider:
     def daily_bars_many(
         self, instruments: list[tuple[str, str]], start: date, end: date
     ) -> dict[tuple[str, str], list[Bar]]:
-        """Batched daily history. Close is split-adjusted by Yahoo, not dividend-adjusted."""
+        """Batched daily history. Close is split-adjusted by Yahoo, not dividend-adjusted.
+
+        A ticker with no session in the range (a holiday on its exchange) is simply absent
+        from the result; only a failed request raises.
+        """
         tickers = {yf_ticker(s, e): (s, e) for s, e in instruments}
         frames = self._fetch_many(
             list(tickers),
+            allow_no_rows=True,
             start=start.isoformat(),
             end=(end + timedelta(days=1)).isoformat(),
             interval="1d",

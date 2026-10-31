@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 import subprocess
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -36,9 +36,19 @@ from app.ml.core import (
     MarketCallOutput,
     MarketCallRecordIn,
 )
-from app.models import DailyBar, JobRun, ModelVersion, Prediction, PredictionGrade
-from app.providers.base import Bar, FlowRecord, NotSupported, SourceUnavailable
+from app.models import (
+    DailyBar,
+    Instrument,
+    JobRun,
+    ModelVersion,
+    Prediction,
+    PredictionGrade,
+    SourceStatus,
+)
+from app.providers.base import Bar, FlowRecord, HolidayRecord, NotSupported, SourceUnavailable
 from app.services import brief, instruments, ledger
+from app.services.backfill import BackfillReport
+from app.services.calendar import store_holidays
 from app.services.grading import grade_close
 from app.services.ledger import record_market_call
 from app.services.market_data import upsert_daily_bars
@@ -88,10 +98,11 @@ def _bars(rng: np.random.Generator, days: list[date]) -> list[Bar]:
 
 @pytest.fixture()
 def world(db: Session) -> dict[str, Bar]:
-    """Targets, India VIX and every global cue with bars on all weekdays through LAST.
-    Returns the target's bars by date."""
+    """Targets, India VIX and every global cue with bars on all weekdays through LAST, and
+    a verified 2026 holiday calendar (one real holiday). Returns the target's bars by date."""
     rng = np.random.default_rng(7)
     instruments.ensure_reference_instruments(db)
+    store_holidays(db, [HolidayRecord(date(2026, 1, 26), "Republic Day")], "test")
     db.flush()
     days = _weekdays(FIRST, LAST)
     target_bars: dict[date, Bar] = {}
@@ -217,18 +228,24 @@ def test_premarket_records_a_locked_call_and_rerun_is_idempotent(
     assert p.timing_guidance and p.timing_guidance.count(".") <= 2
     assert 1 <= len(p.drivers) <= 5
     assert ledger.verify_ledger(db).ok
-    # Bars were fresh through the reference session: nothing was fetched.
-    assert fakes["provider"].requests == [] and fakes["nse"].calls == 1
+    # Indian bars were fresh through the reference session: not fetched. Global cues are
+    # always re-requested for the last three days so a provisional print is replaced.
+    requests = fakes["provider"].requests
+    assert {r[0] for r in requests} == {ref.symbol for ref in instruments.GLOBAL_CUES}
+    assert {(r[1], r[2]) for r in requests} == {(LAST - timedelta(days=2), LAST)}
+    assert fakes["nse"].calls == 1
 
     run = _last_run(db, "premarket_prediction")
     d = run.details[TARGET]
     assert d["status"] == "recorded" and d["model_version"] == champion.version
     assert (d["class"], d["confidence"], d["is_late"]) == (p.predicted_class, p.confidence, False)
     assert run.details["refresh"] == "ok" and run.details["brief"] == "sent"
+    assert "calendar" not in run.details  # verified for 2026: nothing to flag
     assert TARGET in run.message and "gaps" not in run.message
     (msg,) = fakes["sent"]  # the brief, and no partial alert
     assert TARGET in msg and "Fri 30 Oct 2026" in msg
     assert "Track record: no graded calls yet" in msg
+    assert f"Ledger head: seq {p.seq}, {p.hash[:12]}" in msg
     assert msg.rstrip().endswith("<i>Personal research tool. Not investment advice.</i>")
 
     assert _run("premarket_prediction", FRIDAY_0730) == "success"
@@ -275,6 +292,11 @@ def test_premarket_reports_a_missing_cue_bar_but_still_records(
     assert run.details[TARGET]["status"] == "recorded"
     (problem,) = run.details["refresh"]
     assert problem.startswith("GLOBAL:DX-Y.NYB has no bar for 2026-10-29")
+    assert "latest bar (2026-10-15) is older than 7 days" in problem and "down" in problem
+    # The other cues have their bar; a failed re-fetch of it is a note, not a problem.
+    notes = run.details["refresh_notes"]
+    assert len(notes) == len(instruments.GLOBAL_CUES) - 1
+    assert all("stored bar for 2026-10-29 stands" in n for n in notes)
     assert run.details["fii_dii"] == "unavailable: blocked"
     assert "DX-Y.NYB" in (run.message or "")
     assert [m for m in fakes["sent"] if "Not investment advice" in m], "brief still sent"
@@ -301,6 +323,7 @@ def test_open_check_grades_the_gap_once_the_open_exists(
 
     assert _run("premarket_prediction", FRIDAY_0730) == "success"
     (p,) = _predictions(db)
+    fakes["provider"].requests.clear()  # the 07:30 cue re-fetches are not open_check's
     # No bar for the session yet: partial, nothing invented.
     assert _run("open_check", FRIDAY_0920) == "partial"
     assert "not available yet" in (_last_run(db, "open_check").message or "")
@@ -483,7 +506,11 @@ def test_morning_brief_shows_confidence_track_record_and_lateness(db: Session) -
     card = scorecard(db, p.target)
     msg = brief.morning_brief([(p, card)], SESSION)
     assert "<b>UP</b> (high confidence)" in msg and "No edge today" not in msg
-    assert "Track record: 1 graded, 100% right vs best baseline (always UP) 100%" in msg
+    # Paired: the model and the toughest baseline scored on the same sessions.
+    assert (
+        "Track record: 1 graded, 100% right; toughest baseline (always UP): "
+        "100% vs 100% on the same 1 call" in msg
+    )
     assert "unproven (&lt; 100 graded)" in msg
     assert "Recorded late (after 09:15 IST)." in msg
     assert "Drivers:" in msg and msg.count("•") == 2
@@ -606,12 +633,13 @@ def test_jobs_workflow_schedules_the_phase2_jobs_and_keeps_the_allowlist() -> No
     wf = _workflow()
     crons = {c["cron"] for c in wf["on"]["schedule"]}
     expected = {
-        "0 2 * * 1-5": "premarket_prediction",
+        "57 1 * * 1-5": "premarket_prediction",  # 07:27 IST: off the congested top of the hour
         "50 3 * * 1-5": "open_check",
         "15 10 * * 1-5": "close_grading",
         "30 4 * * 6": "weekly_retrain",
     }
     assert set(expected) <= crons
+    assert "0 2 * * 1-5" not in crons, "the old top-of-the-hour premarket cron must be gone"
     options = wf["on"]["workflow_dispatch"]["inputs"]["command"]["options"]
     assert {
         "run-job premarket_prediction",
@@ -659,3 +687,296 @@ def test_vercel_env_exports_the_phase2_tunables(tmp_path: Path) -> None:
     assert "PREDICTION_TARGETS=NIFTY 50" in lines
     assert mod.SECRETISH.search("MLFLOW_TRACKING_URI"), "a tracking URI may carry credentials"
     assert not mod.SECRETISH.search("MIN_SAMPLE_SIZE")
+
+
+# ------------------------------------------------------------------ review fixes: data honesty
+
+
+def _delete_bar(db: Session, symbol: str, exchange: str, day: date) -> None:
+    inst = instruments.get_instrument(db, symbol, exchange)
+    assert inst is not None
+    db.execute(
+        text("DELETE FROM daily_bar WHERE instrument_id = :i AND trade_date = :d"),
+        {"i": inst.id, "d": day},
+    )
+    db.commit()
+
+
+def _yfinance_status(db: Session) -> SourceStatus | None:
+    db.expire_all()
+    return db.scalars(select(SourceStatus).where(SourceStatus.source == "yfinance")).first()
+
+
+def test_premarket_treats_a_cue_holiday_as_a_note_not_a_problem(
+    db: Session, champion: ModelVersion, fakes: dict[str, Any]
+) -> None:
+    """A global cue's exchange was closed on the reference day: its bar is missing but its
+    latest bar is fresh enough for the feature pipeline. No partial run, no Telegram alert,
+    and yfinance is not marked errored for answering "no rows"."""
+    _delete_bar(db, "DX-Y.NYB", "GLOBAL", LAST)
+
+    assert _run("premarket_prediction", FRIDAY_0730) == "success"
+    (p,) = _predictions(db)
+    assert p.feature_snapshot["dxy_ret_1d"] is not None, "the 28 Oct bar is still usable"
+    run = _last_run(db, "premarket_prediction")
+    assert run.details["refresh"] == "ok"
+    note = next(n for n in run.details["refresh_notes"] if "DX-Y.NYB" in n)
+    assert note == "GLOBAL:DX-Y.NYB: no bar for 2026-10-29 (market closed?); latest is 2026-10-28"
+    assert len(fakes["sent"]) == 1 and "Not investment advice" in fakes["sent"][0]
+    status = _yfinance_status(db)
+    assert status is None or status.status != "unavailable"
+
+
+def test_premarket_does_not_record_against_a_stale_reference(
+    db: Session, champion: ModelVersion, fakes: dict[str, Any]
+) -> None:
+    """The previous session's target bar is missing: an honest skip, never a call whose
+    reference close is two sessions old."""
+    _delete_bar(db, TARGET, "INDEX", LAST)
+
+    assert _run("premarket_prediction", FRIDAY_0730) == "partial"
+    assert _predictions(db) == []
+    run = _last_run(db, "premarket_prediction")
+    status = run.details[TARGET]["status"]
+    assert status.startswith("not recorded: previous session bar missing (2026-10-29)")
+    assert "referenced to 2026-10-28" in status
+    assert "INDEX:NIFTY 50 has no bar for 2026-10-29" in run.details["refresh"][0]
+    assert "call not recorded" in (run.message or "")
+    assert run.details["brief"].startswith("not sent")
+    (alert,) = fakes["sent"]
+    assert "finished with gaps" in alert and "previous session bar missing" in alert
+
+
+def test_premarket_refuses_an_unverified_calendar_unless_forced(
+    db: Session, champion: ModelVersion, fakes: dict[str, Any]
+) -> None:
+    db.execute(text("DELETE FROM market_holiday"))
+    db.commit()
+
+    assert _run("premarket_prediction", FRIDAY_0730) == "partial"
+    assert _predictions(db) == []
+    run = _last_run(db, "premarket_prediction")
+    assert "NSE holiday calendar for 2026 not loaded" in run.details[TARGET]["status"]
+    assert "run with --force" in (run.message or "")
+    assert run.details["brief"].startswith("not sent")
+
+    assert _run("premarket_prediction", FRIDAY_0730, force=True) == "success"
+    (p,) = _predictions(db)
+    assert p.session_date == FRIDAY
+    run = _last_run(db, "premarket_prediction")
+    assert run.details["calendar"] == "unverified for 2026; recorded anyway (--force)"
+    assert run.details[TARGET]["status"] == "recorded"
+
+
+def test_premarket_refuses_on_the_reference_day_before_1830(
+    db: Session, champion: ModelVersion, fakes: dict[str, Any]
+) -> None:
+    """`predict --force` at 16:00 on Thursday for Friday's session would lock in Thursday's
+    close while it may still be provisional; after 18:30 IST it is fine."""
+    too_early = datetime(2026, 10, 29, 16, 0, tzinfo=IST)
+    assert _run("premarket_prediction", too_early) == "partial"
+    assert _predictions(db) == []
+    run = _last_run(db, "premarket_prediction")
+    assert run.details["session"] == FRIDAY.isoformat()
+    status = run.details[TARGET]["status"]
+    assert "16:00 IST on the reference session 2026-10-29" in status and "provisional" in status
+    assert "rerun after" in (run.message or "")
+
+    evening = datetime(2026, 10, 29, 19, 0, tzinfo=IST)
+    assert _run("premarket_prediction", evening) == "success"
+    (p,) = _predictions(db)
+    assert (p.session_date, p.reference_date, p.is_late) == (FRIDAY, LAST, False)
+
+
+def test_premarket_reports_retrain_needed_on_a_feature_mismatch(
+    db: Session, champion: ModelVersion, fakes: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    trained = list(champion.feature_names)
+    # The model expects a feature the pipeline no longer produces (e.g. is_expiry_day).
+    champion.feature_names = [*trained, "is_expiry_day"]
+    db.commit()
+    assert _run("premarket_prediction", FRIDAY_0730) == "partial"
+    assert _predictions(db) == []
+    run = _last_run(db, "premarket_prediction")
+    status = run.details[TARGET]["status"]
+    assert status.startswith("not predicted: retrain needed") and "is_expiry_day" in status
+    assert "retrain needed" in (run.message or "") and run.details["brief"].startswith("not sent")
+
+    # The pipeline produces a feature the model never saw: predict without it, but say so.
+    db.expire_all()
+    champion.feature_names = trained
+    db.commit()
+    real_live_row = features.live_row
+
+    def with_extra(db: Session, target: str, session: date, *, settings: Any = None) -> Any:
+        row, ref, close = real_live_row(db, target, session, settings=settings)
+        return {**row, "brand_new_feature": 1.0}, ref, close
+
+    monkeypatch.setattr(tasks.features, "live_row", with_extra)
+    assert _run("premarket_prediction", FRIDAY_0730) == "partial"
+    (p,) = _predictions(db)
+    assert p.feature_snapshot["brand_new_feature"] == 1.0
+    run = _last_run(db, "premarket_prediction")
+    assert run.details[TARGET]["status"] == "recorded"
+    assert "retrain needed" in (run.message or "") and "brand_new_feature" in (run.message or "")
+
+
+def test_overlapping_premarket_runs_record_one_call(
+    db: Session, champion: ModelVersion, fakes: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both runs pass the cheap pre-check (nothing committed yet when they look); the ledger
+    lock makes the second one see the first's row and report "already recorded"."""
+    monkeypatch.setattr(tasks.ledger, "latest_call", lambda db, target, session: None)
+    assert _run("premarket_prediction", FRIDAY_0730) == "success"
+    assert _run("premarket_prediction", FRIDAY_0730) == "success"
+    assert len(_predictions(db)) == 1
+    run = _last_run(db, "premarket_prediction")
+    assert run.details[TARGET]["status"] == "already recorded"
+    assert run.details["brief"].startswith("not sent")
+    assert len(fakes["sent"]) == 1 and ledger.verify_ledger(db).ok
+
+
+def test_evening_pull_never_stores_a_global_bar_for_the_run_day(
+    db: Session, world: dict[str, Bar], fakes: dict[str, Any]
+) -> None:
+    """At 19:30 IST the US session is open: a bar dated today would be a partial print that
+    `ensure_recent` would never revisit. Global cues stop at the last complete UTC day."""
+    _delete_bar(db, "^GSPC", "GLOBAL", LAST)
+    thursday = Bar(LAST, 5000.0, 5010.0, 4990.0, 5005.0, 1.0)
+    friday_partial = Bar(FRIDAY, 5005.0, 5020.0, 5000.0, 5012.0, 1.0)
+    fakes["provider"].bars["^GSPC"] = [thursday, friday_partial]
+    fakes["provider"].bars[TARGET] = [_friday_bar(world, open_pct=0.2, close_pct=0.5)]
+
+    status = _run("evening_data_pull", datetime(2026, 10, 30, 19, 30, tzinfo=IST))
+    assert status in {"success", "partial"}  # partial: the stub has no bhavcopy
+    run = _last_run(db, "evening_data_pull")
+    assert "through 2026-10-29, the last complete UTC day" in run.details["global_cues"]
+    gspc = instruments.get_instrument(db, "^GSPC", "GLOBAL")
+    nifty = instruments.get_instrument(db, TARGET, "INDEX")
+    assert gspc is not None and nifty is not None
+    db.expire_all()
+    assert db.get(DailyBar, (nifty.id, FRIDAY)) is not None, "Indian bars are final by 19:30"
+    assert db.get(DailyBar, (gspc.id, LAST)) is not None
+    assert db.get(DailyBar, (gspc.id, FRIDAY)) is None
+    global_today = db.execute(
+        select(DailyBar.instrument_id)
+        .join(Instrument, Instrument.id == DailyBar.instrument_id)
+        .where(Instrument.exchange == "GLOBAL", DailyBar.trade_date == FRIDAY)
+    ).all()
+    assert global_today == []
+    assert [r for r in fakes["provider"].requests if r[0] == "^GSPC"] == [("^GSPC", LAST, LAST)]
+    global_symbols = {ref.symbol for ref in instruments.GLOBAL_CUES}
+    assert all(r[2] <= LAST for r in fakes["provider"].requests if r[0] in global_symbols)
+    # Indian indices are final by 19:30 and are fetched through the session itself.
+    assert all(r[2] == FRIDAY for r in fakes["provider"].requests if r[0] not in global_symbols)
+
+
+def test_close_grading_lists_old_unresolved_calls_without_going_partial(
+    db: Session,
+    world: dict[str, Bar],
+    fakes: dict[str, Any],
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    saturday = date(2026, 10, 17)  # never a session: no bar will ever come
+    old = record_market_call(db, make_record(target=TARGET, session_date=saturday))
+    db.commit()
+
+    assert _run("close_grading", FRIDAY_1545) == "success"
+    run = _last_run(db, "close_grading")
+    assert run.details["ungraded"] == [] and run.details["graded"] == []
+    (line,) = run.details["unresolvable"]
+    assert line.startswith(f"{TARGET} 2026-10-17 (seq {old.seq}): no close after 5 sessions")
+    assert f"grade --void {old.seq} --reason" in line
+    assert "1 unresolvable" in (run.message or "") and fakes["sent"] == []
+
+    # A recent call without a close is still a problem.
+    recent = record_market_call(db, make_record(target=TARGET, session_date=FRIDAY))
+    db.commit()
+    assert _run("close_grading", FRIDAY_1545) == "partial"
+    run = _last_run(db, "close_grading")
+    assert run.details["ungraded"] == [f"{TARGET} {FRIDAY} (seq {recent.seq}): no close yet"]
+    assert len(run.details["unresolvable"]) == 1
+
+    # Void the old one from the CLI: it leaves the queue for good.
+    assert cli.main(["grade", "--void", str(old.seq), "--reason", "Saturday: never a session"]) == 0
+    assert f"voided seq {old.seq}" in capsys.readouterr().out
+    g = _grade(db, old)
+    assert g is not None and g.actual_close is None and g.error_category == "no_session"
+    assert g.notes == "voided (no_session): Saturday: never a session"
+    assert [p.seq for p in ledger.ungraded(db)] == [recent.seq]
+    assert _run("close_grading", FRIDAY_1545) == "partial"
+    assert _last_run(db, "close_grading").details["unresolvable"] == []
+
+    fakes["provider"].bars[TARGET] = [_friday_bar(world, open_pct=0.0, close_pct=0.5)]
+    assert _run("close_grading", FRIDAY_1545) == "success"
+    assert _last_run(db, "close_grading").details["ungraded"] == []
+
+
+def test_cli_grade_void_argument_checks(db: Session, capsys: pytest.CaptureFixture[str]) -> None:
+    assert cli.main(["grade", "--void", "1"]) == 2  # no reason
+    assert "--reason" in capsys.readouterr().err
+    assert cli.main(["grade", "--reason", "x"]) == 2  # reason without --void
+    capsys.readouterr()
+    assert cli.main(["grade", "--void", "999", "--reason", "x"]) == 1
+    assert "no ledger record with seq 999" in capsys.readouterr().err
+
+    p = record_market_call(db, make_record())
+    db.commit()
+    args = ["grade", "--void", str(p.seq), "--reason", "bar never published", "--category"]
+    assert cli.main([*args, "data_error"]) == 0
+    g = _grade(db, p)
+    assert g is not None and g.error_category == "data_error"
+    grade_close(db, p, None, 1010.0, now=AS_OF, source="test")
+    db.commit()
+    assert cli.main([*args, "data_error"]) == 1  # already close-graded
+    assert "already has a close grade" in capsys.readouterr().err
+
+
+def test_cli_backfill_stops_global_cues_at_the_last_complete_utc_day(
+    db: Session, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    instruments.ensure_reference_instruments(db)
+    stock = instruments.get_or_create_equity(db, "RELIANCE", "NSE")
+    stock.in_universe = True
+    db.commit()
+    calls: list[tuple[list[int], date, date]] = []
+
+    def fake_backfill(ids: list[int], start: date, end: date, chain: Any, **kw: Any) -> Any:
+        calls.append((list(ids), start, end))
+        return BackfillReport(requested=len(ids))
+
+    class FixedNow(datetime):
+        @classmethod
+        def now(cls, tz: Any = None) -> datetime:  # type: ignore[override]
+            return datetime(2026, 10, 30, 14, 0, tzinfo=UTC)  # 19:30 IST Friday, US open
+
+    monkeypatch.setattr("app.services.backfill.run_backfill", fake_backfill)
+    monkeypatch.setattr("app.providers.registry.market_data_chain", lambda db, **kw: [])
+    monkeypatch.setattr(cli, "datetime", FixedNow)
+    monkeypatch.setattr(cli, "get_settings", lambda: SETTINGS)
+    assert cli.main(["backfill", "--years", "1", "--no-broker"]) == 0
+    out = capsys.readouterr().out
+    assert "global cues: 11 instruments through 2026-10-29" in out
+    assert "indices: 3 instruments through 2026-10-30" in out
+
+    index_ids = {i.id for i in db.scalars(select(Instrument).where(Instrument.exchange == "INDEX"))}
+    global_ids = {
+        i.id for i in db.scalars(select(Instrument).where(Instrument.exchange == "GLOBAL"))
+    }
+    ends = {frozenset(ids): end for ids, _, end in calls}
+    assert ends[frozenset(index_ids)] == FRIDAY
+    assert ends[frozenset(global_ids)] == LAST
+    assert ends[frozenset({stock.id})] == FRIDAY
+
+
+def test_morning_brief_names_the_ledger_head(db: Session) -> None:
+    first = record_market_call(db, make_record())
+    second = record_market_call(db, make_record(target="NIFTY BANK"))
+    db.commit()
+    msg = brief.morning_brief([(first, None), (second, None)], SESSION, head=ledger.head(db))
+    assert f"\nLedger head: seq 2, {second.hash[:12]}\n" in msg
+    assert msg.count("Ledger head") == 1
+    # Without an explicit head the highest-seq call stands in; an empty brief has none.
+    assert f"Ledger head: seq 1, {first.hash[:12]}" in brief.morning_brief([(first, None)], SESSION)
+    assert "Ledger head" not in brief.morning_brief([], SESSION)
+    assert brief.ledger_anchor(None) is None

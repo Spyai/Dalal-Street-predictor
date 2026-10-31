@@ -1,7 +1,10 @@
 """Market-call model: walk-forward training, prediction, baselines, metrics, API isolation.
 
 No database and no network. The synthetic frame has a weak but real signal, so the
-model has something to learn and every assertion is deterministic (fixed seeds).
+model has something to learn and every assertion is deterministic (fixed seeds). The
+pure-noise frames prove the two out-of-sample choices (boosting rounds, shrinkage towards
+climatology) protect against an overconfident model, and that a fold's own rows never
+take part in its own choice.
 """
 
 from __future__ import annotations
@@ -12,6 +15,7 @@ import subprocess
 import sys
 import types
 from datetime import date
+from itertools import pairwise
 from pathlib import Path
 
 import numpy as np
@@ -40,7 +44,7 @@ FEATURES = [
     "sp500_ret_1d",
     "vix_level",
     "fii_net_cr",
-    "is_expiry_day",
+    "is_month_last_week",
     "dow",
 ]
 
@@ -59,7 +63,7 @@ def synthetic_frame(n: int = N_ROWS, seed: int = 0) -> pd.DataFrame:
             "sp500_ret_1d": rng.normal(0, 1, n + 1),
             "vix_level": rng.uniform(10, 25, n + 1),
             "fii_net_cr": rng.normal(0, 2000, n + 1),
-            "is_expiry_day": (rng.uniform(size=n + 1) < 0.2).astype(float),
+            "is_month_last_week": (rng.uniform(size=n + 1) < 0.2).astype(float),
             "dow": rng.integers(0, 5, n + 1).astype(float),
         },
         index=idx,
@@ -83,6 +87,34 @@ def live_row(frame: pd.DataFrame, feature_names: list[str]) -> dict[str, float |
     return {f: (None if pd.isna(last[f]) else float(last[f])) for f in feature_names}
 
 
+def noise_frame(n: int = N_ROWS, seed: int = 1, n_features: int = 20) -> pd.DataFrame:
+    """Pure noise: independent features and labels. Nothing here can be learnt."""
+    rng = np.random.default_rng(seed)
+    idx = pd.bdate_range("2021-01-04", periods=n + 1).date
+    df = pd.DataFrame({f"f{i}": rng.normal(size=n + 1) for i in range(n_features)}, index=idx)
+    label = rng.normal(0, 1, n + 1)
+    df["label_pct"] = label
+    df["label_class"] = [class_of(float(v), 0.30) for v in label]
+    df["reference_date"] = [d - pd.Timedelta(days=1) for d in idx]
+    df["reference_close"] = 20000.0
+    df.loc[df.index[-1], "label_pct"] = np.nan
+    df.loc[df.index[-1], "label_class"] = None
+    df.attrs["target"] = "NIFTY 50"
+    return df
+
+
+# Deliberately overfit-prone LightGBM settings (deep trees, tiny leaves, no L2, every feature,
+# a fast learning rate): what shrinkage has to protect against.
+LOOSE_PARAMS: dict[str, object] = {
+    "num_leaves": 15,
+    "min_data_in_leaf": 5,
+    "lambda_l2": 0.0,
+    "feature_fraction": 1.0,
+    "learning_rate": 0.1,
+    "n_estimators": 200,
+}
+
+
 @pytest.fixture(scope="module")
 def frame() -> pd.DataFrame:
     return synthetic_frame()
@@ -99,9 +131,17 @@ def trained(frame: pd.DataFrame) -> TrainResult:
 def test_default_params_follow_the_contract() -> None:
     p = models.DEFAULT_PARAMS
     assert p["objective"] == "multiclass" and p["num_class"] == 3
-    assert (p["num_leaves"], p["min_data_in_leaf"], p["learning_rate"]) == (7, 40, 0.03)
-    assert (p["n_estimators"], p["feature_fraction"], p["bagging_fraction"]) == (300, 0.8, 0.8)
-    assert (p["bagging_freq"], p["lambda_l2"], p["seed"], p["verbose"]) == (1, 1.0, 42, -1)
+    assert (p["num_leaves"], p["min_data_in_leaf"], p["learning_rate"]) == (5, 60, 0.03)
+    assert p["n_estimators"] == models.MAX_ROUNDS == 400  # the ceiling of the round search
+    assert (p["feature_fraction"], p["bagging_fraction"], p["bagging_freq"]) == (0.6, 0.8, 1)
+    assert (p["lambda_l2"], p["seed"], p["verbose"]) == (5.0, 42, -1)
+    assert (p["deterministic"], p["force_row_wise"], p["num_threads"]) == (True, True, 1)
+    assert models.round_grid(400) == tuple(range(25, 401, 25))
+    assert models.round_grid(60) == (25, 50, 60) and models.round_grid(10) == (10,)
+    assert models.SHRINK_GRID == (0.0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9)
+    assert models.FIRST_FOLD_ROUNDS == 50 and models.FIRST_FOLD_SHRINK == 0.5
+    # The walk-forward's own keys never reach LightGBM.
+    assert not set(models._booster_params(p)) & {"n_estimators", "shrink"}
 
 
 def test_walk_forward_is_strictly_expanding_and_ordered(
@@ -137,15 +177,29 @@ def test_walk_forward_metrics_are_populated(trained: TrainResult) -> None:
     assert sum(int(r["n"]) for r in m.by_confidence) == m.n_oos
     assert m.calibration and sum(int(b["n"]) for b in m.calibration) == m.n_oos
     assert all(b["bin_lo"] < b["bin_hi"] for b in m.calibration)
+    assert isinstance(m, models.MarketCallMetrics)
+    assert 0.0 <= m.range_coverage <= 1.0
+    assert len(m.fold_params) == len(m.folds)
+    rounds_seen = set(models.round_grid(models.MAX_ROUNDS)) | {models.FIRST_FOLD_ROUNDS}
+    shrinks_seen = set(models.SHRINK_GRID) | {models.FIRST_FOLD_SHRINK}
+    for fp in m.fold_params:
+        assert set(fp) == {"n_estimators", "shrink"}
+        assert fp["n_estimators"] in rounds_seen and fp["shrink"] in shrinks_seen
+    d = m.as_dict()
+    assert d["range_coverage"] == pytest.approx(m.range_coverage)  # finite(): 10 decimals
+    assert d["fold_params"] == m.fold_params
     # The dict form must be JSON for the model_version.metrics column: no NaN anywhere.
-    json.dumps(m.as_dict(), allow_nan=False)
+    json.dumps(d, allow_nan=False)
 
 
 def test_model_learns_the_synthetic_signal(trained: TrainResult) -> None:
     m = trained.metrics
     assert m.brier < 2.0 / 3.0  # better than the uniform forecast
+    assert m.brier < m.baselines["random"]["brier"]  # and than climatology
     assert m.accuracy > m.baselines["always_up"]["accuracy"]
     assert m.log_loss < math.log(3)
+    assert isinstance(m, models.MarketCallMetrics)
+    assert 0.5 <= m.range_coverage <= 0.95  # a nominal 80 % range, from per-fold quantile fits
 
 
 def test_too_few_labelled_rows_raises() -> None:
@@ -166,11 +220,145 @@ def test_training_is_deterministic(frame: pd.DataFrame, trained: TrainResult) ->
 
 def test_artifact_layout_and_cache(trained: TrainResult) -> None:
     payload = json.loads(trained.artifact)
-    assert {"classifier", "q10", "q90", "feature_names", "params"} <= set(payload)
+    keys = {"classifier", "q10", "q90", "feature_names", "params", "class_frequencies"}
+    assert keys <= set(payload)
     assert payload["feature_names"] == FEATURES
+    assert payload["params"] == trained.params
+    assert payload["class_frequencies"] == trained.metrics.class_frequencies
+    # The chosen pair is recorded and the final models were fitted with those rounds.
+    chosen = payload["params"]["n_estimators"]
+    assert chosen in models.round_grid(models.MAX_ROUNDS)
+    assert payload["params"]["shrink"] in models.SHRINK_GRID
     first = models.load_artifact(trained.artifact)
     assert models.load_artifact(trained.artifact) is first  # cached by hash
     assert first["classifier"].feature_name() == FEATURES
+    assert first["classifier"].current_iteration() == chosen
+    assert first["q10"].current_iteration() == first["q90"].current_iteration() == chosen
+    assert first["shrink"] == payload["params"]["shrink"]
+    np.testing.assert_allclose(first["climatology"].sum(), 1.0)
+    assert list(first["climatology"]) == [payload["class_frequencies"][c] for c in CLASSES]
+
+
+# ------------------------------------------------------------------ out-of-sample choices
+
+
+def test_first_fold_uses_the_conservative_defaults(trained: TrainResult) -> None:
+    fp = trained.metrics.fold_params  # type: ignore[attr-defined]
+    assert fp[0] == {"n_estimators": models.FIRST_FOLD_ROUNDS, "shrink": models.FIRST_FOLD_SHRINK}
+
+
+def test_selection_pool_holds_only_earlier_folds(
+    frame: pd.DataFrame, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """When fold j's pair is chosen, exactly the rows of folds < j have been scored."""
+    seen: list[tuple[int, float]] = []
+    real = models.select_rounds_and_shrink
+
+    def spy(loss_sum: np.ndarray, n_scored: int, *args: object) -> tuple[int, float]:
+        seen.append((n_scored, float(loss_sum.sum())))
+        return real(loss_sum, n_scored, *args)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(models, "select_rounds_and_shrink", spy)
+    result = models.train_walk_forward(frame, min_train_days=MIN_TRAIN, step_days=STEP)
+    folds = result.metrics.folds
+    assert len(seen) == len(folds) + 1  # one choice per fold, then the final fit's
+    pooled = np.cumsum([0, *(f.n_test for f in folds)])
+    assert [n for n, _ in seen] == list(pooled)
+    assert seen[0] == (0, 0.0)  # nothing to choose from: the defaults
+    assert all(b > a for (_, a), (_, b) in pairwise(seen))  # the pool only ever grows
+
+
+def test_a_folds_own_rows_never_pick_its_rounds_or_shrink(frame: pd.DataFrame) -> None:
+    """Rewriting the labels of one fold's test rows changes that fold's scores but not its
+    (rounds, shrink), nor anything about the folds before it."""
+    base = models.train_walk_forward(frame, min_train_days=MIN_TRAIN, step_days=STEP)
+    folds = base.metrics.folds
+    j = len(folds) // 2
+    rows = [d for d in frame.index if folds[j].test_start <= d <= folds[j].test_end]
+    assert len(rows) == folds[j].n_test
+    shocked = frame.copy()
+    flipped = -3.0 * shocked.loc[rows, "label_pct"].to_numpy(dtype=float)
+    shocked.loc[rows, "label_pct"] = flipped
+    shocked.loc[rows, "label_class"] = [class_of(float(v), 0.30) for v in flipped]
+    again = models.train_walk_forward(shocked, min_train_days=MIN_TRAIN, step_days=STEP)
+
+    bp, ap = base.metrics.fold_params, again.metrics.fold_params  # type: ignore[attr-defined]
+    assert ap[: j + 1] == bp[: j + 1]  # fold j chose from folds < j, which did not change
+    assert again.metrics.folds[:j] == folds[:j]  # earlier folds never saw the change
+    assert again.metrics.folds[j].test_start == folds[j].test_start
+    assert again.metrics.folds[j].brier != folds[j].brier  # the perturbation was real
+
+
+def test_select_rounds_and_shrink_prefers_the_conservative_tie() -> None:
+    rounds, shrinks = (25, 50, 75), (0.0, 0.5, 0.9)
+    assert models.select_rounds_and_shrink(np.zeros((3, 3)), 0, rounds, shrinks, (50, 0.5)) == (
+        50,
+        0.5,
+    )
+    loss = np.full((3, 3), 10.0)
+    loss[1, 0] = 4.0
+    assert models.select_rounds_and_shrink(loss, 2, rounds, shrinks, (50, 0.5)) == (50, 0.0)
+    loss[2, 2] = 4.0  # a tie: fewer rounds win ...
+    assert models.select_rounds_and_shrink(loss, 2, rounds, shrinks, (50, 0.5)) == (50, 0.0)
+    loss[1, 2] = 4.0  # ... and at equal rounds, more shrinkage
+    assert models.select_rounds_and_shrink(loss, 2, rounds, shrinks, (50, 0.5)) == (50, 0.9)
+
+
+def test_shrink_probs_math() -> None:
+    p = np.array([[0.9, 0.05, 0.05]])
+    clim = np.array([0.3, 0.3, 0.4])
+    np.testing.assert_allclose(models.shrink_probs(p, 0.5, clim), [[0.6, 0.175, 0.225]])
+    np.testing.assert_array_equal(models.shrink_probs(p, 0.0, None), p)
+    stacked = models.shrink_probs(np.stack([p, p]), 0.5, clim)  # (K, n, 3) broadcasts too
+    assert stacked.shape == (2, 1, 3) and np.allclose(stacked[1], [[0.6, 0.175, 0.225]])
+    with pytest.raises(ValueError, match="class frequencies"):
+        models.shrink_probs(p, 0.5, None)
+    for bad in (-0.1, 1.0):
+        with pytest.raises(ValueError, match="shrink"):
+            models.shrink_probs(p, bad, clim)
+    # Overconfident and wrong: shrinking towards climatology repairs the log loss.
+    y = np.array([CLASS_INDEX["UP"]])
+    assert metrics.log_loss(models.shrink_probs(p, 0.9, clim), y) < metrics.log_loss(p, y)
+
+
+def test_shrinkage_tames_an_overfit_model_on_noise() -> None:
+    noise = noise_frame()
+    raw = models.train_walk_forward(
+        noise, params={**LOOSE_PARAMS, "shrink": 0.0}, min_train_days=MIN_TRAIN, step_days=STEP
+    )
+    shrunk = models.train_walk_forward(
+        noise, params=LOOSE_PARAMS, min_train_days=MIN_TRAIN, step_days=STEP
+    )
+    assert raw.metrics.log_loss > math.log(3)  # overconfident: worse than saying "no idea"
+    assert shrunk.metrics.log_loss <= math.log(3) + 0.01
+    assert shrunk.metrics.log_loss < raw.metrics.log_loss
+    assert shrunk.metrics.brier < raw.metrics.brier
+    assert shrunk.params["shrink"] > 0.0 and raw.params["shrink"] == 0.0
+    assert all(fp["shrink"] == 0.0 for fp in raw.metrics.fold_params)  # type: ignore[attr-defined]
+    # With nothing to learn the live call stays near the class frequencies.
+    out = models.predict(
+        shrunk.artifact, shrunk.feature_names, live_row(noise, shrunk.feature_names)
+    )
+    freq = shrunk.metrics.class_frequencies
+    assert all(abs(out.probs[c] - freq[c]) < 0.1 for c in CLASSES)
+
+
+def test_params_overrides_bound_rounds_and_fix_shrink(frame: pd.DataFrame) -> None:
+    small = synthetic_frame(n=MIN_TRAIN + 3 * STEP)
+    result = models.train_walk_forward(
+        small, params={"n_estimators": 60, "shrink": 0.2}, min_train_days=MIN_TRAIN, step_days=STEP
+    )
+    fps = result.metrics.fold_params  # type: ignore[attr-defined]
+    assert [fp["shrink"] for fp in fps] == [0.2, 0.2, 0.2] and result.params["shrink"] == 0.2
+    assert fps[0]["n_estimators"] == 50 and all(fp["n_estimators"] in {25, 50, 60} for fp in fps)
+    assert result.params["n_estimators"] in {25, 50, 60}
+    assert result.params["num_leaves"] == 5  # the other defaults stay
+    loaded = models.load_artifact(result.artifact)
+    assert loaded["classifier"].current_iteration() == result.params["n_estimators"]
+    with pytest.raises(ValueError, match="shrink"):
+        models.train_walk_forward(small, params={"shrink": 1.0}, min_train_days=MIN_TRAIN)
+    with pytest.raises(ValueError, match="n_estimators"):
+        models.train_walk_forward(small, params={"n_estimators": 0}, min_train_days=MIN_TRAIN)
 
 
 # ------------------------------------------------------------------ prediction
@@ -194,6 +382,44 @@ def test_predict_returns_normalised_probs_in_class_order(
     assert contribs == sorted(contribs, reverse=True)
     for d in out.drivers:
         assert d.feature in FEATURES and d.text and out.predicted_class in d.text
+
+
+def test_predict_applies_the_artifacts_shrinkage(frame: pd.DataFrame, trained: TrainResult) -> None:
+    row = live_row(frame, trained.feature_names)
+    x = models.row_vector(trained.feature_names, row)
+    art = models.load_artifact(trained.artifact)
+    raw = models._probs(art["classifier"], x)[0]
+    clim = art["climatology"]
+
+    def variant(**changes: object) -> str:
+        payload = json.loads(trained.artifact)
+        for key, value in changes.items():
+            if value is None:
+                payload.pop(key, None)
+            else:
+                payload[key] = value
+        return json.dumps(payload, sort_keys=True)
+
+    # A fixed, known shrink: predict() mixes exactly as shrink_probs does.
+    params = {**trained.params, "shrink": 0.6}
+    out = models.predict(variant(params=params), trained.feature_names, row)
+    expected = models.shrink_probs(raw[None, :], 0.6, clim)[0]
+    for c in ("UP", "FLAT", "DOWN"):
+        assert out.probs[c] == pytest.approx(expected[CLASS_INDEX[c]])
+    for c in CLASSES:  # a convex mix: every class lands between the model and climatology
+        lo, hi = sorted((raw[CLASS_INDEX[c]], clim[CLASS_INDEX[c]]))
+        assert lo - 1e-9 <= out.probs[c] <= hi + 1e-9
+    # Shrink 0, or an artifact from before shrinkage existed: the classifier's own numbers.
+    for legacy in (
+        variant(params={**trained.params, "shrink": 0.0}),
+        variant(params={}, class_frequencies=None),
+    ):
+        out = models.predict(legacy, trained.feature_names, row)
+        for c in ("UP", "FLAT", "DOWN"):
+            assert out.probs[c] == pytest.approx(raw[CLASS_INDEX[c]])
+    # Shrinkage asked for without class frequencies is an error, never a made-up prior.
+    with pytest.raises(ValueError, match="class frequencies"):
+        models.predict(variant(params=params, class_frequencies=None), trained.feature_names, row)
 
 
 def test_predict_class_order_matches_the_signal(frame: pd.DataFrame, trained: TrainResult) -> None:
@@ -283,7 +509,7 @@ def test_driver_text_falls_back_without_features_module(monkeypatch: pytest.Monk
         ("rsi_14", 61.4, "at 61"),
         ("vol_z20", 1.25, "at +1.25 sd"),
         ("bollinger_z", -0.5, "at -0.50 sd"),
-        ("is_expiry_day", 1.0, "= yes"),
+        ("is_month_last_week", 1.0, "= yes"),
         ("budget_day", 0.0, "= no"),
         ("fomc_overnight", 1.0, "= yes"),
         ("dow", 1.0, "= Tuesday"),

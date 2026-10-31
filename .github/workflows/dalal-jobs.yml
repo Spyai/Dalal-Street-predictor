@@ -5,14 +5,17 @@
 # Vercel API project via VERCEL_TOKEN, or from GitHub secrets. Set the repository
 # variable DALAL_JOBS_ENABLED=false to pause the schedule.
 #
-# Times are UTC; IST = UTC+5:30. GitHub can start scheduled runs several minutes late.
+# Times are UTC; IST = UTC+5:30. GitHub can start scheduled runs several minutes late,
+# and runs scheduled on the top of the hour are the most delayed, so the pre-market
+# prediction is asked for at 07:27 IST (01:57 UTC): it still records the 07:30 call and
+# the brief is out well before the 09:15 lock.
 name: Dalal jobs
 
 on:
   schedule:
     - cron: "35 0 * * *"       # 06:05 IST daily      holiday_refresh
     - cron: "30 1 * * 1-5"     # 07:00 IST Mon-Fri    kite_login_reminder
-    - cron: "0 2 * * 1-5"      # 07:30 IST Mon-Fri    premarket_prediction
+    - cron: "57 1 * * 1-5"     # 07:27 IST Mon-Fri    premarket_prediction (off the hour)
     - cron: "15 3 * * 1-5"     # 08:45 IST Mon-Fri    instrument_sync
     - cron: "50 3 * * 1-5"     # 09:20 IST Mon-Fri    open_check
     - cron: "15 10 * * 1-5"    # 15:45 IST Mon-Fri    close_grading
@@ -107,7 +110,7 @@ jobs:
           case "$SCHEDULE" in
             "35 0 * * *")      CMD="run-job holiday_refresh" ;;
             "30 1 * * 1-5")    CMD="run-job kite_login_reminder" ;;
-            "0 2 * * 1-5")     CMD="run-job premarket_prediction" ;;
+            "57 1 * * 1-5")    CMD="run-job premarket_prediction" ;;
             "15 3 * * 1-5")    CMD="run-job instrument_sync" ;;
             "50 3 * * 1-5")    CMD="run-job open_check" ;;
             "15 10 * * 1-5")   CMD="run-job close_grading" ;;

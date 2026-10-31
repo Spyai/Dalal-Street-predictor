@@ -120,13 +120,23 @@ class GradeOut(BaseModel):
 
 
 class TrackOut(BaseModel):
-    """The live track record that sits beside every call (honesty rules, brief §1)."""
+    """The live track record that sits beside every call (honesty rules, brief §1).
+
+    The baseline comparison is paired: `best_baseline_accuracy` and `model_paired_accuracy`
+    cover exactly the `paired_n` graded sessions where that baseline had a call.
+    `comparison` is one of app.services.scorecard.COMPARISONS (ahead, behind, level,
+    too_early, no_baseline, no_calls); ahead/behind needs `min_paired_n` paired calls.
+    """
 
     n_graded: int
     accuracy: float | None
     best_baseline: str | None
     best_baseline_label: str | None
     best_baseline_accuracy: float | None
+    paired_n: int | None
+    model_paired_accuracy: float | None
+    min_paired_n: int
+    comparison: str
     sample_warning: bool
     min_sample_size: int
 
@@ -157,6 +167,9 @@ class MarketCallOut(BaseModel):
     note: str | None
     grade: GradeOut | None
     track: TrackOut | None
+    # True when the upcoming session has no call yet and this is the latest earlier call
+    # (with its grade), shown so the close grade is visible after 15:30 IST.
+    is_previous: bool = False
 
 
 class TodayOut(BaseModel):
@@ -164,8 +177,9 @@ class TodayOut(BaseModel):
     cues: list[CueOut]
     flows: FlowsOut
     kite: KiteStatusOut
+    market_call_session: date  # the session the page is for (core.session_for)
     market_call: list[MarketCallOut] = Field(default_factory=list)
-    market_call_note: str = ""  # why a target has no call; empty when every target has one
+    market_call_note: str = ""  # why a target has no call at all; empty when every one has
 
 
 # ----------------------------------------------------------------------------- scorecard
@@ -186,10 +200,13 @@ class CalibrationBinOut(BaseModel):
 
 
 class BaselineScoreOut(BaseModel):
+    """A baseline against the model on the `n` graded sessions where the baseline had a call."""
+
     name: str
     label: str
     n: int
-    accuracy: float | None
+    accuracy: float | None  # the baseline's, on those n sessions
+    model_accuracy: float | None  # the model's, on the same n sessions
 
 
 class OosMetricsOut(BaseModel):
@@ -201,6 +218,16 @@ class OosMetricsOut(BaseModel):
     log_loss: float | None
 
 
+class OosBaselineOut(BaseModel):
+    """A baseline's walk-forward, out-of-sample score stored with the champion."""
+
+    name: str
+    label: str
+    n: int
+    accuracy: float | None
+    brier: float | None
+
+
 class ChampionOut(BaseModel):
     id: int
     version: str
@@ -208,6 +235,11 @@ class ChampionOut(BaseModel):
     trained_through: date
     train_rows: int
     oos: OosMetricsOut
+    baselines: list[OosBaselineOut]  # empty when the model was stored without them
+    class_frequencies: dict[str, float | None] | None
+    range_coverage: float | None  # share of OOS moves inside the 10–90 % range, if stored
+    climatology_brier: float | None  # OOS Brier of the class-frequency forecast
+    oos_verdict: str
     promoted_at: datetime | None
     created_at: datetime | None
 
@@ -257,6 +289,9 @@ class ScorecardOut(BaseModel):
     by_confidence: list[ConfidenceBucketOut]
     calibration: list[CalibrationBinOut]
     baselines: list[BaselineScoreOut]
+    best_baseline: BaselineScoreOut | None  # the toughest paired comparison
+    comparison: str  # app.services.scorecard.COMPARISONS
+    min_paired_n: int
     verdict: str
     sample_warning: bool
     min_sample_size: int
@@ -361,6 +396,7 @@ class ModelHealthOut(BaseModel):
     version: str
     trained_through: date
     oos_brier: float | None
+    climatology_brier: float | None  # OOS Brier of the class-frequency forecast, same sessions
     oos_accuracy: float | None
     n_oos: int | None
     promoted_at: datetime | None

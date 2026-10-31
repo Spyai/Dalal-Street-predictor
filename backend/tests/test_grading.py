@@ -220,3 +220,92 @@ def test_grade_session_grades_what_it_can_and_names_the_rest(db: Session) -> Non
     report2 = grade_session(db, SESSION, {}, now=NOW, source="yfinance")
     assert report2.graded == 0 and len(report2.skipped) == 2
     assert isinstance(report2, grading.GradingReport)
+
+
+# ------------------------------------------------------------------ provenance
+
+
+def _ist(at: datetime) -> str:
+    from app.config import IST
+
+    return at.astimezone(IST).strftime("%Y-%m-%d %H:%M IST")
+
+
+def test_close_grade_keeps_the_gap_grades_source_in_notes(db: Session) -> None:
+    p = record_market_call(db, make_record(gap_call="gap_up"))
+    g1 = grade_gap(db, p, 1004.0, now=OPEN_NOW, source="kite")
+    assert g1.source == "kite" and g1.notes is None
+
+    g2 = grade_close(db, p, 1009.0, 1010.0, now=NOW, source="nse_bhavcopy")
+    assert g2.source == "nse_bhavcopy", "the close's source"
+    assert g2.notes == f"gap graded from kite at {_ist(OPEN_NOW)}; close from nse_bhavcopy"
+    assert g2.gap_actual_pct == pytest.approx(0.4) and g2.gap_graded_at == OPEN_NOW
+
+    # Re-grading the close later keeps the gap's provenance and updates the close's.
+    g3 = grade_close(db, p, None, 1010.5, now=NOW + timedelta(hours=1), source="yfinance")
+    assert g3.notes == f"gap graded from kite at {_ist(OPEN_NOW)}; close from yfinance"
+    assert g3.source == "yfinance" and g3.gap_actual_pct == pytest.approx(0.4)
+
+
+def test_gap_grade_after_a_close_grade_does_not_steal_its_source(db: Session) -> None:
+    p = record_market_call(db, make_record(gap_call="gap_up"))
+    grade_close(db, p, None, 1010.0, now=NOW, source="nse_bhavcopy")  # no open: gap ungraded
+    g = grade_gap(db, p, 1004.0, now=NOW + timedelta(days=1), source="kite")
+    assert g.source == "nse_bhavcopy" and g.actual_close == 1010.0
+    assert (
+        g.notes
+        == f"gap graded from kite at {_ist(NOW + timedelta(days=1))}; close from nse_bhavcopy"
+    )
+    assert g.gap_correct is True
+
+
+def test_close_grade_that_grades_the_gap_itself_says_so(db: Session) -> None:
+    p = record_market_call(db, make_record(gap_call="gap_up"))
+    g = grade_close(db, p, 1004.0, 1010.0, now=NOW, source="yfinance")
+    assert g.notes == f"gap graded from yfinance at {_ist(NOW)}; close from yfinance"
+    only_close = grade_close(
+        db,
+        record_market_call(db, make_record(target="NIFTY BANK")),
+        None,
+        1010.0,
+        now=NOW,
+        source="yfinance",
+    )
+    assert only_close.notes is None and only_close.gap_graded_at is None
+
+
+# ------------------------------------------------------------------ voiding
+
+
+def test_void_grade_marks_a_call_ungradeable_without_inventing_a_close(db: Session) -> None:
+    p = record_market_call(db, make_record())
+    g = grading.void_grade(db, p, now=NOW, reason="session never traded (ad-hoc holiday)")
+    assert g.actual_close is None and g.actual_class is None and g.correct is None
+    assert g.error_category == "no_session" and g.source == "manual"
+    assert g.notes == "voided (no_session): session never traded (ad-hoc holiday)"
+    assert g.graded_at == NOW
+    assert ledger.ungraded(db) == []
+    assert _grade_rows(db) == 1
+
+    with pytest.raises(ValueError, match="category"):
+        grading.void_grade(db, p, now=NOW, reason="x", category="typo")
+    with pytest.raises(ValueError, match="reason"):
+        grading.void_grade(db, p, now=NOW, reason="   ")
+
+    # A real close later supersedes the void (and clears its category).
+    g2 = grade_close(db, p, None, 1010.0, now=NOW + timedelta(days=1), source="nse_bhavcopy")
+    assert g2.id == g.id and g2.error_category is None and g2.actual_class == "UP"
+    with pytest.raises(ValueError, match="already has a close grade"):
+        grading.void_grade(db, p, now=NOW, reason="too late")
+
+
+def test_void_keeps_an_existing_gap_grade(db: Session) -> None:
+    p = record_market_call(db, make_record(gap_call="gap_up"))
+    grade_gap(db, p, 1004.0, now=OPEN_NOW, source="kite")
+    g = grading.void_grade(
+        db, p, now=NOW, reason="vendor bar missing for good", category="data_error"
+    )
+    assert g.gap_actual_pct == pytest.approx(0.4) and g.gap_graded_at == OPEN_NOW
+    assert g.source == "kite", "the gap's source is kept; the void adds no close source"
+    assert g.error_category == "data_error" and g.actual_close is None
+    assert ledger.ungraded(db) == []

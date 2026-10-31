@@ -2,12 +2,13 @@
 
 Everything here is read from the ledger and its grades through `app.services.scorecard`
 and `app.services.ledger`; the API never imports LightGBM. A metric with nothing behind
-it is None and the UI shows "—".
+it is None and the UI shows "—". A target that is neither configured nor in the ledger
+is a 404, not an empty scorecard that looks like a real one.
 """
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -17,7 +18,7 @@ from app.db import get_db
 from app.models import AppUser, Prediction
 from app.schemas import LedgerVerifyOut, PredictionRowOut, ScorecardOut
 from app.services import ledger
-from app.services.scorecard import row_dict, scorecard
+from app.services.scorecard import MIN_PAIRED_N, row_dict, scorecard
 
 router = APIRouter(prefix="/api/scorecard", tags=["scorecard"])
 
@@ -38,6 +39,21 @@ def known_targets(db: Session) -> list[str]:
     return out
 
 
+def known_target(db: Session, target: str | None) -> tuple[str, list[str]]:
+    """(resolved target, known targets); 404 when the target is unknown.
+
+    Unknown = not configured and without a single ledger record.
+    """
+    wanted = resolve_target(target)
+    known = known_targets(db)
+    if wanted not in known:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            f"Unknown target {wanted!r}; known targets: {', '.join(known)}.",
+        )
+    return wanted, known
+
+
 @router.get("", response_model=ScorecardOut)
 def get_scorecard(
     target: str | None = Query(default=None, max_length=32),
@@ -45,9 +61,10 @@ def get_scorecard(
     _: AppUser = Depends(current_user),
 ) -> ScorecardOut:
     s = get_settings()
-    sc = scorecard(db, resolve_target(target), settings=s)
+    wanted, known = known_target(db, target)
+    sc = scorecard(db, wanted, settings=s)
     return ScorecardOut(
-        targets=known_targets(db), min_sample_size=s.min_sample_size, **sc.as_dict()
+        targets=known, min_sample_size=s.min_sample_size, min_paired_n=MIN_PAIRED_N, **sc.as_dict()
     )
 
 
@@ -59,7 +76,9 @@ def ledger_rows(
     _: AppUser = Depends(current_user),
 ) -> list[PredictionRowOut]:
     """Recent ledger records with their grades, newest first. No target = every target."""
-    wanted = target.strip().upper() if target is not None and target.strip() else None
+    wanted: str | None = None
+    if target is not None and target.strip():
+        wanted, _known = known_target(db, target)
     rows = ledger.history(db, wanted, limit)
     return [PredictionRowOut.model_validate(row_dict(p, g)) for p, g in rows]
 

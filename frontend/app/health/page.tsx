@@ -3,8 +3,9 @@
 import { useEffect, useState } from "react";
 import { api, ApiError } from "@/lib/api";
 import type { Health } from "@/lib/types";
-import { ago, fmtIstDateTime } from "@/lib/format";
+import { ago, fmtDate, fmtIstDateTime, fmtNum } from "@/lib/format";
 import { Notice, StatusPill } from "@/components/Status";
+import { fmtProb } from "@/components/MarketCall";
 
 export default function HealthPage() {
   const [data, setData] = useState<Health | null>(null);
@@ -130,7 +131,61 @@ export default function HealthPage() {
 
       <Section title="Models in production">
         <p className="text-sm text-muted">{data.models_note}</p>
+        {data.models.length > 0 && <ModelTable models={data.models} />}
       </Section>
+    </div>
+  );
+}
+
+function ModelTable({ models }: { models: Health["models"] }) {
+  return (
+    <div className="mt-3 overflow-x-auto">
+      <table className="num w-full text-sm">
+        <thead className="text-left text-xs text-faint">
+          <tr>
+            <th className="py-1 font-normal">Target</th>
+            <th className="py-1 font-normal">Version</th>
+            <th className="hidden py-1 font-normal sm:table-cell">Trained through</th>
+            <th className="py-1 text-right font-normal" title="Out of sample (walk-forward)">
+              OOS Brier
+            </th>
+            <th
+              className="py-1 text-right font-normal"
+              title="Brier of a forecast that always says the training class frequencies, on the same OOS sessions"
+            >
+              Climatology Brier
+            </th>
+            <th className="py-1 text-right font-normal">OOS accuracy</th>
+            <th className="py-1 text-right font-normal">n</th>
+          </tr>
+        </thead>
+        <tbody>
+          {models.map((m) => {
+            const worse =
+              m.oos_brier !== null && m.climatology_brier !== null && m.oos_brier > m.climatology_brier;
+            return (
+              <tr key={`${m.name}-${m.target}`} className="border-t border-line align-top">
+                <td className="py-1.5 pr-2 font-medium">{m.target}</td>
+                <td className="py-1.5 pr-2 break-all text-xs text-muted">
+                  {m.version}
+                  {m.promoted_at && (
+                    <div className="text-[11px] text-faint">promoted {fmtIstDateTime(m.promoted_at)} IST</div>
+                  )}
+                </td>
+                <td className="hidden py-1.5 pr-2 text-muted sm:table-cell">{fmtDate(m.trained_through)}</td>
+                <td className={`py-1.5 text-right ${worse ? "text-down" : ""}`}>{fmtNum(m.oos_brier, 3)}</td>
+                <td className="py-1.5 text-right text-muted">{fmtNum(m.climatology_brier, 3)}</td>
+                <td className="py-1.5 text-right">{fmtProb(m.oos_accuracy)}</td>
+                <td className="py-1.5 text-right text-muted">{m.n_oos ?? "—"}</td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      <p className="mt-2 text-[11px] text-faint">
+        A Brier score above the climatology Brier means the model&apos;s probabilities were worse
+        than always quoting the class frequencies. &quot;—&quot; = not stored with the model.
+      </p>
     </div>
   );
 }

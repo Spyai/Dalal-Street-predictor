@@ -6,7 +6,10 @@ row D is computed from data dated strictly before D:
 - target / India VIX / global-cue daily bars dated <= D-1 (the last bar before D, so a
   bar dated D, even a partial one fetched before the open, is never used);
 - FII/DII flows dated on the reference session (published the evening of that day);
-- NSE calendar flags for D itself (holidays and expiries are known in advance);
+- NSE calendar flags for D itself (weekday, sessions left in the month: known in
+  advance). There is no expiry-day flag: the weekly expiry weekday moved in 2023, 2024
+  and 2025, so a single weekday would mislabel most of the history, and `dow` already
+  carries whatever day-of-week effect exists;
 - scheduled-event flags from `app.ml.events`.
 
 The same code builds the training frame and the live row (`live_row` is
@@ -89,7 +92,6 @@ FEATURE_LABELS: dict[str, str] = {
     "up_streak": "Consecutive up (+) / down (-) sessions",
     "dow": "Day of week (0 = Monday)",
     "sessions_to_month_end": "Sessions left in the month",
-    "is_expiry_day": "Weekly expiry day",
     "is_month_last_week": "Last five sessions of the month",
     "vix_level": "India VIX level",
     "vix_chg_1d": "India VIX 1-day change (%)",
@@ -307,7 +309,6 @@ def _calendar_block(cal: TradingCalendar, sessions: list[date], settings: Settin
         row = {
             "dow": float(d.weekday()),
             "sessions_to_month_end": float(left),
-            "is_expiry_day": float(d.weekday() == settings.nifty_expiry_weekday),
             "is_month_last_week": float(left < MONTH_LAST_WEEK_SESSIONS),
         }
         row.update(events.flags(d, cal.previous_trading_day(d)))

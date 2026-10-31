@@ -18,6 +18,9 @@ Commands:
                                 promoted, later ones only if they beat the champion
     predict [--force]           the 07:30 pre-market prediction run, now
     grade [--force]             the 15:45 close grading, now
+    grade --void SEQ --reason TEXT [--category no_session|data_error]
+                                mark one ledger record as ungradeable (its session never
+                                traded, or the data is unusable); the record itself stays
     verify-ledger               walk the prediction hash chain; exit 1 if it is broken
     scorecard [--target T]      the live track record in plain words
 """
@@ -114,6 +117,7 @@ def cmd_backfill(args: argparse.Namespace) -> int:
     from app.services import instruments
     from app.services.backfill import run_backfill
     from app.services.calendar import TradingCalendar
+    from app.services.market_data import last_final_global_day
 
     years = args.years or get_settings().backfill_years
     with session_scope() as db:
@@ -125,18 +129,26 @@ def cmd_backfill(args: argparse.Namespace) -> int:
                 print(f"  {n} symbols from {src}")
             except Exception as exc:
                 print(f"  could not load universe: {exc}", file=sys.stderr)
+        now = datetime.now(UTC)
         cal = TradingCalendar.load(db)
-        end = cal.last_completed_session(datetime.now(UTC))
+        end = cal.last_completed_session(now)
+        # Global cues trade in other time zones: a bar dated the current UTC day may be a
+        # partial print, so they stop at the last complete UTC day (see market_data).
+        global_end = min(end, last_final_global_day(now))
         start = end - timedelta(days=int(365.25 * years))
-        ref_ids = list(
-            db.scalars(select(Instrument.id).where(Instrument.exchange.in_(["INDEX", "GLOBAL"])))
-        )
+        index_ids = list(db.scalars(select(Instrument.id).where(Instrument.exchange == "INDEX")))
+        global_ids = list(db.scalars(select(Instrument.id).where(Instrument.exchange == "GLOBAL")))
         uni_ids = [i.id for i in instruments.universe_instruments(db)]
         chain = registry.market_data_chain(db, include_broker=not args.no_broker)
     print(f"Backfilling {start} .. {end} with providers: {[p.name for p in chain]}")
-    for label, ids in (("indices + global cues", ref_ids), ("universe", uni_ids)):
-        print(f"\n== {label}: {len(ids)} instruments")
-        rep = run_backfill(ids, start, end, chain, progress=lambda m: print("  " + m))
+    groups = (
+        ("indices", index_ids, end),
+        ("global cues", global_ids, global_end),
+        ("universe", uni_ids, end),
+    )
+    for label, ids, through in groups:
+        print(f"\n== {label}: {len(ids)} instruments through {through}")
+        rep = run_backfill(ids, start, through, chain, progress=lambda m: print("  " + m))
         print("  " + rep.summary())
         for key, why in list(rep.missing.items())[:25]:
             print(f"  missing {key}: {why}")
@@ -176,7 +188,37 @@ def cmd_predict(args: argparse.Namespace) -> int:
 
 
 def cmd_grade(args: argparse.Namespace) -> int:
+    if args.void is not None:
+        return _void_call(args.void, args.reason, args.category)
+    if args.reason or args.category:
+        print("--reason / --category only make sense with --void SEQ", file=sys.stderr)
+        return 2
     return _run_named_job("close_grading", args.force)
+
+
+def _void_call(seq: int, reason: str | None, category: str | None) -> int:
+    """Mark one ledger record as ungradeable. The record is immutable; only its grade row
+    says that no close will come, and why."""
+    from app.models import Prediction
+    from app.services.grading import void_grade
+
+    if not reason or not reason.strip():
+        print("--void needs --reason TEXT (it is shown next to the call forever)", file=sys.stderr)
+        return 2
+    with session_scope() as db:
+        p = db.scalar(select(Prediction).where(Prediction.seq == seq))
+        if p is None:
+            print(f"no ledger record with seq {seq}", file=sys.stderr)
+            return 1
+        try:
+            g = void_grade(
+                db, p, now=datetime.now(UTC), reason=reason, category=category or "no_session"
+            )
+        except ValueError as exc:
+            print(f"not voided: {exc}", file=sys.stderr)
+            return 1
+        print(f"voided seq {p.seq} ({p.target}, session {p.session_date}): {g.notes}")
+    return 0
 
 
 def _fmt(x: float | None, spec: str = ".3f") -> str:
@@ -215,9 +257,7 @@ def cmd_train(args: argparse.Namespace) -> int:
                 failures += 1
                 continue
             champ = model_registry.champion(db, target)
-            promote, reason = model_registry.should_promote(
-                champ.metrics if champ is not None else None, result.metrics, s
-            )
+            promote, reason = model_registry.should_promote(champ, result, s)
             if args.promote_always and not promote:
                 promote, reason = True, f"--promote-always ({reason})"
             mv = model_registry.save_model(db, target, result, promote=promote, note=reason)
@@ -396,6 +436,13 @@ def main(argv: list[str] | None = None) -> int:
     sp.set_defaults(fn=cmd_predict)
     sp = sub.add_parser("grade")
     sp.add_argument("--force", action="store_true", help="run even on a weekend or holiday")
+    sp.add_argument("--void", type=int, metavar="SEQ", help="mark this record as ungradeable")
+    sp.add_argument("--reason", help="why no close will come (required with --void)")
+    sp.add_argument(
+        "--category",
+        choices=("no_session", "data_error"),
+        help="what kind of void (default no_session)",
+    )
     sp.set_defaults(fn=cmd_grade)
     sub.add_parser("verify-ledger").set_defaults(fn=cmd_verify_ledger)
     sp = sub.add_parser("scorecard")

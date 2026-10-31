@@ -76,12 +76,22 @@ export interface Grade {
   graded_at: string | null;
 }
 
+// Where the model stands against its toughest baseline on paired calls
+// (app.services.scorecard.COMPARISONS).
+export type Comparison = "ahead" | "behind" | "level" | "too_early" | "no_baseline" | "no_calls";
+
 export interface Track {
   n_graded: number;
   accuracy: number | null;
   best_baseline: string | null;
   best_baseline_label: string | null;
+  // Paired: the baseline's and the model's accuracy on the paired_n sessions where the
+  // baseline had a call.
   best_baseline_accuracy: number | null;
+  paired_n: number | null;
+  model_paired_accuracy: number | null;
+  min_paired_n: number;
+  comparison: Comparison;
   sample_warning: boolean;
   min_sample_size: number;
 }
@@ -110,6 +120,8 @@ export interface MarketCall {
   note: string | null;
   grade: Grade | null;
   track: Track | null;
+  // The upcoming session has no call yet; this is the latest earlier call with its grade.
+  is_previous: boolean;
 }
 
 export interface Today {
@@ -117,6 +129,7 @@ export interface Today {
   cues: Cue[];
   flows: Flows;
   kite: KiteStatus;
+  market_call_session: string; // the session the page is for
   market_call: MarketCall[];
   market_call_note: string;
 }
@@ -138,8 +151,9 @@ export interface CalibrationBin {
 export interface BaselineScore {
   name: string;
   label: string;
-  n: number;
-  accuracy: number | null;
+  n: number; // graded sessions where this baseline had a call
+  accuracy: number | null; // the baseline's, on those n sessions
+  model_accuracy: number | null; // the model's, on the same n sessions
 }
 
 export interface OosMetrics {
@@ -149,6 +163,14 @@ export interface OosMetrics {
   log_loss: number | null;
 }
 
+export interface OosBaseline {
+  name: string;
+  label: string;
+  n: number;
+  accuracy: number | null;
+  brier: number | null;
+}
+
 export interface Champion {
   id: number;
   version: string;
@@ -156,6 +178,11 @@ export interface Champion {
   trained_through: string;
   train_rows: number;
   oos: OosMetrics;
+  baselines: OosBaseline[]; // empty when the model was stored without them
+  class_frequencies: Partial<Record<CallClass, number | null>> | null;
+  range_coverage: number | null;
+  climatology_brier: number | null;
+  oos_verdict: string;
   promoted_at: string | null;
   created_at: string | null;
 }
@@ -201,6 +228,9 @@ export interface Scorecard {
   by_confidence: ConfidenceBucket[];
   calibration: CalibrationBin[];
   baselines: BaselineScore[];
+  best_baseline: BaselineScore | null; // the toughest paired comparison
+  comparison: Comparison;
+  min_paired_n: number;
   verdict: string;
   sample_warning: boolean;
   min_sample_size: number;
@@ -309,6 +339,7 @@ export interface ModelHealth {
   version: string;
   trained_through: string;
   oos_brier: number | null;
+  climatology_brier: number | null; // OOS Brier of the class-frequency forecast
   oos_accuracy: number | null;
   n_oos: number | null;
   promoted_at: string | null;

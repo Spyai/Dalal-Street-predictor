@@ -2,10 +2,10 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { api, ApiError } from "@/lib/api";
-import type { LedgerVerify, PredictionRow, Scorecard } from "@/lib/types";
+import type { CallClass, Champion, LedgerVerify, PredictionRow, Scorecard } from "@/lib/types";
 import { fmtDate, fmtIstDateTime, fmtNum, fmtPct } from "@/lib/format";
 import { Notice } from "@/components/Status";
-import { fmtProb } from "@/components/MarketCall";
+import { COMPARISON_TONE, comparisonText, fmtProb } from "@/components/MarketCall";
 
 // The market-call scorecard (brief §6.3): every metric with its sample size, the naive
 // baselines beside the model, calibration, the champion model, and the ledger check.
@@ -79,6 +79,11 @@ export default function ScorecardPage() {
       <section className="card p-4">
         <h2 className="label mb-1">Verdict</h2>
         <p className="text-sm">{data.verdict}</p>
+        {data.n_graded > 0 && (
+          <p className={`mt-1 text-sm ${COMPARISON_TONE[data.comparison]}`}>
+            {comparisonText(data.comparison, data.best_baseline?.n ?? null, data.min_paired_n)}
+          </p>
+        )}
         {data.sample_warning && (
           <div className="mt-2">
             <Notice tone="warn">
@@ -97,33 +102,46 @@ export default function ScorecardPage() {
       </section>
 
       <div className="grid gap-4 lg:grid-cols-2">
-        <Section title="Accuracy vs naive baselines">
+        <Section title="Accuracy vs naive baselines (paired)">
           <table className="num w-full text-sm">
             <thead className="text-left text-xs text-faint">
               <tr>
                 <th className="py-1 font-normal">Strategy</th>
                 <th className="py-1 text-right font-normal">n</th>
-                <th className="py-1 text-right font-normal">Accuracy</th>
+                <th className="py-1 text-right font-normal">Baseline</th>
+                <th className="py-1 text-right font-normal" title="The model on the same n sessions">
+                  Model
+                </th>
                 <th className="py-1 text-right font-normal">Model − baseline</th>
               </tr>
             </thead>
             <tbody>
               <tr className="border-t border-line font-medium">
-                <td className="py-1.5">{modelRow.label}</td>
+                <td className="py-1.5">{modelRow.label} (all graded)</td>
                 <td className="py-1.5 text-right">{modelRow.n}</td>
+                <td className="py-1.5 text-right text-faint">—</td>
                 <td className="py-1.5 text-right">{fmtProb(modelRow.accuracy)}</td>
                 <td className="py-1.5 text-right text-faint">—</td>
               </tr>
               {data.baselines.map((b) => {
                 const delta =
-                  data.accuracy !== null && b.accuracy !== null
-                    ? (data.accuracy - b.accuracy) * 100
+                  b.model_accuracy !== null && b.accuracy !== null
+                    ? (b.model_accuracy - b.accuracy) * 100
                     : null;
+                const toughest = data.best_baseline?.name === b.name;
                 return (
-                  <tr key={b.name} className="border-t border-line">
-                    <td className="py-1.5 text-muted">{b.label}</td>
+                  <tr key={b.name} className={`border-t border-line ${toughest ? "bg-panel-2/60" : ""}`}>
+                    <td className="py-1.5 text-muted">
+                      {b.label}
+                      {toughest && (
+                        <span className="ml-1 text-[10px] uppercase text-faint" title="The baseline the model leads by the least">
+                          toughest
+                        </span>
+                      )}
+                    </td>
                     <td className="py-1.5 text-right">{b.n}</td>
                     <td className="py-1.5 text-right">{fmtProb(b.accuracy)}</td>
+                    <td className="py-1.5 text-right">{fmtProb(b.model_accuracy)}</td>
                     <td
                       className={`py-1.5 text-right ${
                         delta === null ? "text-faint" : delta > 0 ? "text-up" : delta < 0 ? "text-down" : "text-muted"
@@ -137,8 +155,10 @@ export default function ScorecardPage() {
             </tbody>
           </table>
           <p className="mt-2 text-[11px] text-faint">
-            Baselines are graded on the same sessions as the model. A baseline with no call for a
-            session (e.g. no overnight futures) is skipped for that session, hence smaller n.
+            Paired: each baseline is compared with the model on exactly the n graded sessions where
+            that baseline had a call (the overnight-gap rule needs US futures; random needs class
+            frequencies), so both columns cover the same sessions. The verdict names the toughest
+            baseline and only claims ahead/behind with at least {data.min_paired_n} paired calls.
           </p>
         </Section>
 
@@ -196,20 +216,7 @@ export default function ScorecardPage() {
 
         <Section title="Champion model">
           {data.champion ? (
-            <dl className="num grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
-              <Row label="Version" value={data.champion.version} />
-              <Row label="Kind" value={data.champion.kind} />
-              <Row label="Trained through" value={fmtDate(data.champion.trained_through)} />
-              <Row label="Training rows" value={String(data.champion.train_rows)} />
-              <Row label="OOS sessions" value={data.champion.oos.n_oos === null ? "—" : String(data.champion.oos.n_oos)} />
-              <Row label="OOS accuracy" value={fmtProb(data.champion.oos.accuracy)} />
-              <Row label="OOS Brier" value={fmtNum(data.champion.oos.brier, 3)} />
-              <Row label="OOS log loss" value={fmtNum(data.champion.oos.log_loss, 3)} />
-              <Row
-                label="Promoted"
-                value={data.champion.promoted_at ? `${fmtIstDateTime(data.champion.promoted_at)} IST` : "—"}
-              />
-            </dl>
+            <ChampionBox champion={data.champion} />
           ) : (
             <Empty>
               No champion model for {data.target}. Train one with <code>python -m app.cli train</code>;
@@ -217,8 +224,8 @@ export default function ScorecardPage() {
             </Empty>
           )}
           <p className="mt-2 text-[11px] text-faint">
-            OOS = strict walk-forward, out-of-sample. A challenger replaces the champion only when
-            it beats it on these numbers.
+            OOS = strict walk-forward, out-of-sample, with the naive baselines scored on the same
+            sessions. A challenger replaces the champion only when it beats it on these numbers.
           </p>
         </Section>
       </div>
@@ -259,6 +266,100 @@ export default function ScorecardPage() {
           </div>
         )}
       </Section>
+    </div>
+  );
+}
+
+const CLASS_ORDER: CallClass[] = ["UP", "FLAT", "DOWN"];
+
+function ChampionBox({ champion }: { champion: Champion }) {
+  const oos = champion.oos;
+  const worse =
+    oos.brier !== null && champion.climatology_brier !== null && oos.brier > champion.climatology_brier;
+  const freq = champion.class_frequencies;
+  return (
+    <div className="space-y-3">
+      <dl className="num grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
+        <Row label="Version" value={champion.version} />
+        <Row label="Kind" value={champion.kind} />
+        <Row label="Trained through" value={fmtDate(champion.trained_through)} />
+        <Row label="Training rows" value={String(champion.train_rows)} />
+        <Row label="OOS sessions" value={oos.n_oos === null ? "—" : String(oos.n_oos)} />
+        <Row label="OOS accuracy" value={fmtProb(oos.accuracy)} />
+        <Row label="OOS Brier" value={fmtNum(oos.brier, 3)} tone={worse ? "text-down" : ""} />
+        <Row label="Climatology Brier" value={fmtNum(champion.climatology_brier, 3)} />
+        <Row label="OOS log loss" value={fmtNum(oos.log_loss, 3)} />
+        {champion.range_coverage !== null && (
+          <Row
+            label="10–90% range coverage"
+            value={`${fmtProb(champion.range_coverage)} (nominal 80%)`}
+            tone={Math.abs(champion.range_coverage - 0.8) > 0.1 ? "text-warn" : ""}
+          />
+        )}
+        <Row
+          label="Promoted"
+          value={champion.promoted_at ? `${fmtIstDateTime(champion.promoted_at)} IST` : "—"}
+        />
+      </dl>
+
+      <p className={`text-sm ${worse ? "text-down" : "text-muted"}`}>{champion.oos_verdict}</p>
+
+      <div>
+        <div className="label mb-1">Out of sample: model vs baselines</div>
+        {champion.baselines.length === 0 ? (
+          <Empty>This model was stored without walk-forward baselines, so none are shown.</Empty>
+        ) : (
+          <table className="num w-full text-xs">
+            <thead className="text-left text-faint">
+              <tr>
+                <th className="py-1 font-normal">Strategy</th>
+                <th className="py-1 text-right font-normal">n</th>
+                <th className="py-1 text-right font-normal">Accuracy</th>
+                <th className="py-1 text-right font-normal">Brier</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr className="border-t border-line font-medium">
+                <td className="py-1">Model</td>
+                <td className="py-1 text-right">{oos.n_oos ?? "—"}</td>
+                <td className="py-1 text-right">{fmtProb(oos.accuracy)}</td>
+                <td className={`py-1 text-right ${worse ? "text-down" : ""}`}>{fmtNum(oos.brier, 3)}</td>
+              </tr>
+              {champion.baselines.map((b) => (
+                <tr key={b.name} className="border-t border-line">
+                  <td className="py-1 text-muted">
+                    {b.label}
+                    {b.name === "random" && (
+                      <span className="ml-1 text-[10px] text-faint" title="Its Brier is that of the class-frequency (climatology) forecast">
+                        · Brier = climatology
+                      </span>
+                    )}
+                  </td>
+                  <td className="py-1 text-right">{b.n}</td>
+                  <td className="py-1 text-right">{fmtProb(b.accuracy)}</td>
+                  <td className="py-1 text-right">{fmtNum(b.brier, 3)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+        <p className="mt-1 text-[11px] text-faint">
+          A baseline&apos;s n below the model&apos;s means it had no call on some sessions; its
+          accuracy then covers a different set and is not directly comparable.
+        </p>
+      </div>
+
+      {freq && (
+        <p className="num text-xs text-muted">
+          Training class frequencies:{" "}
+          {CLASS_ORDER.map((c, i) => (
+            <span key={c}>
+              {i > 0 && " · "}
+              <span className={CLASS_TONE[c]}>{c}</span> {fmtProb(freq[c] ?? null)}
+            </span>
+          ))}
+        </p>
+      )}
     </div>
   );
 }
@@ -364,11 +465,11 @@ function Section({ title, children }: { title: string; children: React.ReactNode
   );
 }
 
-function Row({ label, value }: { label: string; value: string }) {
+function Row({ label, value, tone = "" }: { label: string; value: string; tone?: string }) {
   return (
     <>
       <dt className="text-xs text-muted">{label}</dt>
-      <dd className="text-right break-all">{value}</dd>
+      <dd className={`text-right break-all ${tone}`}>{value}</dd>
     </>
   );
 }

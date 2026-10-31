@@ -5,19 +5,28 @@ Phase 2 (brief §3, §4.1, §5): `premarket_prediction` at 07:30 makes and locks
 `weekly_retrain` on Saturday trains a challenger and promotes it only when it beats the
 champion out of sample. Every job returns per-target details for /health, says "partial"
 whenever a number it wanted was missing, and never substitutes a guess for it.
+
+Honest skips beat mis-referenced records: the 07:30 job refuses to write a call when the
+previous session's target bar is missing, when the session's year has no holiday calendar
+(unless forced), or when it runs on the reference session itself before 18:30 IST, and it
+says so in the run details instead. Global cues live on other exchanges, so a missing bar
+on one of their holidays is a note, not a problem, and their bars are only ever fetched
+through the last complete UTC day, then re-requested at 07:30 so a provisional print is
+replaced by the final close.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import date, timedelta
+from dataclasses import dataclass, field
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.config import Settings
+from app.config import IST, Settings
 from app.jobs.runner import JobContext, JobResult, JobSkipped
 from app.ml import baselines, core, features, models
 from app.ml import registry as model_registry
@@ -38,7 +47,12 @@ from app.services import (
     telegram,
 )
 from app.services.backfill import run_backfill
-from app.services.market_data import ensure_recent, ingest_bhavcopy
+from app.services.market_data import (
+    ensure_recent,
+    ingest_bhavcopy,
+    last_final_global_day,
+    latest_bar_date,
+)
 from app.services.source_status import mark_error, mark_ok
 
 
@@ -155,11 +169,16 @@ def evening_data_pull(ctx: JobContext) -> JobResult:
     ctx.db.commit()
 
     chain = registry.market_data_chain(ctx.db)
-    ref_ids = list(
-        ctx.db.scalars(select(Instrument.id).where(Instrument.exchange.in_(["INDEX", "GLOBAL"])))
-    )
-    rep = run_backfill(ref_ids, session_day - timedelta(days=10), session_day, chain)
+    index_ids = list(ctx.db.scalars(select(Instrument.id).where(Instrument.exchange == "INDEX")))
+    rep = run_backfill(index_ids, session_day - timedelta(days=10), session_day, chain)
     steps["reference_series"] = rep.summary()
+    # Global cues trade while this job runs (the US session is open at 19:30 IST): fetch
+    # them only through the last complete UTC day, never the run day. The 07:30 job
+    # re-requests the last days and the same-source upsert replaces any earlier print.
+    global_ids = list(ctx.db.scalars(select(Instrument.id).where(Instrument.exchange == "GLOBAL")))
+    global_through = min(session_day, last_final_global_day(ctx.now))
+    rep = run_backfill(global_ids, global_through - timedelta(days=10), global_through, chain)
+    steps["global_cues"] = f"{rep.summary()} (through {global_through}, the last complete UTC day)"
 
     have = set(
         ctx.db.scalars(select(DailyBar.instrument_id).where(DailyBar.trade_date == session_day))
@@ -183,6 +202,17 @@ def evening_data_pull(ctx: JobContext) -> JobResult:
 # ----------------------------------------------------------------------------- Phase 2
 
 TRAIN_HINT = "no model: run `python -m app.cli train`"
+RETRAIN_HINT = "retrain needed (run `python -m app.cli train` or wait for Saturday)"
+# Calendar days of GLOBAL-cue history re-requested at 07:30 so a bar first stored while
+# its market was open is replaced by the final one (market_data.ensure_recent).
+GLOBAL_REFETCH_DAYS = 3
+# The previous session's own close may still be revised by the exchange / the vendor for
+# a while after 15:30 IST; a call written on that day before this time would lock in a
+# provisional reference close.
+REFERENCE_FINAL_TIME = time(18, 30)
+# Ungraded calls older than this many sessions will not resolve on their own: list them
+# as unresolvable (void them with `grade --void`) instead of alerting every afternoon.
+UNRESOLVED_SESSIONS = 5
 GAP_GUIDANCE: dict[str, str] = {
     "gap_up": "Gap-up likely; avoid buying the first 15 minutes.",
     "gap_down": "Gap-down likely; avoid selling into the first 15 minutes.",
@@ -229,21 +259,67 @@ def _reference_instruments(db: Session, targets: list[str]) -> list[Instrument]:
     return out
 
 
+@dataclass
+class RefreshReport:
+    """What the pre-run data refresh found. `problems` make the run partial (a target or
+    VIX bar is missing); `notes` are reported but harmless (a global cue's exchange was
+    closed, or its re-fetch failed and the stored bar stands)."""
+
+    problems: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+
+
 def _refresh_bars(
     db: Session,
     insts: list[Instrument],
     through: date,
     chain: list[MarketDataProvider],
     years: int,
-) -> list[str]:
-    """Best-effort `ensure_recent` for each instrument; returns one line per instrument
-    that still has no bar for `through` (the caller reports them, never fills them in)."""
-    problems: list[str] = []
+    *,
+    session: date,
+    now: datetime,
+) -> RefreshReport:
+    """Best-effort `ensure_recent` for each instrument, then say what is still missing.
+
+    INDEX instruments (targets, India VIX) must have a bar for `through`; a missing one is
+    a problem the caller reports (never fills in). GLOBAL instruments follow their own
+    calendars: they are fetched only through the last complete UTC day, the last
+    `GLOBAL_REFETCH_DAYS` are re-requested so a provisional bar is replaced, and a missing
+    bar is only a problem once the latest bar is older than `features.MAX_CUE_AGE_DAYS`
+    (the age at which the feature pipeline treats the cue as missing anyway).
+    """
+    report = RefreshReport()
+    global_through = min(through, last_final_global_day(now))
     for inst in insts:
-        source, errors = ensure_recent(db, inst, through, chain, years)
-        if source is None and errors:
-            problems.append(f"{inst.exchange}:{inst.symbol} has no bar for {through}: {errors[-1]}")
-    return problems
+        is_global = inst.exchange == "GLOBAL"
+        want = global_through if is_global else through
+        _, errors = ensure_recent(
+            db,
+            inst,
+            want,
+            chain,
+            years,
+            refetch_days=GLOBAL_REFETCH_DAYS if is_global else 0,
+        )
+        latest = latest_bar_date(db, inst.id)
+        name = f"{inst.exchange}:{inst.symbol}"
+        why = errors[-1] if errors else "no bars returned"
+        if latest is not None and latest >= want:
+            if errors:
+                report.notes.append(
+                    f"{name}: re-fetch returned nothing ({why}); the stored bar for {want} stands"
+                )
+            continue
+        if not is_global:
+            report.problems.append(f"{name} has no bar for {want}: {why}")
+        elif latest is not None and (session - latest).days <= features.MAX_CUE_AGE_DAYS:
+            report.notes.append(f"{name}: no bar for {want} (market closed?); latest is {latest}")
+        else:
+            report.problems.append(
+                f"{name} has no bar for {want} and its latest bar ({latest or 'none'}) is older "
+                f"than {features.MAX_CUE_AGE_DAYS} days: {why}"
+            )
+    return report
 
 
 def _class_frequencies(mv: Any) -> dict[str, float]:
@@ -276,26 +352,79 @@ def _call_summary(p: Prediction) -> str:
     return f"{p.target}: {p.predicted_class} {top:.0%} ({p.confidence}{late})"
 
 
-def _predict_target(
-    db: Session, target: str, session: date, ctx: JobContext
-) -> tuple[Prediction | None, dict[str, Any], list[str]]:
-    """Make and record one target's call. Returns (row or None, details, problems)."""
+@dataclass
+class TargetOutcome:
+    """One target's result in the 07:30 run."""
+
+    row: Prediction | None
+    details: dict[str, Any]
+    problems: list[str] = field(default_factory=list)
+    recorded: bool = False  # a new ledger record was written in this run
+
+
+def _skipped(target: str, status: str, problem: str | None = None) -> TargetOutcome:
+    return TargetOutcome(None, {"status": status}, [problem] if problem else [])
+
+
+def _names(items: list[str], limit: int = 5) -> str:
+    return ", ".join(items[:limit]) + ("..." if len(items) > limit else "")
+
+
+def recording_block(ctx: JobContext, session: date, reference: date) -> str | None:
+    """Why no call may be recorded for `session` right now, or None if recording is fine.
+
+    - The session's year has no NSE holiday rows: `session` itself may be a holiday, so
+      the call would be for a day that never trades. `--force` overrides (the operator
+      has checked), and the run record says so.
+    - The run happens on the reference session itself before REFERENCE_FINAL_TIME: the
+      just-closed bar may still be provisional, and the ledger is immutable.
+    """
+    if not ctx.calendar.info(session).calendar_verified and not ctx.force:
+        return (
+            f"NSE holiday calendar for {session.year} not loaded, so {session} may not be a "
+            f"trading day; import nse_holidays_{session.year}.csv or run with --force"
+        )
+    now_ist = ctx.now.astimezone(IST)
+    if now_ist.date() == reference and now_ist.time() < REFERENCE_FINAL_TIME:
+        return (
+            f"run at {now_ist:%H:%M} IST on the reference session {reference}; its close may "
+            f"still be provisional before {REFERENCE_FINAL_TIME:%H:%M} IST, rerun after that"
+        )
+    return None
+
+
+def _predict_target(db: Session, target: str, session: date, ctx: JobContext) -> TargetOutcome:
+    """Make and record one target's call; never records against a stale reference."""
     s = ctx.settings
     champion = model_registry.champion(db, target)
     if champion is None or not champion.artifact:
-        return None, {"status": TRAIN_HINT}, [f"{target}: {TRAIN_HINT}"]
+        return _skipped(target, TRAIN_HINT, f"{target}: {TRAIN_HINT}")
     try:
         row, ref_date, ref_close = features.live_row(db, target, session, settings=s)
     except LookupError as exc:
-        return None, {"status": f"no features: {exc}"}, [f"{target}: {exc}"]
+        return _skipped(target, f"no features: {exc}", f"{target}: {exc}")
+    expected_ref = ctx.calendar.previous_trading_day(session)
+    if ref_date != expected_ref:
+        why = (
+            f"previous session bar missing ({expected_ref}); call not recorded rather than "
+            f"referenced to {ref_date}"
+        )
+        return _skipped(target, f"not recorded: {why}", f"{target}: {why}")
     trained_names = [str(f) for f in champion.feature_names]
     missing = [f for f in trained_names if f not in row]
     if missing:
         why = (
-            f"model {champion.version} expects features the pipeline no longer produces "
-            f"({', '.join(missing[:5])}{'...' if len(missing) > 5 else ''}); retrain"
+            f"{RETRAIN_HINT}: model {champion.version} expects features the pipeline no "
+            f"longer produces ({_names(missing)})"
         )
-        return None, {"status": f"not predicted: {why}"}, [f"{target}: {why}"]
+        return _skipped(target, f"not predicted: {why}", f"{target}: {why}")
+    problems: list[str] = []
+    extra = [f for f in row if f not in trained_names]
+    if extra:
+        problems.append(
+            f"{target}: {RETRAIN_HINT}: the pipeline now produces features model "
+            f"{champion.version} was not trained on ({_names(extra)}); predicted without them"
+        )
 
     out = models.predict(champion.artifact, trained_names, row, settings=s)
     gap_pct = baselines.gap_expected_pct(row)
@@ -315,13 +444,12 @@ def _predict_target(
         baselines=calls,
         feature_snapshot=row,
     )
-    p = ledger.record_market_call(db, rec, settings=s)
-    problems: list[str] = []
-    expected_ref = ctx.calendar.previous_trading_day(session)
-    if ref_date < expected_ref:
-        problems.append(
-            f"{target}: reference close is from {ref_date}, not {expected_ref} (bar missing)"
-        )
+    try:
+        p = ledger.record_market_call(db, rec, settings=s)
+    except ledger.LedgerConflict as conflict:
+        # Another run recorded this session while we were computing: theirs stands.
+        existing = conflict.existing
+        return TargetOutcome(existing, _call_details(existing, "already recorded"))
     details = _call_details(
         p,
         "recorded",
@@ -331,16 +459,19 @@ def _predict_target(
         gap_expected_pct=p.gap_expected_pct,
         drivers=[d["text"] for d in (p.drivers or []) if isinstance(d, dict) and d.get("text")],
     )
-    return p, details, problems
+    return TargetOutcome(p, details, problems, recorded=True)
 
 
 def premarket_prediction(ctx: JobContext) -> JobResult:
     """07:30: refresh inputs, make and lock the market call per target, send the brief.
 
-    Data refresh and the FII/DII pull are best effort: a missing bar is reported in the
-    details (and the call still records which reference close it used). A target with no
-    champion model is reported with the training hint; an existing call for the session
-    is left alone (re-runs are idempotent and do not re-send the brief).
+    Data refresh and the FII/DII pull are best effort: a missing target or VIX bar is a
+    problem (partial run), a global cue's closed market is a note. A call is recorded only
+    against the previous session's own bar (see `recording_block` and `_predict_target`);
+    otherwise the target's status says why it was not recorded. A target with no champion
+    model is reported with the training hint; an existing call for the session is left
+    alone (re-runs are idempotent, race-safe through the ledger lock, and do not re-send
+    the brief).
     """
     s = ctx.settings
     db = ctx.db
@@ -352,10 +483,18 @@ def premarket_prediction(ctx: JobContext) -> JobResult:
 
     chain = registry.market_data_chain(db, include_broker=False)
     refresh = _refresh_bars(
-        db, _reference_instruments(db, targets), through, chain, s.backfill_years
+        db,
+        _reference_instruments(db, targets),
+        through,
+        chain,
+        s.backfill_years,
+        session=session,
+        now=ctx.now,
     )
-    details["refresh"] = refresh or "ok"
-    problems += refresh
+    details["refresh"] = refresh.problems or "ok"
+    if refresh.notes:
+        details["refresh_notes"] = refresh.notes
+    problems += refresh.problems
     try:
         n = flows.refresh(db, registry.nse_provider())
         details["fii_dii"] = f"ok ({n} rows)"
@@ -365,27 +504,39 @@ def premarket_prediction(ctx: JobContext) -> JobResult:
         details["fii_dii"] = f"unavailable: {exc.reason}"
     db.commit()  # keep what was fetched even if the prediction step fails and retries
 
+    blocked = recording_block(ctx, session, through)
+    if blocked is not None:
+        problems.append(f"call not recorded: {blocked}")
+    elif ctx.force and not ctx.calendar.info(session).calendar_verified:
+        details["calendar"] = f"unverified for {session.year}; recorded anyway (--force)"
+
     current: list[Prediction] = []
     recorded = 0
     for target in targets:
+        # Fast path for re-runs; the race between two live runs is closed inside
+        # ledger.record_market_call (LedgerConflict under the ledger lock).
         existing = ledger.latest_call(db, target, session)
         if existing is not None:
             details[target] = _call_details(existing, "already recorded")
             current.append(existing)
             continue
-        p, target_details, target_problems = _predict_target(db, target, session, ctx)
-        details[target] = target_details
-        problems += target_problems
-        if p is not None:
-            current.append(p)
-            recorded += 1
+        if blocked is not None:
+            details[target] = {"status": f"not recorded: {blocked}"}
+            continue
+        outcome = _predict_target(db, target, session, ctx)
+        details[target] = outcome.details
+        problems += outcome.problems
+        if outcome.row is not None:
+            current.append(outcome.row)
+            recorded += int(outcome.recorded)
     db.commit()  # the ledger rows are final before anything is announced
 
     if recorded:
         cards: list[tuple[Prediction, scorecard.Scorecard | None]] = [
             (p, scorecard.scorecard(db, p.target, settings=s)) for p in current
         ]
-        sent = telegram.send(brief.morning_brief(cards, session, s))
+        text = brief.morning_brief(cards, session, s, head=ledger.head(db))
+        sent = telegram.send(text)
         details["brief"] = "sent" if sent else "not sent (Telegram not configured or failed)"
     else:
         details["brief"] = "not sent (nothing new recorded)"
@@ -470,8 +621,22 @@ def open_check(ctx: JobContext) -> JobResult:
     return JobResult("partial" if problems else "success", message, details)
 
 
+def _sessions_back(cal: calendar.TradingCalendar, session: date, n: int) -> date:
+    """The session `n` trading days before `session`."""
+    d = session
+    for _ in range(n):
+        d = cal.previous_trading_day(d)
+    return d
+
+
 def close_grading(ctx: JobContext) -> JobResult:
-    """15:45: fetch the session close, grade every ungraded call that has one, report."""
+    """15:45: fetch the session close, grade every ungraded call that has one, report.
+
+    A call still without a close within the last UNRESOLVED_SESSIONS sessions is a
+    problem (partial run). Older ones will not resolve by themselves (the session never
+    traded, or the bar is gone for good): they are listed under `unresolvable` with the
+    void command, without turning every afternoon's run partial.
+    """
     s = ctx.settings
     db = ctx.db
     session = ctx.calendar.last_completed_session(ctx.now)
@@ -479,23 +644,38 @@ def close_grading(ctx: JobContext) -> JobResult:
     if not pending:
         raise JobSkipped(f"no ungraded market calls through {session}")
     details: dict[str, Any] = {"session": session.isoformat()}
+    oldest_recent = _sessions_back(ctx.calendar, session, UNRESOLVED_SESSIONS - 1)
 
     chain = registry.market_data_chain(db)
     targets = sorted({p.target for p in pending})
     insts = {t: instruments.get_instrument(db, t, "INDEX") for t in targets}
     refresh = _refresh_bars(
-        db, [i for i in insts.values() if i is not None], session, chain, s.backfill_years
+        db,
+        [i for i in insts.values() if i is not None],
+        session,
+        chain,
+        s.backfill_years,
+        session=session,
+        now=ctx.now,
     )
-    details["refresh"] = refresh or "ok"
+    details["refresh"] = refresh.problems or "ok"
     db.commit()
 
     graded: list[tuple[Prediction, PredictionGrade]] = []
     remaining: list[str] = []
+    unresolvable: list[str] = []
     for p in pending:
         inst = insts.get(p.target)
         bar = db.get(DailyBar, (inst.id, p.session_date)) if inst is not None else None
         if bar is None or finite(bar.close) is None:
-            remaining.append(f"{p.target} {p.session_date} (seq {p.seq}): no close yet")
+            if p.session_date < oldest_recent:
+                unresolvable.append(
+                    f"{p.target} {p.session_date} (seq {p.seq}): no close after "
+                    f"{UNRESOLVED_SESSIONS} sessions; void it with "
+                    f"`python -m app.cli grade --void {p.seq} --reason ...`"
+                )
+            else:
+                remaining.append(f"{p.target} {p.session_date} (seq {p.seq}): no close yet")
             continue
         g = grading.grade_close(
             db, p, bar.open, bar.close, now=ctx.now, source=bar.source, settings=s
@@ -519,12 +699,18 @@ def close_grading(ctx: JobContext) -> JobResult:
         for p, g in graded
     ]
     details["ungraded"] = remaining
+    details["unresolvable"] = unresolvable
     if graded:
         sent = telegram.send(brief.close_summary(graded))
         details["summary"] = "sent" if sent else "not sent (Telegram not configured or failed)"
     message = f"{len(graded)} call(s) graded; {len(remaining)} still ungraded"
     if remaining:
         message += ": " + "; ".join(remaining)
+    if unresolvable:
+        message += (
+            f"; {len(unresolvable)} unresolvable (older than {UNRESOLVED_SESSIONS} sessions, "
+            "see details)"
+        )
     return JobResult("partial" if remaining else "success", message, details)
 
 
@@ -540,9 +726,7 @@ def _retrain_target(db: Session, target: str, s: Settings) -> tuple[dict[str, An
     except ValueError as exc:
         return {"status": f"not trained: {exc}", "labelled_rows": labelled}, f"{target}: {exc}"
     champ = model_registry.champion(db, target)
-    promote, reason = model_registry.should_promote(
-        champ.metrics if champ is not None else None, result.metrics, s
-    )
+    promote, reason = model_registry.should_promote(champ, result, s)
     mv = model_registry.save_model(db, target, result, promote=promote, note=reason)
     db.commit()
     model_registry.log_to_mlflow(result, target, promote, s)

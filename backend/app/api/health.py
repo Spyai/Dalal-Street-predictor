@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import UTC, datetime, time, timedelta
+from datetime import UTC, date, datetime, time, timedelta
 
 import redis
 from fastapi import APIRouter, Depends
@@ -28,6 +28,7 @@ from app.models import (
 from app.schemas import FreshnessOut, HealthOut, JobHealthOut, ModelHealthOut, SourceHealthOut
 from app.services import calendar, flows
 from app.services.calendar import TradingCalendar
+from app.services.scorecard import climatology_brier
 from app.services.source_status import SOURCE_INFO, all_statuses
 
 router = APIRouter(tags=["health"])
@@ -141,46 +142,98 @@ def _freshness(db: Session, cal: TradingCalendar) -> list[FreshnessOut]:
         )
     )
 
-    # The ledger should hold a call for the session we are in (or heading into) by 07:30 IST.
-    session = session_for(cal, now)
     last_call = db.scalar(
         select(func.max(Prediction.session_date)).where(Prediction.kind == MODEL_NAME)
     )
     n_calls = db.scalar(
         select(func.count()).select_from(Prediction).where(Prediction.kind == MODEL_NAME)
     )
-    f = _fresh("Last market call", last_call, session)
-    f.detail = (
-        "no market call in the ledger yet"
-        if last_call is None
-        else f"{n_calls or 0} ledger record{'s' if (n_calls or 0) != 1 else ''}; "
-        f"latest call is for {last_call}, expected one for {session} by 07:30 IST"
-    )
-    out.append(f)
+    lock = get_settings().ledger_lock_time
+    out.append(market_call_freshness(cal, now, last_call, int(n_calls or 0), lock))
     return out
 
 
+def call_due_session(cal: TradingCalendar, now: datetime, lock: time) -> date:
+    """The latest session whose call is already due at `now`.
+
+    A call for session S is written by the 07:30 IST job and locked at `lock` (09:15 IST)
+    on S. So once the lock time has passed on a trading day, that day's call is due;
+    before it, and on non-trading days, only the previous session's call is.
+    """
+    local = now.astimezone(IST)
+    today = local.date()
+    if cal.is_trading_day(today) and local.time() >= lock:
+        return today
+    return cal.previous_trading_day(today)
+
+
+def market_call_freshness(
+    cal: TradingCalendar, now: datetime, last_call: date | None, n_calls: int, lock: time
+) -> FreshnessOut:
+    """The "Last market call" freshness row, session-aware.
+
+    `ok` when the ledger holds a call for every session already due (`call_due_session`):
+    the upcoming session's call, or, before the lock time on a trading day and on
+    non-trading days, the previous session's. `stale` once a due session has no call,
+    `missing` with an empty ledger. `expected` is the session we are heading into.
+    """
+    session = session_for(cal, now)
+    due = call_due_session(cal, now, lock)
+    records = f"{n_calls} ledger record{'s' if n_calls != 1 else ''}"
+    lock_text = f"{lock:%H:%M} IST"
+    if last_call is None:
+        status, detail = "missing", "no market call in the ledger yet"
+    elif last_call >= session:
+        status, detail = "ok", f"{records}; the call for {session} is recorded"
+    elif last_call >= due:
+        status = "ok"
+        detail = (
+            f"{records}; latest call is for {last_call}; the next is due for {session} "
+            f"by {lock_text}"
+        )
+    else:
+        status = "stale"
+        detail = (
+            f"{records}; latest call is for {last_call}; the call for {due} was due by "
+            f"{lock_text} and is missing"
+        )
+    return FreshnessOut(
+        dataset="Last market call", latest=last_call, expected=session, status=status, detail=detail
+    )
+
+
 def _models(db: Session) -> list[ModelHealthOut]:
-    """Every champion in production with its out-of-sample metrics (None when absent)."""
-    champions = db.scalars(
-        select(ModelVersion)
+    """Every champion in production with its out-of-sample metrics (None when absent).
+
+    Selects columns explicitly so the model artifact (about 1.3 MB each) is never read.
+    """
+    rows = db.execute(
+        select(
+            ModelVersion.name,
+            ModelVersion.target,
+            ModelVersion.version,
+            ModelVersion.trained_through,
+            ModelVersion.metrics,
+            ModelVersion.promoted_at,
+        )
         .where(ModelVersion.is_champion.is_(True))
         .order_by(ModelVersion.name, ModelVersion.target)
     ).all()
     out: list[ModelHealthOut] = []
-    for mv in champions:
-        metrics: dict[str, object] = dict(mv.metrics or {})
+    for row in rows:
+        metrics: dict[str, object] = dict(row.metrics or {})
         n_oos = metrics.get("n_oos")
         out.append(
             ModelHealthOut(
-                name=mv.name,
-                target=mv.target,
-                version=mv.version,
-                trained_through=mv.trained_through,
+                name=row.name,
+                target=row.target,
+                version=row.version,
+                trained_through=row.trained_through,
                 oos_brier=finite(metrics.get("brier")),
+                climatology_brier=climatology_brier(metrics),
                 oos_accuracy=finite(metrics.get("accuracy")),
                 n_oos=int(n_oos) if isinstance(n_oos, int | float) else None,
-                promoted_at=mv.promoted_at,
+                promoted_at=row.promoted_at,
             )
         )
     return out

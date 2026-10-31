@@ -4,7 +4,9 @@ Telegram renders the HTML parse mode, so every string that did not originate her
 (target names, driver sentences, verdicts, timing guidance) goes through `html.escape`.
 Numbers are formatted by hand; a missing number is shown as an em dash, never a guess.
 The brief always carries the model's confidence or "No edge today", the live track record
-beside the call, and the footer the brief asks for.
+beside the call, and the footer the brief asks for. It also names the ledger head (seq and
+the first 12 hex digits of its hash) so the Telegram chat is an independent witness of the
+chain: a later edit to the database cannot rewrite what was sent that morning.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from app.services.scorecard import Scorecard, baseline_label
 
 FOOTER = "Personal research tool. Not investment advice."
 MISSING = "—"  # em dash
+HASH_PREFIX_LEN = 12
 TOP_DRIVERS_IN_BRIEF = 3
 GAP_LABELS: dict[str, str] = {"gap_up": "gap up", "gap_down": "gap down", "flat": "flat open"}
 
@@ -51,13 +54,17 @@ def track_record_line(card: Scorecard | None, settings: Settings | None = None) 
     unproven = f"unproven (&lt; {s.min_sample_size} graded)"
     if card.n_graded == 0 or card.accuracy is None:
         return f"Track record: no graded calls yet, {unproven}"
-    with_calls = [b for b in card.baselines if b.get("accuracy") is not None]
-    best = max(with_calls, key=lambda b: (b["accuracy"], b["n"])) if with_calls else None
+    # Paired comparison (scorecard.best_baseline): the model and the baseline scored on
+    # the same sessions, so the two percentages are comparable.
+    best = getattr(card, "best_baseline", None)
     line = f"Track record: {card.n_graded} graded, {card.accuracy * 100:.0f}% right"
-    if best is not None:
+    if best is not None and best.get("accuracy") is not None:
+        model_acc = best.get("model_accuracy")
+        paired = f"{float(model_acc) * 100:.0f}% vs " if model_acc is not None else ""
         line += (
-            f" vs best baseline ({_esc(baseline_label(str(best['name'])))}) "
-            f"{float(best['accuracy']) * 100:.0f}%"
+            f"; toughest baseline ({_esc(baseline_label(str(best['name'])))}): "
+            f"{paired}{float(best['accuracy']) * 100:.0f}% on the same "
+            f"{int(best['n'])} call{'' if int(best['n']) == 1 else 's'}"
         )
     if card.sample_warning:
         line += f"; {unproven}"
@@ -96,18 +103,34 @@ def _call_block(p: Prediction, card: Scorecard | None, settings: Settings) -> li
     return lines
 
 
+def ledger_anchor(head: Prediction | None) -> str | None:
+    """ "Ledger head: seq N, <12 hex>" for the chain's last record, None for an empty ledger."""
+    if head is None:
+        return None
+    return f"Ledger head: seq {head.seq}, {_esc(str(head.hash)[:HASH_PREFIX_LEN])}"
+
+
 def morning_brief(
     calls: list[tuple[Prediction, Scorecard | None]],
     session: date,
     settings: Settings | None = None,
+    *,
+    head: Prediction | None = None,
 ) -> str:
-    """The 07:30 Telegram brief: one block per target, HTML-escaped, with the footer."""
+    """The 07:30 Telegram brief: one block per target, HTML-escaped, with the footer.
+
+    `head` is the ledger's last record (`ledger.head`); without it the highest-seq call
+    in `calls` stands in, so the anchor line is always present when something was recorded.
+    """
     s = settings or get_settings()
     parts = [f"<b>Dalal market call — {_day(session)}</b>"]
     if not calls:
         parts.append("No market call was recorded for this session.")
     for p, card in calls:
         parts.append("\n".join(_call_block(p, card, s)))
+    anchor = ledger_anchor(head or max((p for p, _ in calls), key=lambda p: p.seq, default=None))
+    if anchor is not None:
+        parts.append(anchor)
     parts.append(f"<i>{FOOTER}</i>")
     return "\n\n".join(parts)
 

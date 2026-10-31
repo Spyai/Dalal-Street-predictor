@@ -234,8 +234,8 @@ def test_db_trigger_rejects_update_and_delete(db: Session) -> None:
 
 def test_verify_detects_an_out_of_band_edit(db: Session) -> None:
     """Someone with enough privilege disables the trigger and edits a row: the chain tells."""
-    for _ in range(3):
-        record_market_call(db, make_record())
+    for i in range(3):
+        record_market_call(db, make_record(session_date=SESSION + timedelta(days=i)))
     db.commit()
 
     db.execute(text("ALTER TABLE prediction DISABLE TRIGGER prediction_immutable"))
@@ -392,3 +392,86 @@ def test_record_refuses_ambiguous_or_missing_numbers(db: Session) -> None:
         record_market_call(db, make_record(probs={"UP": 0.6, "FLAT": 0.4}))
     db.rollback()
     assert ledger.ungraded(db) == []
+
+
+# ------------------------------------------------------------------ one current call per session
+
+
+def test_second_record_for_the_same_session_is_refused_under_the_lock(db: Session) -> None:
+    """Two overlapping 07:30 runs: the second writer sees the first's row inside the ledger
+    lock and gets LedgerConflict instead of appending a duplicate (ledger stays one-per-day)."""
+    first = record_market_call(db, make_record())
+    db.commit()
+    with pytest.raises(ledger.LedgerConflict) as info:
+        record_market_call(db, make_record(as_of=AS_OF + timedelta(seconds=5)))
+    assert info.value.existing is first
+    assert "already recorded as seq 1" in str(info.value)
+    db.rollback()
+    assert [p.seq for p in ledger.calls_for_session(db, SESSION)] == [1]
+
+    # Another target, another session, or another kind of record are all fine.
+    record_market_call(db, make_record(target="NIFTY BANK"))
+    record_market_call(db, make_record(session_date=SESSION + timedelta(days=1)))
+    record_market_call(db, make_record(), kind="stock_idea")
+    db.commit()
+    assert verify_ledger(db).ok and verify_ledger(db).checked == 4
+
+    # A correction supersedes the first; a further plain record then collides with the
+    # correction (the current row), not with the superseded original.
+    fix = record_market_call(db, make_record(corrects=first.id, note="fixed"))
+    db.commit()
+    with pytest.raises(ledger.LedgerConflict) as info2:
+        record_market_call(db, make_record())
+    assert info2.value.existing is fix
+    db.rollback()
+
+
+def test_corrections_must_name_a_current_record_of_the_same_call(db: Session) -> None:
+    original = record_market_call(db, make_record())
+    bank = record_market_call(db, make_record(target="NIFTY BANK"))
+    db.commit()
+    with pytest.raises(ValueError, match="does not exist"):
+        record_market_call(db, make_record(corrects=original.id + 999))
+    with pytest.raises(ValueError, match="correction targets NIFTY 50"):
+        record_market_call(db, make_record(corrects=bank.id))  # other target
+    with pytest.raises(ValueError, match="correction targets"):
+        record_market_call(
+            db, make_record(session_date=SESSION + timedelta(days=1), corrects=original.id)
+        )
+    db.rollback()
+    fix = record_market_call(db, make_record(corrects=original.id, note="first fix"))
+    db.commit()
+    with pytest.raises(
+        ValueError, match=f"seq {original.seq} is already corrected by seq {fix.seq}"
+    ):
+        record_market_call(db, make_record(corrects=original.id, note="second fix"))
+    db.rollback()
+    # Correcting the correction is the right way to amend again.
+    again = record_market_call(db, make_record(corrects=fix.id, note="second fix"))
+    db.commit()
+    assert ledger.latest_call(db, "NIFTY 50", SESSION) is again
+    assert verify_ledger(db).ok
+
+
+def test_ungraded_leaves_out_voided_and_superseded_records(db: Session) -> None:
+    from app.services.grading import void_grade
+
+    original = record_market_call(db, make_record())
+    voided = record_market_call(db, make_record(target="NIFTY BANK"))
+    fix = record_market_call(db, make_record(corrects=original.id, note="fixed"))
+    db.commit()
+    assert [p.seq for p in ledger.ungraded(db)] == [voided.seq, fix.seq], "original is superseded"
+    void_grade(db, voided, now=AS_OF, reason="Saturday: never a session")
+    db.commit()
+    assert [p.seq for p in ledger.ungraded(db)] == [fix.seq]
+    # The voided record is still in the history, with its grade row saying why.
+    hist = {p.seq: g for p, g in ledger.history(db)}
+    assert hist[voided.seq] is not None and hist[voided.seq].error_category == "no_session"
+
+
+def test_head_is_the_last_record(db: Session) -> None:
+    assert ledger.head(db) is None
+    record_market_call(db, make_record())
+    last = record_market_call(db, make_record(target="NIFTY BANK"))
+    db.commit()
+    assert ledger.head(db) is last and last.seq == 2

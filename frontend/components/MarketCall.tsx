@@ -1,12 +1,14 @@
 "use client";
 
 import Link from "next/link";
-import type { CallClass, MarketCall, Track } from "@/lib/types";
+import type { CallClass, Comparison, MarketCall, Track } from "@/lib/types";
 import { fmtDate, fmtIstDateTime, fmtNum, fmtPct } from "@/lib/format";
 import { Notice } from "@/components/Status";
 
 // The market-call card (brief §7.1). Honesty first: "No edge today" is the loudest state,
-// every missing number renders "—", and the live track record sits under every call.
+// every missing number renders "—", and the live track record sits under every call. After
+// the close the upcoming session has no call yet, so the card keeps the latest earlier call
+// (flagged "previous") with its grade instead of going blank.
 
 const CLASSES: CallClass[] = ["UP", "FLAT", "DOWN"];
 const CLASS_TONE: Record<CallClass, string> = {
@@ -32,7 +34,40 @@ export function fmtProb(p: number | null | undefined): string {
   return `${(p * 100).toFixed(0)}%`;
 }
 
-export function MarketCallCard({ call }: { call: MarketCall }) {
+// Plain words for the paired comparison, shared by the Today card and the Scorecard page.
+export function comparisonText(c: Comparison, pairedN: number | null, minPairedN: number): string {
+  switch (c) {
+    case "ahead":
+      return "Ahead of the naive baselines on paired calls.";
+    case "behind":
+      return "NOT beating the naive baselines on paired calls.";
+    case "level":
+      return "Level with the naive baselines: no edge shown yet.";
+    case "too_early":
+      return `Too early to tell whether the model beats the baselines: ${pairedN ?? 0} of the ${minPairedN} paired calls needed.`;
+    case "no_baseline":
+      return "No baseline has a call to compare with yet.";
+    case "no_calls":
+      return "No graded calls yet.";
+  }
+}
+
+export const COMPARISON_TONE: Record<Comparison, string> = {
+  ahead: "text-up",
+  behind: "text-down",
+  level: "text-muted",
+  too_early: "text-warn",
+  no_baseline: "text-faint",
+  no_calls: "text-faint",
+};
+
+export function MarketCallCard({
+  call,
+  upcomingSession,
+}: {
+  call: MarketCall;
+  upcomingSession?: string;
+}) {
   const top = call.probs[call.predicted_class] ?? null;
   const hasRange = call.range_p10_pct !== null && call.range_p90_pct !== null;
   return (
@@ -40,6 +75,14 @@ export function MarketCallCard({ call }: { call: MarketCall }) {
       <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
         <h2 className="label">Market call: {call.target}</h2>
         <div className="flex items-center gap-1.5">
+          {call.is_previous && (
+            <Badge
+              cls="border-line text-muted"
+              title={`The latest recorded call; no call yet for ${upcomingSession ? fmtDate(upcomingSession) : "the upcoming session"}`}
+            >
+              previous · for {fmtDate(call.session_date)}
+            </Badge>
+          )}
           {call.is_late && (
             <Badge cls="border-warn/40 text-warn" title="Recorded after the 09:15 IST ledger lock">
               late
@@ -73,6 +116,13 @@ export function MarketCallCard({ call }: { call: MarketCall }) {
         {fmtDate(call.reference_date)} · recorded {fmtIstDateTime(call.as_of)} IST
         {call.model_version ? ` · ${call.model_version}` : ""}
       </p>
+      {call.is_previous && (
+        <p className="mt-1 text-xs text-muted">
+          No call yet for {upcomingSession ? fmtDate(upcomingSession) : "the upcoming session"}:
+          the 07:30 IST job records it before the open. Shown is the latest call, with its
+          grade.
+        </p>
+      )}
 
       <div className="mt-3 space-y-1.5">
         {CLASSES.map((c) => {
@@ -154,17 +204,26 @@ export function MarketCallCard({ call }: { call: MarketCall }) {
 
 function GradeLine({ call }: { call: MarketCall }) {
   const g = call.grade;
-  if (!g) return null;
-  const closed = g.actual_class !== null;
-  const gapGraded = g.gap_correct !== null;
-  if (!closed && !gapGraded) return null;
+  const closed = g !== null && g.actual_class !== null;
+  const gapGraded = g !== null && g.gap_correct !== null;
+  if (!closed && !gapGraded) {
+    // A previous session's call that the 15:45 job has not graded yet: say so, don't hide it.
+    if (call.is_previous) {
+      return (
+        <p className="mt-3 border-t border-line pt-2 text-xs text-muted">
+          Not graded yet: the 15:45 IST close-grading job writes the outcome.
+        </p>
+      );
+    }
+    return null;
+  }
   return (
     <div className="num mt-3 border-t border-line pt-2 text-sm">
-      {closed && (
+      {closed && g && (
         <div className="flex flex-wrap items-baseline gap-x-2">
-          <span className="text-muted">Actual</span>
+          <span className="text-muted">Graded:</span>
           <span className={CLASS_TONE[g.actual_class ?? "FLAT"]}>
-            {fmtPct(g.actual_pct)} {g.actual_class}
+            {g.actual_class} {fmtPct(g.actual_pct)}
           </span>
           <Verdict ok={g.correct} />
           <span className="text-xs text-muted">
@@ -172,7 +231,7 @@ function GradeLine({ call }: { call: MarketCall }) {
           </span>
         </div>
       )}
-      {gapGraded && (
+      {gapGraded && g && (
         <div className="mt-0.5 flex flex-wrap items-baseline gap-x-2 text-xs">
           <span className="text-muted">Open gap</span>
           <span>{fmtPct(g.gap_actual_pct)}</span>
@@ -193,21 +252,32 @@ function TrackLine({ track }: { track: Track | null }) {
     return <p className="mt-3 border-t border-line pt-2 text-xs text-faint">Track record: —</p>;
   }
   const n = track.n_graded;
+  const paired =
+    track.best_baseline_label !== null &&
+    track.best_baseline_accuracy !== null &&
+    track.paired_n !== null;
   return (
     <div className="mt-3 border-t border-line pt-2">
       <p className="num text-xs text-muted">
         Track record: {n} graded
         {n > 0 && track.accuracy !== null ? ` · ${fmtProb(track.accuracy)} right` : ""}
-        {track.best_baseline_label && track.best_baseline_accuracy !== null
-          ? ` · best baseline (${track.best_baseline_label}) ${fmtProb(track.best_baseline_accuracy)}`
-          : n > 0
-            ? " · no baseline comparison yet"
-            : ""}
         {" · "}
         <Link href="/scorecard" className="underline hover:text-fg">
           Scorecard
         </Link>
       </p>
+      {paired && (
+        <p className="num mt-0.5 text-xs text-muted">
+          Toughest baseline ({track.best_baseline_label}) {fmtProb(track.best_baseline_accuracy)}{" "}
+          vs model {fmtProb(track.model_paired_accuracy)} on the same {track.paired_n} call
+          {track.paired_n === 1 ? "" : "s"}
+        </p>
+      )}
+      {n > 0 && (
+        <p className={`mt-0.5 text-xs ${COMPARISON_TONE[track.comparison]}`}>
+          {comparisonText(track.comparison, track.paired_n, track.min_paired_n)}
+        </p>
+      )}
       {track.sample_warning && (
         <div className="mt-2">
           <Notice tone="warn">

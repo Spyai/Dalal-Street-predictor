@@ -33,6 +33,7 @@ class JobContext:
     today: date  # IST
     calendar: TradingCalendar
     settings: Settings
+    force: bool = False  # the operator explicitly forced this run (`--force`)
 
 
 @dataclass
@@ -102,7 +103,9 @@ def run_job(
     """Run a job with retries. Returns the final status.
 
     `force=True` skips the trading-day check (`python -m app.cli predict --force` on a
-    weekend, or re-running a job by hand); the run record says the check was skipped.
+    weekend, or re-running a job by hand); the run record says the check was skipped. The
+    flag is also handed to the job (`JobContext.force`) for guards an operator may
+    knowingly override, such as recording a call for a year with no holiday calendar.
     """
     settings = settings or get_settings()
     now = now or datetime.now(UTC)
@@ -149,7 +152,9 @@ def run_job(
         try:
             with session_scope() as db:
                 result = spec.fn(
-                    JobContext(db=db, now=now, today=today, calendar=cal, settings=settings)
+                    JobContext(
+                        db=db, now=now, today=today, calendar=cal, settings=settings, force=force
+                    )
                 )
         except JobSkipped as skip:
             _record(

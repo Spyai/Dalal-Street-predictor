@@ -4,14 +4,27 @@ LightGBM is imported inside functions only. The API process imports `app.ml.core
 `app.ml.metrics` and `app.ml.baselines`, never this module's heavy parts; a test asserts
 `import app.main` leaves `lightgbm` out of `sys.modules`.
 
-Validation is an expanding window: fold k fits on labelled sessions [0, k) and predicts
+Validation is an expanding window: fold j fits on labelled sessions [0, k) and predicts
 the next `step_days` sessions; every out-of-sample row is predicted by a model that never
-saw it or anything after it. No random splits. Given the same frame, params and seed the
-artifact is byte-identical (single thread, deterministic histograms).
+saw it or anything after it. No random splits.
 
-The artifact is JSON text {"classifier", "q10", "q90", "feature_names", "params"} where the
-three model strings come from `Booster.model_to_string()`; it lives in the database
-(`ModelVersion.artifact`), not on disk.
+Two knobs are chosen out of sample, sequentially, so the reported metrics stay honest:
+
+- the number of boosting rounds: each fold trains up to `n_estimators` rounds and its
+  out-of-sample rows are scored at every ROUND_STEP-th round (`num_iteration`);
+- a shrinkage weight towards the fold's training class frequencies,
+  p = (1 - a) * p_model + a * p_climatology, a in SHRINK_GRID.
+
+Fold j is predicted with the (rounds, shrink) pair that had the lowest pooled
+out-of-sample log loss over folds < j; the first fold uses conservative defaults. A fold's
+own rows only ever inform the choice for LATER folds. The final fit uses the pair chosen on
+every fold and records it in params["n_estimators"] / params["shrink"]. Given the same
+frame, params and seed the artifact is byte-identical (single thread, deterministic
+histograms).
+
+The artifact is JSON text {"classifier", "q10", "q90", "feature_names", "params",
+"class_frequencies"} where the three model strings come from `Booster.model_to_string()`;
+it lives in the database (`ModelVersion.artifact`), not on disk.
 """
 
 from __future__ import annotations
@@ -22,6 +35,7 @@ import math
 import re
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Any
 
@@ -30,7 +44,7 @@ import pandas as pd
 
 from app.config import Settings, get_settings
 from app.ml import metrics
-from app.ml.baselines import baseline_calls, baseline_probs, normalise_probs
+from app.ml.baselines import PROB_FLOOR, baseline_calls, baseline_probs
 from app.ml.core import (
     BASELINE_NAMES,
     CLASS_INDEX,
@@ -49,18 +63,24 @@ from app.ml.core import (
 if TYPE_CHECKING:
     from lightgbm import Booster
 
-DEFAULT_ROUNDS = 300  # boosting rounds ("n_estimators" in DEFAULT_PARAMS)
+MAX_ROUNDS = 400  # the most boosting rounds tried ("n_estimators" in DEFAULT_PARAMS)
+ROUND_STEP = 25  # rounds are scored out of sample at ROUND_STEP, 2 * ROUND_STEP, ..., the ceiling
+FIRST_FOLD_ROUNDS = 50  # before any out-of-sample evidence exists: few rounds ...
+FIRST_FOLD_SHRINK = 0.5  # ... and half-way to climatology
+SHRINK_GRID: tuple[float, ...] = tuple(round(0.1 * i, 1) for i in range(10))  # 0.0 .. 0.9
+# Chosen out of sample by the walk-forward, so not part of the model recipe a caller sets.
+SELECTED_PARAM_KEYS: frozenset[str] = frozenset({"n_estimators", "shrink"})
 DEFAULT_PARAMS: dict[str, object] = {
     "objective": "multiclass",
     "num_class": len(CLASSES),
-    "num_leaves": 7,
-    "min_data_in_leaf": 40,
+    "num_leaves": 5,
+    "min_data_in_leaf": 60,
     "learning_rate": 0.03,
-    "n_estimators": DEFAULT_ROUNDS,
-    "feature_fraction": 0.8,
+    "n_estimators": MAX_ROUNDS,  # ceiling of the round search; the artifact records the choice
+    "feature_fraction": 0.6,
     "bagging_fraction": 0.8,
     "bagging_freq": 1,
-    "lambda_l2": 1.0,
+    "lambda_l2": 5.0,
     "seed": 42,
     "verbose": -1,
     # Reproducibility: same data + params + seed -> the same trees, byte for byte.
@@ -73,6 +93,25 @@ LABEL_COLUMNS: tuple[str, ...] = ("label_pct", "label_class", "reference_date", 
 TOP_DRIVERS = 5
 _ARTIFACT_CACHE_SIZE = 8
 _ARTIFACT_CACHE: OrderedDict[str, dict[str, Any]] = OrderedDict()
+
+
+@dataclass
+class MarketCallMetrics(WalkForwardMetrics):
+    """`WalkForwardMetrics` plus what the walk-forward chose and how the range held up.
+
+    range_coverage: share of out-of-sample `label_pct` inside [p10, p90] where the quantile
+    models of each fold were fitted on that fold's training rows only (nominally 0.8).
+    fold_params: the (n_estimators, shrink) each fold's out-of-sample rows were scored with.
+    """
+
+    range_coverage: float = math.nan
+    fold_params: list[dict[str, float]] = field(default_factory=list)
+
+    def as_dict(self) -> dict[str, object]:
+        out = super().as_dict()
+        out["range_coverage"] = finite(self.range_coverage)
+        out["fold_params"] = [dict(fp) for fp in self.fold_params]
+        return out
 
 
 # --------------------------------------------------------------------------- frame helpers
@@ -114,25 +153,49 @@ def _class_frequencies(y: np.ndarray) -> dict[str, float]:
     return {c: float(np.sum(y == CLASS_INDEX[c])) / n for c in CLASSES}
 
 
+def _climatology(freq: Mapping[str, float]) -> np.ndarray | None:
+    """Class frequencies as a probability vector in CLASSES order, or None when there are none."""
+    v = np.array([max(float(freq.get(c, 0.0) or 0.0), 0.0) for c in CLASSES], dtype=float)
+    total = float(v.sum())
+    if total <= 0.0:
+        return None
+    return v / total
+
+
 # --------------------------------------------------------------------------- LightGBM fits
 
 
-def _booster_params(params: Mapping[str, object]) -> tuple[dict[str, object], int]:
-    """Split the sklearn-style `n_estimators` out of a params dict for `lgb.train`."""
-    p = dict(params)
-    raw = p.pop("n_estimators", DEFAULT_ROUNDS)
-    rounds = int(raw) if isinstance(raw, int | float | str) else DEFAULT_ROUNDS
-    return p, rounds
+def _booster_params(params: Mapping[str, object]) -> dict[str, object]:
+    """The LightGBM parameters: `params` without the walk-forward's own keys."""
+    return {k: v for k, v in params.items() if k not in SELECTED_PARAM_KEYS}
+
+
+def _max_rounds(params: Mapping[str, object]) -> int:
+    raw = params.get("n_estimators", MAX_ROUNDS)
+    rounds = int(raw) if isinstance(raw, int | float | str) else MAX_ROUNDS
+    if rounds < 1:
+        raise ValueError("n_estimators must be positive")
+    return rounds
+
+
+def round_grid(max_rounds: int) -> tuple[int, ...]:
+    """Round counts scored out of sample: every ROUND_STEP up to and including `max_rounds`."""
+    grid = list(range(ROUND_STEP, max_rounds, ROUND_STEP))
+    grid.append(max_rounds)
+    return tuple(grid)
 
 
 def _fit_classifier(
-    x: np.ndarray, y: np.ndarray, feature_names: Sequence[str], params: Mapping[str, object]
+    x: np.ndarray,
+    y: np.ndarray,
+    feature_names: Sequence[str],
+    params: Mapping[str, object],
+    rounds: int,
 ) -> Booster:
     import lightgbm as lgb
 
-    p, rounds = _booster_params(params)
     data = lgb.Dataset(x, label=y, feature_name=list(feature_names), free_raw_data=False)
-    return lgb.train(p, data, num_boost_round=rounds)
+    return lgb.train(_booster_params(params), data, num_boost_round=rounds)
 
 
 def _fit_quantile(
@@ -141,28 +204,112 @@ def _fit_quantile(
     feature_names: Sequence[str],
     params: Mapping[str, object],
     alpha: float,
+    rounds: int,
 ) -> Booster:
     import lightgbm as lgb
 
-    p, rounds = _booster_params(params)
+    p = _booster_params(params)
     p.pop("num_class", None)
     p.update({"objective": "quantile", "alpha": alpha, "metric": "quantile"})
     data = lgb.Dataset(x, label=y_pct, feature_name=list(feature_names), free_raw_data=False)
     return lgb.train(p, data, num_boost_round=rounds)
 
 
-def _probs(booster: Booster, x: np.ndarray) -> np.ndarray:
-    """(n, 3) probabilities in CLASSES order, clipped to [1e-4, 1] and renormalised per row."""
-    raw = np.asarray(booster.predict(x), dtype=float).reshape(x.shape[0], len(CLASSES))
-    out = np.empty_like(raw)
-    for i, r in enumerate(raw):
-        d = normalise_probs({c: float(r[j]) for j, c in enumerate(CLASSES)})
-        out[i] = [d[c] for c in CLASSES]
-    return out
+def _quantile_range(
+    x_train: np.ndarray,
+    y_pct_train: np.ndarray,
+    x_test: np.ndarray,
+    feature_names: Sequence[str],
+    params: Mapping[str, object],
+    rounds: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """(p10, p90) for `x_test` from quantile models fitted on the training rows only.
+
+    Ordered per row, so a crossing pair still gives a well-defined range.
+    """
+    preds = [
+        np.asarray(
+            _fit_quantile(x_train, y_pct_train, feature_names, params, alpha, rounds).predict(
+                x_test
+            ),
+            dtype=float,
+        ).reshape(-1)
+        for _, alpha in QUANTILES
+    ]
+    return np.minimum(preds[0], preds[1]), np.maximum(preds[0], preds[1])
+
+
+def _normalise(p: np.ndarray) -> np.ndarray:
+    """Clip every class to [PROB_FLOOR, 1] and renormalise along the last axis.
+
+    The array form of `baselines.normalise_probs`; works on (n, 3) and (K, n, 3) alike.
+    """
+    clipped = np.clip(np.asarray(p, dtype=float), PROB_FLOOR, 1.0)
+    return clipped / clipped.sum(axis=-1, keepdims=True)
+
+
+def _probs(booster: Booster, x: np.ndarray, rounds: int | None = None) -> np.ndarray:
+    """(n, 3) probabilities in CLASSES order from the first `rounds` trees (all when None)."""
+    raw = booster.predict(x, num_iteration=rounds)
+    return _normalise(np.asarray(raw, dtype=float).reshape(x.shape[0], len(CLASSES)))
+
+
+def shrink_probs(p: np.ndarray, shrink: float, climatology: np.ndarray | None) -> np.ndarray:
+    """(1 - shrink) * p + shrink * climatology, renormalised; `shrink` 0 leaves `p` alone.
+
+    `climatology` is the training class frequencies in CLASSES order (broadcast over the
+    leading axes of `p`). Raises ValueError when shrinkage is asked for without them: a
+    missing number is never replaced by a made-up prior.
+    """
+    if not 0.0 <= shrink < 1.0:
+        raise ValueError(f"shrink must be in [0, 1), got {shrink}")
+    if shrink == 0.0:
+        return np.asarray(p, dtype=float)
+    if climatology is None:
+        raise ValueError("shrinkage needs the training class frequencies")
+    return _normalise((1.0 - shrink) * np.asarray(p, dtype=float) + shrink * climatology)
 
 
 def _probs_dict(p: np.ndarray) -> dict[str, float]:
     return {c: float(p[CLASS_INDEX[c]]) for c in ("UP", "FLAT", "DOWN")}
+
+
+# --------------------------------------------------------------------------- selection
+
+
+def select_rounds_and_shrink(
+    loss_sum: np.ndarray,
+    n_scored: int,
+    rounds: Sequence[int],
+    shrinks: Sequence[float],
+    default: tuple[int, float],
+) -> tuple[int, float]:
+    """The (rounds, shrink) pair with the lowest pooled log loss so far; `default` before any.
+
+    `loss_sum[i, j]` is the summed out-of-sample log loss of rounds[i] with shrinks[j] over
+    the `n_scored` rows scored so far. Ties go to the more conservative pair: fewer rounds
+    first, then more shrinkage.
+    """
+    if n_scored <= 0:
+        return default
+    mean = np.asarray(loss_sum, dtype=float) / n_scored
+    best = float(np.nanmin(mean))
+    for i in range(len(rounds)):
+        for j in reversed(range(len(shrinks))):
+            if mean[i, j] <= best + 1e-12:
+                return int(rounds[i]), float(shrinks[j])
+    raise AssertionError("unreachable: the minimum is in the grid")
+
+
+def _shrink_grid(params: Mapping[str, object]) -> tuple[tuple[float, ...], float]:
+    """(grid, first-fold default): SHRINK_GRID, or the single fixed value in params["shrink"]."""
+    fixed = params.get("shrink")
+    if fixed is None:
+        return SHRINK_GRID, FIRST_FOLD_SHRINK
+    a = float(fixed)  # type: ignore[arg-type]
+    if not 0.0 <= a < 1.0:
+        raise ValueError(f"shrink must be in [0, 1), got {a}")
+    return (a,), a
 
 
 # --------------------------------------------------------------------------- training
@@ -179,13 +326,20 @@ def train_walk_forward(
 ) -> TrainResult:
     """Strict expanding-window walk-forward validation, then a final fit on every label.
 
-    For k = min_train, min_train + step, ...: fit on labelled rows [0, k), predict rows
-    [k, k + step). The out-of-sample probabilities give the headline metrics and, with the
-    same rows, each baseline's accuracy/Brier (class frequencies for the random baseline
-    come from the fold's own training rows). Rows with a NaN label are excluded. Raises
+    For k = min_train, min_train + step, ...: fit on labelled rows [0, k) with the round
+    ceiling, score rows [k, k + step) with the (rounds, shrink) pair chosen on the folds
+    before this one (see the module docstring), and add this fold's scores at every grid
+    pair to the pool the later folds choose from. The out-of-sample probabilities give the
+    headline metrics and, on the same rows, each baseline's accuracy/Brier (class
+    frequencies for the random baseline and for the shrinkage come from the fold's own
+    training rows). Each fold also fits the two quantile models on its training rows with
+    the fold's rounds, for `range_coverage`. Rows with a NaN label are excluded. Raises
     ValueError when there are fewer than `min_train_days + step_days` labelled rows.
 
-    `target` only seeds the random baseline (falls back to `frame.attrs["target"]`).
+    `params` override DEFAULT_PARAMS: "n_estimators" is the ceiling of the round search and
+    "shrink", when given, fixes the shrinkage instead of choosing it. The returned params
+    carry the chosen "n_estimators" and "shrink". `target` only seeds the random baseline
+    (falls back to `frame.attrs["target"]`).
     """
     s = settings or get_settings()
     min_train = s.wf_min_train_days if min_train_days is None else int(min_train_days)
@@ -193,6 +347,10 @@ def train_walk_forward(
     if min_train < 1 or step < 1:
         raise ValueError("min_train_days and step_days must be positive")
     effective: dict[str, object] = {**DEFAULT_PARAMS, **dict(params or {})}
+    max_rounds = _max_rounds(effective)
+    rounds_grid = round_grid(max_rounds)
+    shrink_grid, first_shrink = _shrink_grid(effective)
+    first_choice = (min(FIRST_FOLD_ROUNDS, max_rounds), first_shrink)
     tgt = target if target is not None else str(frame.attrs.get("target", ""))
 
     labelled = frame[frame["label_pct"].notna() & frame["label_class"].notna()]
@@ -219,14 +377,24 @@ def train_walk_forward(
     base_probs: dict[str, np.ndarray] = {
         b: np.full((n, len(CLASSES)), np.nan) for b in BASELINE_NAMES
     }
+    loss_sum = np.zeros((len(rounds_grid), len(shrink_grid)))  # pooled over folds scored so far
+    n_scored = 0
+    in_range = 0
     folds: list[WalkForwardFold] = []
+    fold_params: list[dict[str, float]] = []
     for k in range(min_train, n, step):
         end = min(k + step, n)
-        booster = _fit_classifier(x[:k], y[:k], feature_names, effective)
-        p = _probs(booster, x[k:end])
+        # Chosen on folds < this one only: this fold's rows are still unseen at this point.
+        rounds, shrink = select_rounds_and_shrink(
+            loss_sum, n_scored, rounds_grid, shrink_grid, first_choice
+        )
+        freq_train = _class_frequencies(y[:k])
+        clim = _climatology(freq_train)
+        booster = _fit_classifier(x[:k], y[:k], feature_names, effective, max_rounds)
+        xk, yk = x[k:end], y[k:end]
+        p = shrink_probs(_probs(booster, xk, rounds), shrink, clim)
         oos_probs[k:end] = p
         oos[k:end] = True
-        freq_train = _class_frequencies(y[:k])
         for i in range(k, end):
             calls = baseline_calls(rows[i], tgt, dates[i], freq_train, s)
             for b in BASELINE_NAMES:
@@ -235,7 +403,8 @@ def train_walk_forward(
                     base_pred[b][i] = CLASS_INDEX[call]
                 bp = baseline_probs(b, call, freq_train)
                 base_probs[b][i] = [bp[c] for c in CLASSES]
-        yk = y[k:end]
+        lo, hi = _quantile_range(x[:k], y_pct[:k], xk, feature_names, effective, rounds)
+        in_range += int(np.sum((lo <= y_pct[k:end]) & (y_pct[k:end] <= hi)))
         folds.append(
             WalkForwardFold(
                 train_end=dates[k - 1],
@@ -247,6 +416,14 @@ def train_walk_forward(
                 log_loss=metrics.log_loss(p, yk),
             )
         )
+        fold_params.append({"n_estimators": rounds, "shrink": shrink})
+        # Now, and only now, this fold's rows join the pool the later folds choose from.
+        grid_probs = np.stack([_probs(booster, xk, r) for r in rounds_grid])  # (K, n_test, 3)
+        for j, a in enumerate(shrink_grid):
+            mixed = shrink_probs(grid_probs, a, clim)
+            for i in range(len(rounds_grid)):
+                loss_sum[i, j] += metrics.log_loss(mixed[i], yk) * (end - k)
+        n_scored += end - k
 
     po, yo = oos_probs[oos], y[oos]
     pred = po.argmax(axis=1)
@@ -261,8 +438,9 @@ def train_walk_forward(
             entry["accuracy"] = metrics.accuracy(base_pred[b][has_call], y[has_call])
             entry["brier"] = metrics.brier(base_probs[b][has_call], y[has_call])
         baselines[b] = entry
-    wf = WalkForwardMetrics(
-        n_oos=int(oos.sum()),
+    n_oos = int(oos.sum())
+    wf = MarketCallMetrics(
+        n_oos=n_oos,
         accuracy=metrics.accuracy(pred, yo),
         brier=metrics.brier(po, yo),
         log_loss=metrics.log_loss(po, yo),
@@ -271,11 +449,20 @@ def train_walk_forward(
         by_confidence=metrics.by_confidence(labels, correct),
         calibration=metrics.calibration_bins(po.max(axis=1), correct),
         folds=folds,
+        range_coverage=in_range / n_oos if n_oos else math.nan,
+        fold_params=fold_params,
     )
 
-    classifier = _fit_classifier(x, y, feature_names, effective)
+    # The final pair is chosen on every fold's out-of-sample rows (all unseen by their fits).
+    rounds, shrink = select_rounds_and_shrink(
+        loss_sum, n_scored, rounds_grid, shrink_grid, first_choice
+    )
+    effective["n_estimators"] = rounds
+    effective["shrink"] = shrink
+    classifier = _fit_classifier(x, y, feature_names, effective, rounds)
     quantiles = {
-        key: _fit_quantile(x, y_pct, feature_names, effective, alpha) for key, alpha in QUANTILES
+        key: _fit_quantile(x, y_pct, feature_names, effective, alpha, rounds)
+        for key, alpha in QUANTILES
     }
     artifact = json.dumps(
         {
@@ -283,6 +470,7 @@ def train_walk_forward(
             **{key: q.model_to_string() for key, q in quantiles.items()},
             "feature_names": feature_names,
             "params": effective,
+            "class_frequencies": wf.class_frequencies,
         },
         sort_keys=True,
     )
@@ -306,7 +494,9 @@ def artifact_hash(artifact: str) -> str:
 def load_artifact(artifact: str) -> dict[str, Any]:
     """Boosters rebuilt from the artifact JSON, cached in-process by the artifact's sha256.
 
-    Returns {"classifier", "q10", "q90": Booster, "feature_names": list[str], "hash": str}.
+    Returns {"classifier", "q10", "q90": Booster, "feature_names": list[str], "hash": str,
+    "shrink": float, "climatology": np.ndarray | None}. An artifact from before shrinkage
+    existed loads with shrink 0 and no climatology.
     """
     key = artifact_hash(artifact)
     cached = _ARTIFACT_CACHE.get(key)
@@ -322,6 +512,11 @@ def load_artifact(artifact: str) -> dict[str, Any]:
     names = payload.get("feature_names") or loaded["classifier"].feature_name()
     loaded["feature_names"] = [str(f) for f in names]
     loaded["hash"] = key
+    params = payload.get("params") or {}
+    raw_shrink = params.get("shrink", 0.0) if isinstance(params, Mapping) else 0.0
+    loaded["shrink"] = float(raw_shrink or 0.0)
+    freq = payload.get("class_frequencies")
+    loaded["climatology"] = _climatology(freq) if isinstance(freq, Mapping) else None
     _ARTIFACT_CACHE[key] = loaded
     while len(_ARTIFACT_CACHE) > _ARTIFACT_CACHE_SIZE:
         _ARTIFACT_CACHE.popitem(last=False)
@@ -337,10 +532,13 @@ def predict(
 ) -> MarketCallOutput:
     """The market call for one live feature row.
 
-    Probabilities sum to 1; the 10th/90th percentile of the close-to-close % come from the
-    quantile regressors; drivers are the five features with the largest contribution
-    (`pred_contrib`) to the predicted class's raw score, in plain English. Raises
-    ValueError if `feature_names` differ from the names the artifact was trained with.
+    Probabilities are the classifier's, shrunk towards the training class frequencies by
+    the artifact's `shrink` (chosen out of sample at training time), and sum to 1; the
+    10th/90th percentile of the close-to-close % come from the quantile regressors; drivers
+    are the five features with the largest contribution (`pred_contrib`) to the predicted
+    class's raw score, in plain English. Raises ValueError if `feature_names` differ from
+    the names the artifact was trained with, or if the artifact asks for shrinkage but
+    carries no class frequencies.
     """
     s = settings or get_settings()
     art = load_artifact(artifact)
@@ -351,7 +549,8 @@ def predict(
             f"trained with {len(trained_names)}"
         )
     x = row_vector(feature_names, row)
-    probs = _probs_dict(_probs(art["classifier"], x)[0])
+    p_model = _probs(art["classifier"], x)
+    probs = _probs_dict(shrink_probs(p_model, art["shrink"], art["climatology"])[0])
     cls = predicted_class(probs)
     p10 = finite(np.asarray(art["q10"].predict(x), dtype=float).reshape(-1)[0])
     p90 = finite(np.asarray(art["q90"].predict(x), dtype=float).reshape(-1)[0])
