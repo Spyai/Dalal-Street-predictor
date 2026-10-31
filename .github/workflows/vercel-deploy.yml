@@ -28,6 +28,7 @@ jobs:
       VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
       # The Vercel team that owns the projects (from Vercel's GitHub bot); override with a repo variable.
       VERCEL_SCOPE: ${{ vars.VERCEL_SCOPE || 'sparkyaipvtltd-9543s-projects' }}
+      VERCEL_TEAM_ID: ${{ vars.VERCEL_TEAM_ID || 'team_CvSRUYihh0vnYPxGg7jArw9O' }}
       # The two Vercel projects already connected to this repo; override with repo variables.
       DALAL_API_PROJECT: ${{ vars.DALAL_API_PROJECT || 'dalal-streetpredictor' }}
       DALAL_WEB_PROJECT: ${{ vars.DALAL_WEB_PROJECT || 'dalal-street-predictor' }}
@@ -53,6 +54,11 @@ jobs:
 
       - uses: actions/checkout@v4
         if: steps.gate.outputs.ready == 'true'
+
+      - name: Check what the token can reach
+        id: token
+        if: steps.gate.outputs.ready == 'true'
+        run: python3 .github/scripts/vercel_token_check.py
 
       - uses: actions/setup-python@v5
         if: steps.gate.outputs.ready == 'true'
