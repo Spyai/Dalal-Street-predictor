@@ -151,6 +151,7 @@ Scan the QR with an authenticator app (Google Authenticator, 1Password, Aegis). 
 ```bash
 docker compose run --rm backend python -m app.cli sync-instruments   # Kite tokens + Nifty 500 list
 docker compose run --rm backend python -m app.cli backfill           # 5y daily history, resumable
+docker compose run --rm backend python -m app.cli train              # first market-call model
 ```
 
 The backfill takes a few minutes on Kite (one request per stock at ≤3 req/s). Without a Kite
@@ -178,10 +179,13 @@ Then: `docker compose run --rm backend python -m app.cli import-holidays /import
 |---|---|---|
 | 06:05 | Holiday calendar refresh | — |
 | 07:00 | Kite login reminder (only if no token today) | Tap the Telegram link |
-| 07:30 | Pre-market prediction (Phase 2) | Read the brief |
+| 07:30 | Pre-market prediction: Nifty 50 + Bank Nifty calls locked into the ledger, Telegram brief | Read the brief |
 | 08:45 | Instrument + universe sync | — |
+| 09:20 | Open check: the gap call is graded against the open | — |
 | every 10 min | Global cues refresh | — |
+| 15:45 | Close grading: every open call is graded against the close | — |
 | 19:30 | Evening pull: FII/DII, bhavcopy + delivery %, gap-fill | — |
+| Sat 10:00 | Weekly retrain: a challenger is promoted only if it beats the champion out of sample | — |
 
 Failed jobs retry with backoff (30s, 60s, ...) and then alert you on Telegram. Holidays and
 weekends are recorded as "skipped: reason" on `/health`.
@@ -193,6 +197,10 @@ docker compose ps                                   # what's running
 docker compose logs -f scheduler                    # job logs (JSON)
 docker compose run --rm backend python -m app.cli jobs
 docker compose run --rm backend python -m app.cli run-job evening_data_pull
+docker compose run --rm backend python -m app.cli train                 # first market-call model
+docker compose run --rm backend python -m app.cli predict --force       # record a call now
+docker compose run --rm backend python -m app.cli verify-ledger         # check the hash chain
+docker compose run --rm backend python -m app.cli scorecard
 docker compose run --rm backend python -m app.cli reset-user
 make test                                           # backend tests (throwaway DB on :55432)
 ```
