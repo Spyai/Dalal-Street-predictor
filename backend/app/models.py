@@ -211,3 +211,101 @@ class KiteSession(Base):
     login_time: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+# --------------------------------------------------------------------- Phase 2
+
+
+class ModelVersion(Base):
+    """A trained model (or a baseline) and its walk-forward, out-of-sample metrics.
+
+    The artifact is stored here (LightGBM `model_to_string`), because GitHub Actions
+    runners keep no files between runs. Exactly one champion per (name, target).
+    """
+
+    __tablename__ = "model_version"
+    __table_args__ = (
+        UniqueConstraint("name", "target", "version", name="uq_model_version_name_target_version"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(32), index=True)  # "market_call"
+    target: Mapped[str] = mapped_column(String(32))  # "NIFTY 50" | "NIFTY BANK"
+    version: Mapped[str] = mapped_column(String(64))
+    kind: Mapped[str] = mapped_column(String(16))  # lightgbm | baseline
+    params: Mapped[dict | None] = mapped_column(JSON)
+    feature_names: Mapped[list] = mapped_column(JSON)
+    metrics: Mapped[dict] = mapped_column(JSON)
+    artifact: Mapped[str | None] = mapped_column(Text)
+    trained_through: Mapped[date] = mapped_column(Date)
+    train_rows: Mapped[int] = mapped_column(Integer)
+    is_champion: Mapped[bool] = mapped_column(Boolean, default=False)
+    promoted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    promotion_note: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class Prediction(Base):
+    """One immutable ledger record (brief §5). Rows are never updated or deleted: a
+    database trigger (migration 0003) rejects both. Corrections are new rows that set
+    `corrects_prediction_id`. `hash` covers the record and `prev_hash`, so the chain
+    (ordered by `seq`) makes any later edit detectable; see app/services/ledger.py.
+    """
+
+    __tablename__ = "prediction"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    seq: Mapped[int] = mapped_column(Integer, unique=True)
+    kind: Mapped[str] = mapped_column(String(32))  # "market_call"
+    target: Mapped[str] = mapped_column(String(32), index=True)
+    session_date: Mapped[date] = mapped_column(Date, index=True)
+    as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    is_late: Mapped[bool] = mapped_column(Boolean, default=False)  # written after 09:15 IST
+    model_version_id: Mapped[int | None] = mapped_column(ForeignKey("model_version.id"))
+    reference_date: Mapped[date] = mapped_column(Date)
+    reference_close: Mapped[float] = mapped_column(Float)
+    prob_up: Mapped[float] = mapped_column(Float)
+    prob_flat: Mapped[float] = mapped_column(Float)
+    prob_down: Mapped[float] = mapped_column(Float)
+    predicted_class: Mapped[str] = mapped_column(String(8))  # UP | FLAT | DOWN
+    range_p10_pct: Mapped[float | None] = mapped_column(Float)
+    range_p90_pct: Mapped[float | None] = mapped_column(Float)
+    gap_call: Mapped[str | None] = mapped_column(String(8))  # gap_up | gap_down | flat
+    gap_expected_pct: Mapped[float | None] = mapped_column(Float)
+    confidence: Mapped[str] = mapped_column(String(8))  # high | medium | low | none
+    no_edge: Mapped[bool] = mapped_column(Boolean, default=False)
+    drivers: Mapped[list] = mapped_column(JSON)
+    timing_guidance: Mapped[str | None] = mapped_column(Text)
+    baselines: Mapped[dict] = mapped_column(JSON)
+    feature_snapshot: Mapped[dict] = mapped_column(JSON)
+    corrects_prediction_id: Mapped[int | None] = mapped_column(ForeignKey("prediction.id"))
+    note: Mapped[str | None] = mapped_column(Text)
+    prev_hash: Mapped[str] = mapped_column(String(64))
+    hash: Mapped[str] = mapped_column(String(64), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class PredictionGrade(Base):
+    """The outcome of a prediction, written after the fact (mutable: the open grade comes
+    at 09:20, the close grade at 15:45; re-grading overwrites)."""
+
+    __tablename__ = "prediction_grade"
+    __table_args__ = (UniqueConstraint("prediction_id", name="uq_prediction_grade_prediction"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    prediction_id: Mapped[int] = mapped_column(ForeignKey("prediction.id"), index=True)
+    graded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    actual_open: Mapped[float | None] = mapped_column(Float)
+    actual_close: Mapped[float | None] = mapped_column(Float)
+    actual_pct: Mapped[float | None] = mapped_column(Float)
+    actual_class: Mapped[str | None] = mapped_column(String(8))
+    correct: Mapped[bool | None] = mapped_column(Boolean)
+    brier: Mapped[float | None] = mapped_column(Float)
+    log_loss: Mapped[float | None] = mapped_column(Float)
+    gap_actual_pct: Mapped[float | None] = mapped_column(Float)
+    gap_correct: Mapped[bool | None] = mapped_column(Boolean)
+    gap_graded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    baseline_correct: Mapped[dict | None] = mapped_column(JSON)
+    error_category: Mapped[str | None] = mapped_column(String(32))  # Phase 4
+    notes: Mapped[str | None] = mapped_column(Text)
+    source: Mapped[str] = mapped_column(String(32))

@@ -77,7 +77,17 @@ class Settings(BaseSettings):
     global_cues_refresh_minutes: int = 10
 
     # Prediction / risk (used from Phase 2+)
-    market_flat_threshold_pct: float = 0.30
+    market_flat_threshold_pct: float = 0.30  # |close-to-close %| beyond this is UP/DOWN
+    gap_threshold_pct: float = 0.25  # |open vs previous close %| beyond this is a gap
+    no_edge_margin: float = 0.08  # top-two class probability gap below this = "No edge"
+    confidence_high_prob: float = 0.55  # max probability for a "high" confidence label
+    ledger_lock_time: time = time(9, 15)  # IST; a record written later is marked late
+    prediction_targets: str = "NIFTY 50,NIFTY BANK"  # comma-separated INDEX symbols
+    wf_min_train_days: int = 500  # walk-forward: first fold trains on this many sessions
+    wf_step_days: int = 21  # walk-forward: refit every N sessions
+    retrain_min_brier_gain: float = 0.005  # challenger must beat champion's Brier by this
+    nifty_expiry_weekday: int = 1  # 0=Mon; weekly index expiry day (Tuesday since 2025)
+    mlflow_tracking_uri: str = ""  # optional; empty = models are registered in Postgres only
     paper_capital: float = 1_000_000.0
     risk_per_trade_pct: float = 1.0
     min_sample_size: int = 100
@@ -89,7 +99,11 @@ class Settings(BaseSettings):
     imports_dir: str = "/imports"
     data_dir: str = "/data"
 
-    @field_validator("kite_login_reminder_time", mode="before")
+    @property
+    def prediction_target_symbols(self) -> list[str]:
+        return [t.strip().upper() for t in self.prediction_targets.split(",") if t.strip()]
+
+    @field_validator("kite_login_reminder_time", "ledger_lock_time", mode="before")
     @classmethod
     def _parse_time(cls, v: object) -> object:
         if isinstance(v, str) and len(v) == 5:

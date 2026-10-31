@@ -67,7 +67,8 @@ def test_vercel_requirements_cover_runtime_imports() -> None:
     deps = tomllib.loads((root / "pyproject.toml").read_text())["project"]["dependencies"]
     reqs = (root / "requirements.txt").read_text().splitlines()
     names = {r.split(">")[0].split("[")[0].split("=")[0].strip().lower() for r in reqs}
-    not_needed_on_vercel = {"uvicorn", "alembic", "apscheduler"}
+    # Training and prediction run in GitHub Actions; the API only reads the ledger.
+    not_needed_on_vercel = {"uvicorn", "alembic", "apscheduler", "lightgbm", "scikit-learn"}
     for dep in deps:
         name = dep.split(">")[0].split("[")[0].split("=")[0].strip().lower()
         if name not in not_needed_on_vercel:
