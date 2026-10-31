@@ -1,0 +1,12 @@
+# Only the API function goes to Vercel. Dependencies come from requirements.txt;
+# migrations, tests and the scheduler run in GitHub Actions instead.
+.venv
+**/__pycache__
+.pytest_cache
+.mypy_cache
+.ruff_cache
+tests
+alembic
+alembic.ini
+pyproject.toml
+Dockerfile
