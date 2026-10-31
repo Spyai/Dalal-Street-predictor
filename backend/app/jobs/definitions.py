@@ -1,7 +1,9 @@
 """The daily schedule (Section 3 of the brief). All times IST.
 
 Jobs with fn=None are part of the plan but not built yet; /health lists them with the
-phase that delivers them, and the scheduler does not register them.
+phase that delivers them, and the scheduler does not register them. Phase 2 adds the
+market-call loop: 07:30 prediction, 09:20 gap grade, 15:45 close grade and the Saturday
+retrain (`weekly_review`, Phase 4, will fold the retrain into the weekly report).
 """
 
 from __future__ import annotations
@@ -56,6 +58,7 @@ def job_specs() -> list[JobSpec]:
             "07:30 trading days",
             {"day_of_week": "mon-fri", "hour": 7, "minute": 30},
             phase=2,
+            fn=tasks.premarket_prediction,
         ),
         JobSpec(
             "instrument_sync",
@@ -71,6 +74,7 @@ def job_specs() -> list[JobSpec]:
             "09:20 trading days",
             {"day_of_week": "mon-fri", "hour": 9, "minute": 20},
             phase=2,
+            fn=tasks.open_check,
         ),
         JobSpec(
             "intraday_monitor",
@@ -85,6 +89,7 @@ def job_specs() -> list[JobSpec]:
             "15:45 trading days",
             {"day_of_week": "mon-fri", "hour": 15, "minute": 45},
             phase=2,
+            fn=tasks.close_grading,
         ),
         JobSpec(
             "evening_data_pull",
@@ -100,6 +105,16 @@ def job_specs() -> list[JobSpec]:
             "20:30 trading days",
             {"day_of_week": "mon-fri", "hour": 20, "minute": 30},
             phase=4,
+        ),
+        JobSpec(
+            "weekly_retrain",
+            "Weekly retrain (champion/challenger)",
+            "Saturday 10:00",
+            {"day_of_week": "sat", "hour": 10, "minute": 0},
+            phase=2,
+            fn=tasks.weekly_retrain,
+            trading_days_only=False,
+            max_attempts=1,  # a failed training run is reported, not retried in a loop
         ),
         JobSpec(
             "weekly_review",

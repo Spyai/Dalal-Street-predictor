@@ -92,13 +92,183 @@ class KiteStatusOut(BaseModel):
     redirect_url: str
 
 
+# ----------------------------------------------------------------------------- market call
+
+
+class DriverOut(BaseModel):
+    """One plain-English reason behind a call (app.ml.core.Driver)."""
+
+    feature: str
+    value: float | None
+    contribution: float | None
+    text: str
+
+
+class GradeOut(BaseModel):
+    """What the market did, written after the fact. All None until graded."""
+
+    actual_open: float | None
+    actual_close: float | None
+    actual_pct: float | None
+    actual_class: str | None
+    correct: bool | None
+    brier: float | None
+    log_loss: float | None
+    gap_actual_pct: float | None
+    gap_correct: bool | None
+    graded_at: datetime | None
+
+
+class TrackOut(BaseModel):
+    """The live track record that sits beside every call (honesty rules, brief §1)."""
+
+    n_graded: int
+    accuracy: float | None
+    best_baseline: str | None
+    best_baseline_label: str | None
+    best_baseline_accuracy: float | None
+    sample_warning: bool
+    min_sample_size: int
+
+
+class MarketCallOut(BaseModel):
+    """The ledger's current call for one target and session, plus grade and track record."""
+
+    id: int
+    seq: int
+    target: str
+    session_date: date
+    as_of: datetime
+    is_late: bool
+    reference_date: date
+    reference_close: float
+    predicted_class: str
+    probs: dict[str, float]
+    range_p10_pct: float | None
+    range_p90_pct: float | None
+    gap_call: str | None
+    gap_expected_pct: float | None
+    confidence: str
+    no_edge: bool
+    drivers: list[DriverOut]
+    timing_guidance: str | None
+    baselines: dict[str, str | None]
+    model_version: str | None
+    note: str | None
+    grade: GradeOut | None
+    track: TrackOut | None
+
+
 class TodayOut(BaseModel):
     clock: MarketClockOut
     cues: list[CueOut]
     flows: FlowsOut
     kite: KiteStatusOut
-    market_call: None = None  # Phase 2
-    market_call_note: str = "Market call starts in Phase 2. No prediction is made yet."
+    market_call: list[MarketCallOut] = Field(default_factory=list)
+    market_call_note: str = ""  # why a target has no call; empty when every target has one
+
+
+# ----------------------------------------------------------------------------- scorecard
+
+
+class ConfidenceBucketOut(BaseModel):
+    confidence: str
+    n: int
+    accuracy: float | None = None  # the service omits the key when n == 0
+
+
+class CalibrationBinOut(BaseModel):
+    bin_lo: float
+    bin_hi: float
+    n: int
+    predicted_mean: float | None
+    observed: float | None
+
+
+class BaselineScoreOut(BaseModel):
+    name: str
+    label: str
+    n: int
+    accuracy: float | None
+
+
+class OosMetricsOut(BaseModel):
+    """The champion's walk-forward, out-of-sample metrics."""
+
+    n_oos: int | None
+    accuracy: float | None
+    brier: float | None
+    log_loss: float | None
+
+
+class ChampionOut(BaseModel):
+    id: int
+    version: str
+    kind: str
+    trained_through: date
+    train_rows: int
+    oos: OosMetricsOut
+    promoted_at: datetime | None
+    created_at: datetime | None
+
+
+class PredictionRowOut(BaseModel):
+    """One ledger record with its grade (grade fields None until graded)."""
+
+    id: int
+    seq: int
+    target: str
+    session_date: date
+    as_of: datetime | None
+    is_late: bool
+    predicted_class: str
+    probs: dict[str, float]
+    range_p10_pct: float | None
+    range_p90_pct: float | None
+    confidence: str
+    no_edge: bool
+    gap_call: str | None
+    gap_expected_pct: float | None
+    model_version_id: int | None
+    corrects_prediction_id: int | None
+    actual_open: float | None
+    actual_close: float | None
+    actual_pct: float | None
+    actual_class: str | None
+    correct: bool | None
+    brier: float | None
+    log_loss: float | None
+    gap_actual_pct: float | None
+    gap_correct: bool | None
+    graded_at: datetime | None
+
+
+class ScorecardOut(BaseModel):
+    """Mirrors app.services.scorecard.Scorecard, plus the targets the switch can offer."""
+
+    target: str
+    targets: list[str]
+    n_graded: int
+    accuracy: float | None
+    brier: float | None
+    log_loss: float | None
+    gap_n: int
+    gap_accuracy: float | None
+    by_confidence: list[ConfidenceBucketOut]
+    calibration: list[CalibrationBinOut]
+    baselines: list[BaselineScoreOut]
+    verdict: str
+    sample_warning: bool
+    min_sample_size: int
+    champion: ChampionOut | None
+    recent: list[PredictionRowOut]
+
+
+class LedgerVerifyOut(BaseModel):
+    ok: bool
+    checked: int
+    first_bad_seq: int | None
+    message: str
 
 
 # ----------------------------------------------------------------------------- stocks
@@ -183,6 +353,19 @@ class FreshnessOut(BaseModel):
     detail: str | None = None
 
 
+class ModelHealthOut(BaseModel):
+    """A champion model in production and its out-of-sample metrics."""
+
+    name: str
+    target: str
+    version: str
+    trained_through: date
+    oos_brier: float | None
+    oos_accuracy: float | None
+    n_oos: int | None
+    promoted_at: datetime | None
+
+
 class HealthOut(BaseModel):
     now: datetime
     scheduler_mode: str
@@ -194,6 +377,6 @@ class HealthOut(BaseModel):
     jobs: list[JobHealthOut]
     sources: list[SourceHealthOut]
     freshness: list[FreshnessOut]
-    models: list[dict[str, str]]
+    models: list[ModelHealthOut]
     models_note: str
     holiday_coverage: dict[int, int]

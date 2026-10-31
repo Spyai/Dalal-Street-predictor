@@ -97,8 +97,13 @@ def run_job(
     now: datetime | None = None,
     sleep: Callable[[float], None] = time.sleep,
     settings: Settings | None = None,
+    force: bool = False,
 ) -> str:
-    """Run a job with retries. Returns the final status."""
+    """Run a job with retries. Returns the final status.
+
+    `force=True` skips the trading-day check (`python -m app.cli predict --force` on a
+    weekend, or re-running a job by hand); the run record says the check was skipped.
+    """
     settings = settings or get_settings()
     now = now or datetime.now(UTC)
     today = now.astimezone(IST).date()
@@ -109,7 +114,9 @@ def run_job(
         cal = TradingCalendar.load(db)
     info = cal.info(today)
     notes: list[str] = []
-    if spec.trading_days_only:
+    if spec.trading_days_only and force and not info.is_trading_day:
+        notes.append(f"forced run on a non-trading day ({info.reason})")
+    elif spec.trading_days_only:
         if not info.is_trading_day:
             _record(
                 run_id=None,

@@ -9,10 +9,17 @@ Commands:
     sync-instruments            Kite instrument tokens + universe membership
     import-holidays FILE        load an NSE holiday CSV (date,description)
     backfill [--years N]        load daily history for indices, global cues and universe
-    run-job NAME                run one scheduled job now
+    run-job NAME [--force]      run one scheduled job now (--force ignores the calendar)
     jobs                        list scheduled jobs
     record-fixtures DIR         save live provider responses for adapter tests
     test-telegram               send a test message to your Telegram chat
+    train [--target T] [--promote-always]
+                                walk-forward train the market model; the first model is
+                                promoted, later ones only if they beat the champion
+    predict [--force]           the 07:30 pre-market prediction run, now
+    grade [--force]             the 15:45 close grading, now
+    verify-ledger               walk the prediction hash chain; exit 1 if it is broken
+    scorecard [--target T]      the live track record in plain words
 """
 
 from __future__ import annotations
@@ -147,10 +154,136 @@ def cmd_run_job(args: argparse.Namespace) -> int:
         print(f"{spec.name} is not built yet (Phase {spec.phase}).", file=sys.stderr)
         return 1
     status = run_job(
-        spec, sleep=lambda s: None if args.no_retry_wait else __import__("time").sleep(s)
+        spec,
+        sleep=lambda s: None if args.no_retry_wait else __import__("time").sleep(s),
+        force=bool(getattr(args, "force", False)),
     )
     print(f"{spec.name}: {status}")
     return 0 if status != "failed" else 1
+
+
+def _run_named_job(name: str, force: bool) -> int:
+    from app.jobs.definitions import get_spec
+    from app.jobs.runner import run_job
+
+    status = run_job(get_spec(name), force=force)
+    print(f"{name}: {status} (details on /health)")
+    return 0 if status != "failed" else 1
+
+
+def cmd_predict(args: argparse.Namespace) -> int:
+    return _run_named_job("premarket_prediction", args.force)
+
+
+def cmd_grade(args: argparse.Namespace) -> int:
+    return _run_named_job("close_grading", args.force)
+
+
+def _fmt(x: float | None, spec: str = ".3f") -> str:
+    return "\u2014" if x is None else format(x, spec)
+
+
+def _pct(x: float | None) -> str:
+    return "\u2014" if x is None else f"{x * 100:.0f}%"
+
+
+def cmd_train(args: argparse.Namespace) -> int:
+    """Walk-forward train the market model per target and register the result."""
+    from app.ml import features, models
+    from app.ml import registry as model_registry
+
+    s = get_settings()
+    targets = [args.target.strip().upper()] if args.target else s.prediction_target_symbols
+    failures = 0
+    with session_scope() as db:
+        for target in targets:
+            print(f"== {target}")
+            frame = features.build_frame(db, target, settings=s)
+            if frame.empty:
+                print("  no daily bars; run `python -m app.cli backfill` first", file=sys.stderr)
+                failures += 1
+                continue
+            labelled = int(frame["label_pct"].notna().sum())
+            print(
+                f"  {labelled} labelled sessions, {len(features.FEATURE_NAMES)} features; "
+                f"walk-forward from {s.wf_min_train_days} sessions, step {s.wf_step_days} ..."
+            )
+            try:
+                result = models.train_walk_forward(frame, settings=s, target=target)
+            except ValueError as exc:
+                print(f"  not trained: {exc}", file=sys.stderr)
+                failures += 1
+                continue
+            champ = model_registry.champion(db, target)
+            promote, reason = model_registry.should_promote(
+                champ.metrics if champ is not None else None, result.metrics, s
+            )
+            if args.promote_always and not promote:
+                promote, reason = True, f"--promote-always ({reason})"
+            mv = model_registry.save_model(db, target, result, promote=promote, note=reason)
+            db.commit()
+            model_registry.log_to_mlflow(result, target, promote, s)
+            m = result.metrics
+            print(f"  version {mv.version}, trained through {result.trained_through}")
+            print(
+                f"  out of sample: n={m.n_oos} accuracy={_pct(m.accuracy)} "
+                f"brier={_fmt(m.brier)} log_loss={_fmt(m.log_loss)}"
+            )
+            for name, entry in m.baselines.items():
+                print(
+                    f"    baseline {name:<18} n={int(entry.get('n', 0)):<4} "
+                    f"accuracy={_pct(entry.get('accuracy'))} brier={_fmt(entry.get('brier'))}"
+                )
+            print(f"  {'PROMOTED' if promote else 'rejected'}: {reason}")
+    return 1 if failures else 0
+
+
+def cmd_verify_ledger(_: argparse.Namespace) -> int:
+    from app.services.ledger import verify_ledger
+
+    with session_scope() as db:
+        v = verify_ledger(db)
+    print(("OK: " if v.ok else "BROKEN: ") + v.message)
+    if not v.ok:
+        print(f"first bad seq: {v.first_bad_seq} ({v.checked} records verified before it)")
+    return 0 if v.ok else 1
+
+
+def cmd_scorecard(args: argparse.Namespace) -> int:
+    from app.services.scorecard import scorecard
+
+    s = get_settings()
+    targets = [args.target.strip().upper()] if args.target else s.prediction_target_symbols
+    with session_scope() as db:
+        for target in targets:
+            sc = scorecard(db, target, settings=s)
+            print(f"== {target}")
+            print(f"  {sc.verdict}")
+            print(
+                f"  graded: {sc.n_graded}  accuracy: {_pct(sc.accuracy)}  "
+                f"brier: {_fmt(sc.brier)}  log loss: {_fmt(sc.log_loss)}"
+            )
+            print(f"  gap calls graded: {sc.gap_n}  gap accuracy: {_pct(sc.gap_accuracy)}")
+            for b in sc.baselines:
+                print(f"    baseline {b['label']:<42} n={b['n']:<4} accuracy={_pct(b['accuracy'])}")
+            for row in sc.by_confidence:
+                print(
+                    f"    confidence {row['confidence']:<7} n={row['n']:<4} "
+                    f"accuracy={_pct(row.get('accuracy'))}"
+                )
+            if sc.champion is None:
+                print("  champion: none (run `python -m app.cli train`)")
+            else:
+                oos = sc.champion["oos"]
+                print(
+                    f"  champion: {sc.champion['version']} trained through "
+                    f"{sc.champion['trained_through']}; OOS n={oos.get('n_oos')} "
+                    f"accuracy={_pct(oos.get('accuracy'))} brier={_fmt(oos.get('brier'))} "
+                    f"log loss={_fmt(oos.get('log_loss'))}"
+                )
+            if sc.sample_warning:
+                print(f"  sample-size warning: fewer than {s.min_sample_size} graded calls")
+    return 0
 
 
 def cmd_jobs(_: argparse.Namespace) -> int:
@@ -247,8 +380,27 @@ def main(argv: list[str] | None = None) -> int:
     sp = sub.add_parser("run-job")
     sp.add_argument("name")
     sp.add_argument("--no-retry-wait", action="store_true")
+    sp.add_argument("--force", action="store_true", help="run even on a weekend or holiday")
     sp.set_defaults(fn=cmd_run_job)
     sub.add_parser("jobs").set_defaults(fn=cmd_jobs)
+    sp = sub.add_parser("train")
+    sp.add_argument("--target", help='an INDEX symbol, e.g. "NIFTY 50" (default: all targets)')
+    sp.add_argument(
+        "--promote-always",
+        action="store_true",
+        help="promote even if it does not beat the champion",
+    )
+    sp.set_defaults(fn=cmd_train)
+    sp = sub.add_parser("predict")
+    sp.add_argument("--force", action="store_true", help="run even on a weekend or holiday")
+    sp.set_defaults(fn=cmd_predict)
+    sp = sub.add_parser("grade")
+    sp.add_argument("--force", action="store_true", help="run even on a weekend or holiday")
+    sp.set_defaults(fn=cmd_grade)
+    sub.add_parser("verify-ledger").set_defaults(fn=cmd_verify_ledger)
+    sp = sub.add_parser("scorecard")
+    sp.add_argument("--target", help='an INDEX symbol, e.g. "NIFTY 50" (default: all targets)')
+    sp.set_defaults(fn=cmd_scorecard)
     sub.add_parser("test-telegram").set_defaults(fn=cmd_test_telegram)
     sp = sub.add_parser("record-fixtures")
     sp.add_argument("dir")

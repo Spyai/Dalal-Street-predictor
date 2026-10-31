@@ -32,7 +32,7 @@ from typing import Any
 from urllib.parse import urlsplit
 
 SECRETISH = re.compile(
-    r"SECRET|TOKEN|PASSWORD|KEY|URL|PG|POSTGRES|DATABASE|KV_|REDIS|USER_ID|CHAT_ID|WATCHLIST",
+    r"SECRET|TOKEN|PASSWORD|KEY|URL|URI|PG|POSTGRES|DATABASE|KV_|REDIS|USER_ID|CHAT_ID|WATCHLIST",
     re.I,
 )
 UNREADABLE = "[SENSITIVE]"
@@ -57,6 +57,20 @@ APP_KEYS = [
     "UNIVERSE",
     "REDIS_URL",
     "KV_URL",
+    # Phase 2 market-call tunables (app/config.py "Prediction / risk"), so a change made in
+    # Vercel reaches the 07:30 / 15:45 jobs and the Saturday retrain too.
+    "PREDICTION_TARGETS",
+    "MARKET_FLAT_THRESHOLD_PCT",
+    "GAP_THRESHOLD_PCT",
+    "NO_EDGE_MARGIN",
+    "CONFIDENCE_HIGH_PROB",
+    "LEDGER_LOCK_TIME",
+    "WF_MIN_TRAIN_DAYS",
+    "WF_STEP_DAYS",
+    "RETRAIN_MIN_BRIER_GAIN",
+    "NIFTY_EXPIRY_WEEKDAY",
+    "MLFLOW_TRACKING_URI",
+    "MIN_SAMPLE_SIZE",
 ]
 # Direct (unpooled) connections first: migrations and long jobs shouldn't go through
 # a transaction-mode pooler.

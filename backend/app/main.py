@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
-from app.api import auth, health, kite, stocks, today
+from app.api import auth, health, kite, scorecard, stocks, today
 from app.config import get_settings
 from app.logging import configure_logging
 
@@ -20,5 +20,5 @@ app = FastAPI(
     openapi_url="/api/openapi.json",
 )
 
-for module in (auth, today, stocks, kite, health):
+for module in (auth, today, scorecard, stocks, kite, health):
     app.include_router(module.router)

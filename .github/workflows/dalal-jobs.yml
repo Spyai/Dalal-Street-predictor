@@ -12,8 +12,12 @@ on:
   schedule:
     - cron: "35 0 * * *"       # 06:05 IST daily      holiday_refresh
     - cron: "30 1 * * 1-5"     # 07:00 IST Mon-Fri    kite_login_reminder
+    - cron: "0 2 * * 1-5"      # 07:30 IST Mon-Fri    premarket_prediction
     - cron: "15 3 * * 1-5"     # 08:45 IST Mon-Fri    instrument_sync
+    - cron: "50 3 * * 1-5"     # 09:20 IST Mon-Fri    open_check
+    - cron: "15 10 * * 1-5"    # 15:45 IST Mon-Fri    close_grading
     - cron: "0 14 * * 1-5"     # 19:30 IST Mon-Fri    evening_data_pull
+    - cron: "30 4 * * 6"       # 10:00 IST Saturday   weekly_retrain
     - cron: "*/30 0-17 * * *"  # 05:30-23:30 IST      global_cues_refresh
   workflow_dispatch:
     inputs:
@@ -31,6 +35,13 @@ on:
           - run-job kite_login_reminder
           - run-job instrument_sync
           - run-job evening_data_pull
+          - run-job premarket_prediction
+          - run-job open_check
+          - run-job close_grading
+          - run-job weekly_retrain
+          - train
+          - predict --force
+          - verify-ledger
 
 permissions:
   contents: read
@@ -96,13 +107,20 @@ jobs:
           case "$SCHEDULE" in
             "35 0 * * *")      CMD="run-job holiday_refresh" ;;
             "30 1 * * 1-5")    CMD="run-job kite_login_reminder" ;;
+            "0 2 * * 1-5")     CMD="run-job premarket_prediction" ;;
             "15 3 * * 1-5")    CMD="run-job instrument_sync" ;;
+            "50 3 * * 1-5")    CMD="run-job open_check" ;;
+            "15 10 * * 1-5")   CMD="run-job close_grading" ;;
             "0 14 * * 1-5")    CMD="run-job evening_data_pull" ;;
+            "30 4 * * 6")      CMD="run-job weekly_retrain" ;;
             "*/30 0-17 * * *") CMD="run-job global_cues_refresh" ;;
             "")                CMD="$INPUT" ;;
             *) echo "Unknown schedule: $SCHEDULE"; exit 1 ;;
           esac
-          if ! [[ "$CMD" =~ ^(migrate|sync-instruments|backfill|test-telegram|run-job\ [a-z_]+)$ ]]; then
+          # Every command the workflow may run, as a regex (an unquoted variable so bash
+          # reads it as one; the spaces are part of the pattern).
+          ALLOW='^(migrate|sync-instruments|backfill|test-telegram|train|predict( --force)?|verify-ledger|run-job [a-z_]+( --force)?)$'
+          if ! [[ "$CMD" =~ $ALLOW ]]; then
             echo "Refusing unexpected command: $CMD"; exit 1
           fi
           echo "cmd=$CMD" >> "$GITHUB_OUTPUT"

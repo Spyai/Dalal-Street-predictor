@@ -52,13 +52,167 @@ export interface KiteStatus {
   redirect_url: string;
 }
 
+export type CallClass = "UP" | "FLAT" | "DOWN";
+export type Confidence = "high" | "medium" | "low" | "none";
+export type GapCall = "gap_up" | "gap_down" | "flat";
+
+export interface Driver {
+  feature: string;
+  value: number | null;
+  contribution: number | null;
+  text: string;
+}
+
+export interface Grade {
+  actual_open: number | null;
+  actual_close: number | null;
+  actual_pct: number | null;
+  actual_class: CallClass | null;
+  correct: boolean | null;
+  brier: number | null;
+  log_loss: number | null;
+  gap_actual_pct: number | null;
+  gap_correct: boolean | null;
+  graded_at: string | null;
+}
+
+export interface Track {
+  n_graded: number;
+  accuracy: number | null;
+  best_baseline: string | null;
+  best_baseline_label: string | null;
+  best_baseline_accuracy: number | null;
+  sample_warning: boolean;
+  min_sample_size: number;
+}
+
+export interface MarketCall {
+  id: number;
+  seq: number;
+  target: string;
+  session_date: string;
+  as_of: string;
+  is_late: boolean;
+  reference_date: string;
+  reference_close: number;
+  predicted_class: CallClass;
+  probs: Partial<Record<CallClass, number>>;
+  range_p10_pct: number | null;
+  range_p90_pct: number | null;
+  gap_call: GapCall | null;
+  gap_expected_pct: number | null;
+  confidence: Confidence;
+  no_edge: boolean;
+  drivers: Driver[];
+  timing_guidance: string | null;
+  baselines: Record<string, string | null>;
+  model_version: string | null;
+  note: string | null;
+  grade: Grade | null;
+  track: Track | null;
+}
+
 export interface Today {
   clock: MarketClock;
   cues: Cue[];
   flows: Flows;
   kite: KiteStatus;
-  market_call: null;
+  market_call: MarketCall[];
   market_call_note: string;
+}
+
+export interface ConfidenceBucket {
+  confidence: Confidence;
+  n: number;
+  accuracy: number | null;
+}
+
+export interface CalibrationBin {
+  bin_lo: number;
+  bin_hi: number;
+  n: number;
+  predicted_mean: number | null;
+  observed: number | null;
+}
+
+export interface BaselineScore {
+  name: string;
+  label: string;
+  n: number;
+  accuracy: number | null;
+}
+
+export interface OosMetrics {
+  n_oos: number | null;
+  accuracy: number | null;
+  brier: number | null;
+  log_loss: number | null;
+}
+
+export interface Champion {
+  id: number;
+  version: string;
+  kind: string;
+  trained_through: string;
+  train_rows: number;
+  oos: OosMetrics;
+  promoted_at: string | null;
+  created_at: string | null;
+}
+
+export interface PredictionRow {
+  id: number;
+  seq: number;
+  target: string;
+  session_date: string;
+  as_of: string | null;
+  is_late: boolean;
+  predicted_class: CallClass;
+  probs: Partial<Record<CallClass, number>>;
+  range_p10_pct: number | null;
+  range_p90_pct: number | null;
+  confidence: Confidence;
+  no_edge: boolean;
+  gap_call: GapCall | null;
+  gap_expected_pct: number | null;
+  model_version_id: number | null;
+  corrects_prediction_id: number | null;
+  actual_open: number | null;
+  actual_close: number | null;
+  actual_pct: number | null;
+  actual_class: CallClass | null;
+  correct: boolean | null;
+  brier: number | null;
+  log_loss: number | null;
+  gap_actual_pct: number | null;
+  gap_correct: boolean | null;
+  graded_at: string | null;
+}
+
+export interface Scorecard {
+  target: string;
+  targets: string[];
+  n_graded: number;
+  accuracy: number | null;
+  brier: number | null;
+  log_loss: number | null;
+  gap_n: number;
+  gap_accuracy: number | null;
+  by_confidence: ConfidenceBucket[];
+  calibration: CalibrationBin[];
+  baselines: BaselineScore[];
+  verdict: string;
+  sample_warning: boolean;
+  min_sample_size: number;
+  champion: Champion | null;
+  recent: PredictionRow[];
+}
+
+export interface LedgerVerify {
+  ok: boolean;
+  checked: number;
+  first_bad_seq: number | null;
+  message: string;
 }
 
 export interface InstrumentInfo {
@@ -149,6 +303,17 @@ export interface SetupResult {
   qr_svg_data_url: string;
 }
 
+export interface ModelHealth {
+  name: string;
+  target: string;
+  version: string;
+  trained_through: string;
+  oos_brier: number | null;
+  oos_accuracy: number | null;
+  n_oos: number | null;
+  promoted_at: string | null;
+}
+
 export interface Health {
   now: string;
   scheduler_mode: "internal" | "external";
@@ -160,7 +325,7 @@ export interface Health {
   jobs: JobHealth[];
   sources: SourceHealth[];
   freshness: Freshness[];
-  models: Record<string, string>[];
+  models: ModelHealth[];
   models_note: string;
   holiday_coverage: Record<string, number>;
 }

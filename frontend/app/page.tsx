@@ -5,6 +5,7 @@ import { api, ApiError } from "@/lib/api";
 import type { Cue, Flows, KiteStatus, MarketClock, Today } from "@/lib/types";
 import { ago, fmtCr, fmtDate, fmtIstDateTime, fmtNum, fmtPct, tone } from "@/lib/format";
 import { Notice, StatusPill } from "@/components/Status";
+import { MarketCallCard, MarketCallEmpty } from "@/components/MarketCall";
 
 const REFRESH_MS = 60_000;
 
@@ -53,10 +54,20 @@ export default function TodayPage() {
       {error && <Notice tone="down">{error}</Notice>}
       <KiteBanner kite={data.kite} />
 
-      <section className="grid gap-4 lg:grid-cols-3">
-        <MarketCallCard note={data.market_call_note} />
-        <FlowsCard flows={data.flows} />
+      <section className="space-y-2">
+        <div className="grid gap-4 md:grid-cols-2">
+          {data.market_call.length === 0 ? (
+            <MarketCallEmpty note={data.market_call_note} />
+          ) : (
+            data.market_call.map((c) => <MarketCallCard key={c.id} call={c} />)
+          )}
+        </div>
+        {data.market_call.length > 0 && data.market_call_note && (
+          <p className="text-xs text-warn">{data.market_call_note}</p>
+        )}
       </section>
+
+      <FlowsCard flows={data.flows} />
 
       <section className="space-y-2">
         <div className="flex items-baseline justify-between">
@@ -82,8 +93,9 @@ export default function TodayPage() {
       <section className="card p-4">
         <h2 className="label mb-1">Daily brief</h2>
         <p className="text-sm text-muted">
-          The one-paragraph AI brief starts with the market call in Phase 2. It will summarise the
-          numbers above and the model&apos;s call. It will not invent a view of its own.
+          The one-paragraph AI brief is not built yet. The 07:30 Telegram brief carries the market
+          call above; the written summary will cover the numbers on this page and the model&apos;s
+          call. It will not invent a view of its own.
         </p>
       </section>
     </div>
@@ -149,23 +161,6 @@ function KiteBanner({ kite }: { kite: KiteStatus }) {
   );
 }
 
-function MarketCallCard({ note }: { note: string }) {
-  return (
-    <div className="card p-4 lg:col-span-1">
-      <div className="mb-3 flex items-center justify-between">
-        <h2 className="label">Market call: Nifty 50</h2>
-        <span className="text-[10px] uppercase tracking-wide text-faint">Phase 2</span>
-      </div>
-      <p className="text-2xl font-semibold text-faint">No call</p>
-      <p className="mt-2 text-sm text-muted">{note}</p>
-      <p className="mt-2 text-xs text-faint">
-        Once it starts: UP / FLAT / DOWN probabilities, 10–90% range, gap call, drivers, and its live
-        track record against four naive baselines.
-      </p>
-    </div>
-  );
-}
-
 function FlowsCard({ flows }: { flows: Flows }) {
   const latest = flows.days[0];
   const max = Math.max(
@@ -173,7 +168,7 @@ function FlowsCard({ flows }: { flows: Flows }) {
     ...flows.days.flatMap((d) => [Math.abs(d.fii_net_cr ?? 0), Math.abs(d.dii_net_cr ?? 0)]),
   );
   return (
-    <div className="card p-4 lg:col-span-2">
+    <div className="card p-4">
       <div className="mb-3 flex items-center justify-between">
         <h2 className="label">FII / DII cash flows</h2>
         <StatusPill status={flows.status} />

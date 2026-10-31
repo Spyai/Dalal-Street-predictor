@@ -129,6 +129,9 @@ def test_schedule_covers_the_brief() -> None:
     for name, (hh, mm) in expected.items():
         assert specs[name].cron["hour"] == hh and specs[name].cron["minute"] == mm, name
     assert specs["weekly_review"].cron["day_of_week"] == "sat"
+    retrain = specs["weekly_retrain"]
+    assert retrain.cron == {"day_of_week": "sat", "hour": 10, "minute": 0}
+    assert retrain.phase == 2 and not retrain.trading_days_only
     built = {n for n, s in specs.items() if s.fn is not None}
     assert built == {
         "holiday_refresh",
@@ -136,4 +139,21 @@ def test_schedule_covers_the_brief() -> None:
         "global_cues_refresh",
         "instrument_sync",
         "evening_data_pull",
+        "premarket_prediction",
+        "open_check",
+        "close_grading",
+        "weekly_retrain",
     }
+
+
+def test_force_runs_a_trading_days_job_on_a_weekend(db: Session, alerts: list[str]) -> None:
+    called: list[int] = []
+    spec = _spec(lambda ctx: called.append(1) or JobResult("success", "ran"))
+    assert run_job(spec, now=SATURDAY) == "skipped" and not called
+    assert run_job(spec, now=SATURDAY, force=True) == "success" and called == [1]
+    forced = _runs(db, "t")[-1]
+    assert forced.status == "success"
+    assert "ran" in (forced.message or "") and "forced run on a non-trading day" in (
+        forced.message or ""
+    )
+    assert not alerts

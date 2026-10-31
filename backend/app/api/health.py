@@ -1,4 +1,4 @@
-"""Health: last run of every job, data freshness per source, model versions."""
+"""Health: last run of every job, data freshness per source, champion models."""
 
 from __future__ import annotations
 
@@ -14,8 +14,18 @@ from app.cache import HEARTBEAT_KEY, KV
 from app.config import IST, get_settings
 from app.db import get_db
 from app.jobs.definitions import job_specs
-from app.models import AppUser, DailyBar, FiiDiiFlow, GlobalCueSnapshot, Instrument, JobRun
-from app.schemas import FreshnessOut, HealthOut, JobHealthOut, SourceHealthOut
+from app.ml.core import MODEL_NAME, finite, session_for
+from app.models import (
+    AppUser,
+    DailyBar,
+    FiiDiiFlow,
+    GlobalCueSnapshot,
+    Instrument,
+    JobRun,
+    ModelVersion,
+    Prediction,
+)
+from app.schemas import FreshnessOut, HealthOut, JobHealthOut, ModelHealthOut, SourceHealthOut
 from app.services import calendar, flows
 from app.services.calendar import TradingCalendar
 from app.services.source_status import SOURCE_INFO, all_statuses
@@ -130,7 +140,63 @@ def _freshness(db: Session, cal: TradingCalendar) -> list[FreshnessOut]:
             dataset="Global cues (last good fetch)", latest=cues, expected=None, status=cue_status
         )
     )
+
+    # The ledger should hold a call for the session we are in (or heading into) by 07:30 IST.
+    session = session_for(cal, now)
+    last_call = db.scalar(
+        select(func.max(Prediction.session_date)).where(Prediction.kind == MODEL_NAME)
+    )
+    n_calls = db.scalar(
+        select(func.count()).select_from(Prediction).where(Prediction.kind == MODEL_NAME)
+    )
+    f = _fresh("Last market call", last_call, session)
+    f.detail = (
+        "no market call in the ledger yet"
+        if last_call is None
+        else f"{n_calls or 0} ledger record{'s' if (n_calls or 0) != 1 else ''}; "
+        f"latest call is for {last_call}, expected one for {session} by 07:30 IST"
+    )
+    out.append(f)
     return out
+
+
+def _models(db: Session) -> list[ModelHealthOut]:
+    """Every champion in production with its out-of-sample metrics (None when absent)."""
+    champions = db.scalars(
+        select(ModelVersion)
+        .where(ModelVersion.is_champion.is_(True))
+        .order_by(ModelVersion.name, ModelVersion.target)
+    ).all()
+    out: list[ModelHealthOut] = []
+    for mv in champions:
+        metrics: dict[str, object] = dict(mv.metrics or {})
+        n_oos = metrics.get("n_oos")
+        out.append(
+            ModelHealthOut(
+                name=mv.name,
+                target=mv.target,
+                version=mv.version,
+                trained_through=mv.trained_through,
+                oos_brier=finite(metrics.get("brier")),
+                oos_accuracy=finite(metrics.get("accuracy")),
+                n_oos=int(n_oos) if isinstance(n_oos, int | float) else None,
+                promoted_at=mv.promoted_at,
+            )
+        )
+    return out
+
+
+def _models_note(models: list[ModelHealthOut]) -> str:
+    if not models:
+        return (
+            "No champion model yet, so no market call can be made. Train one with "
+            "`python -m app.cli train` (the Saturday retrain then challenges it weekly)."
+        )
+    n = len(models)
+    return (
+        f"{n} champion model{'s' if n != 1 else ''} in production. A challenger replaces a "
+        "champion only when it beats it out of sample in the Saturday retrain."
+    )
 
 
 def _fresh(name: str, latest: object, expected: object) -> FreshnessOut:
@@ -172,6 +238,7 @@ def health(
         for name, info in SOURCE_INFO.items()
     ]
     cal = TradingCalendar.load(db)
+    models = _models(db)
     return HealthOut(
         now=datetime.now(UTC),
         scheduler_mode=mode,
@@ -183,7 +250,7 @@ def health(
         jobs=_jobs(db),
         sources=sources,
         freshness=_freshness(db, cal),
-        models=[],
-        models_note="No models in production. The market model arrives in Phase 2.",
+        models=models,
+        models_note=_models_note(models),
         holiday_coverage=calendar.coverage(db),
     )
