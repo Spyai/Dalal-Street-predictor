@@ -56,3 +56,4 @@ next-env.d.ts
 # Public exchange files may be committed so GitHub Actions can use them (Vercel setup).
 !imports/nse_holidays_*.csv
 !imports/ind_*list.csv
+!imports/README.md
