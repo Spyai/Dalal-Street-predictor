@@ -389,3 +389,134 @@ def test_jobs_use_the_same_cache_backend_as_the_api(
     ).stdout.splitlines()
     assert expected in out
     assert sum(line.startswith("CACHE_BACKEND=") for line in out) == 1
+
+
+# --------------------------------------------------------- vercel_token_check.py
+
+TOKEN = "tok_abcdefghijklmnopqrstuvwxyz0123456789"
+TEAM = "team_test"
+OK: tuple[int, dict[str, Any]] = (200, {})
+
+
+def _not_found(what: str) -> tuple[int, dict[str, Any]]:
+    return 404, {"error": {"code": "not_found", "message": f"{what} not found."}}
+
+
+FORBIDDEN = (403, {"error": {"code": "forbidden", "message": "You are not authorized"}})
+
+
+@pytest.fixture()
+def vercel_api() -> Any:
+    """A local stand-in for api.vercel.com; tests set `routes` (path -> status, body)."""
+    import http.server
+    import threading
+
+    routes: dict[str, tuple[int, dict[str, Any]]] = {}
+    seen: list[str] = []
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            path = self.path.split("?")[0]
+            seen.append(self.headers.get("Authorization", ""))
+            status, body = routes.get(path, (404, {"error": {"code": "not_found"}}))
+            data = json.dumps(body).encode()
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, *args: Any) -> None:
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    yield {"url": f"http://127.0.0.1:{server.server_port}", "routes": routes, "seen": seen}
+    server.shutdown()
+
+
+def _token_check(api: dict[str, Any], tmp_path: Path, token: str = TOKEN) -> tuple[int, str, str]:
+    summary = tmp_path / "summary.md"
+    env = {
+        **os.environ,
+        "VERCEL_API_URL": api["url"],
+        "VERCEL_TOKEN": token,
+        "VERCEL_TEAM_ID": TEAM,
+        "DALAL_API_PROJECT": "dalal-api",
+        "DALAL_WEB_PROJECT": "dalal-web",
+        "GITHUB_STEP_SUMMARY": str(summary),
+    }
+    proc = subprocess.run(
+        [sys.executable, str(SCRIPTS / "vercel_token_check.py")],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    out = proc.stdout + proc.stderr
+    assert TOKEN not in out  # never logged
+    return proc.returncode, out, summary.read_text() if summary.exists() else ""
+
+
+def _routes(user: Any, team: Any, api_project: Any, web_project: Any) -> dict[str, Any]:
+    return {
+        "/v2/user": user,
+        f"/v2/teams/{TEAM}": team,
+        "/v9/projects/dalal-api": api_project,
+        "/v9/projects/dalal-web": web_project,
+    }
+
+
+def test_token_check_passes_a_full_account_token(vercel_api: Any, tmp_path: Path) -> None:
+    vercel_api["routes"].update(_routes(OK, OK, OK, OK))
+    code, out, summary = _token_check(vercel_api, tmp_path)
+    assert code == 0, out
+    assert "VERCEL_TOKEN: ok" in out
+    assert summary == ""
+    assert vercel_api["seen"] and all(h == f"Bearer {TOKEN}" for h in vercel_api["seen"])
+
+
+@pytest.mark.parametrize(
+    ("routes", "expected"),
+    [
+        # What a project-scoped token got on the real API (run 41171365713).
+        (
+            _routes(_not_found("User"), FORBIDDEN, _not_found("Project"), OK),
+            "limited to the project dalal-web",
+        ),
+        (_routes(_not_found("User"), OK, OK, OK), "limited to a team"),
+        (
+            _routes(
+                (403, {"error": {"code": "forbidden", "invalidToken": True}}),
+                FORBIDDEN,
+                FORBIDDEN,
+                FORBIDDEN,
+            ),
+            "invalid, expired or revoked",
+        ),
+        (
+            _routes(OK, FORBIDDEN, _not_found("Project"), _not_found("Project")),
+            "can't reach the Vercel team",
+        ),
+    ],
+)
+def test_token_check_stops_with_the_fix(
+    vercel_api: Any, tmp_path: Path, routes: dict[str, Any], expected: str
+) -> None:
+    vercel_api["routes"].update(routes)
+    code, out, summary = _token_check(vercel_api, tmp_path)
+    assert code == 1, out
+    assert expected in out
+    assert "::error::" in out
+    assert expected in summary
+    if "can't reach the Vercel team" not in expected:
+        assert "Scope: Full Account" in summary
+
+
+def test_token_check_rejects_whitespace_without_calling_vercel(
+    vercel_api: Any, tmp_path: Path
+) -> None:
+    code, out, _ = _token_check(vercel_api, tmp_path, token=TOKEN + "\n")
+    assert code == 1
+    assert "spaces or line breaks" in out
+    assert vercel_api["seen"] == []

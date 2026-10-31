@@ -8,7 +8,9 @@ at ₹0/month. A GitHub Actions workflow does the setup; you add one token.
 1. **Make the repo private** (recommended). On a public repo, GitHub Actions logs are
    readable by anyone. GitHub → repo → Settings → General → Danger Zone → Change visibility.
 2. **Create a Vercel token.** Sign up at <https://vercel.com/signup> (Hobby, free), then
-   **Account Settings → Tokens → Create**. Scope: your account.
+   **Account Settings → Tokens → Create**. **Scope: Full Account**, expiration 1 year. Don't
+   pick a team or a project there: the Vercel CLI first reads the token's user, and team- or
+   project-scoped tokens can't, so the deploy would stop with "User not found".
 3. **Give it to GitHub.** Repo → **Settings → Secrets and variables → Actions → New
    repository secret**. Name: `VERCEL_TOKEN`. Value: the token.
 4. **Run the deploy.** Repo → **Actions → Deploy to Vercel**, open the latest run →
@@ -70,6 +72,7 @@ The workflow stops with a red run and a plain-English message in its Summary.
 | Message | Fix |
 |---|---|
 | "VERCEL_TOKEN isn't set" | Step 3 above |
+| "VERCEL_TOKEN is limited to the project …" / "… to a team" / "User not found" | The token's scope is too narrow. Make a new one with Scope: Full Account (step 2), replace the secret, delete the old token |
 | "Couldn't create Vercel project" | The token expired or has the wrong scope. Make a new one |
 | "Couldn't create or connect the Neon database" | Vercel → `dalal-streetpredictor` → Storage → Create Database → Neon (Free) → Connect, then re-run |
 | "… is stored as Sensitive" | Change that variable to a normal one with the same value. The jobs need to read it |
