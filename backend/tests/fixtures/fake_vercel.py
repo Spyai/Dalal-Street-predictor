@@ -5,7 +5,11 @@ Mirrors the commands, flags and output shapes of Vercel CLI 64.5.0 that the scri
 use, including what it does with --non-interactive (deploy prints a JSON payload) and
 how `env pull` writes Sensitive variables (the "[SENSITIVE]" placeholder).
 
-Failure switches: FAKE_NEON_FAIL=1, FAKE_DEPLOY_FAIL=<project>, FAKE_DOMAINS_FAIL=1,
+Like the real CLI in --non-interactive mode, API errors are printed as JSON on stdout,
+and `integration resource connect` fails if the resource is already connected.
+
+Failure switches: FAKE_NEON_FAIL=1, FAKE_NO_FREE_PLAN=1, FAKE_DEPLOY_FAIL=<project>,
+FAKE_DOMAINS_FAIL=1, FAKE_ENV_ADD_FAIL=<NAME>, FAKE_PULL_FAIL=1 (403 on env pull),
 FAKE_SENSITIVE=KEY1,KEY2 (stored as Sensitive: unreadable in production pulls).
 """
 
@@ -51,6 +55,15 @@ def done(code: int = 0) -> None:
     sys.exit(code)
 
 
+def api_error(reason: str, message: str) -> None:
+    """How the real CLI reports API errors with --non-interactive: JSON on stdout."""
+    print(json.dumps({"status": "error", "reason": reason, "message": message}, indent=2))
+    done(1)
+
+
+FREE_PLAN = "plan_free_123"
+
+
 DB_KEYS = {"DATABASE_URL", "DATABASE_URL_UNPOOLED", "PGPASSWORD"}
 cmd = clean[:2]
 
@@ -71,6 +84,14 @@ if cmd == ["project", "update"]:
 
 if cmd == ["env", "pull"]:
     out = pathlib.Path(clean[2])
+    if not project_file(opt("--project") or "").exists():
+        print(
+            f'Error: Project "{opt("--project")}" was not found in the current scope.',
+            file=sys.stderr,
+        )
+        done(1)
+    if os.environ.get("FAKE_PULL_FAIL"):
+        api_error("forbidden", "Not authorized: Trying to access resource under scope.")
     d = envdir(opt("--project") or "")
     environment = opt("--environment", "development")
     sensitive = set(filter(None, os.environ.get("FAKE_SENSITIVE", "").split(",")))
@@ -91,11 +112,12 @@ if cmd == ["env", "add"]:
     if targets != "production,preview":
         print(f"Error: unexpected targets {targets}", file=sys.stderr)
         done(2)
+    if os.environ.get("FAKE_ENV_ADD_FAIL") == name:
+        api_error("env_add_failed", f"You have reached the maximum number of variables ({name}).")
     d = envdir(project)
     d.mkdir(parents=True, exist_ok=True)
     if (d / name).exists() and "--force" not in clean:
-        print(f"Error: {name} already exists", file=sys.stderr)
-        done(1)
+        api_error("env_already_exists", f"A variable with the name {name} already exists.")
     (d / name).write_text(value)
     done()
 
@@ -103,9 +125,11 @@ if cmd == ["integration", "accept-terms"]:
     done()
 
 if cmd == ["integration", "add"]:
+    (state / "integration-add-cwd").write_text(os.getcwd())
     if os.environ.get("FAKE_NEON_FAIL"):
-        print("Error: plan required", file=sys.stderr)
-        done(1)
+        api_error("action_required", "Complete provisioning in the Vercel dashboard.")
+    if opt("--plan") != FREE_PLAN:
+        api_error("invalid_plan", f"unexpected plan {opt('--plan')}")
     (state / "resources").mkdir(exist_ok=True)
     (state / "resources" / (opt("--name") or "")).touch()
     done()
@@ -113,7 +137,16 @@ if cmd == ["integration", "add"]:
 if cmd == ["integration", "resource"] and clean[2] == "connect":
     resource, project = clean[3], clean[4]
     if not (state / "resources" / resource).exists():
+        print(f"Error: No resource {resource} found.", file=sys.stderr)
         done(1)
+    connected = state / "resources" / f"{resource}.connected-{project}"
+    if connected.exists():
+        print(
+            f"Error: Project {project} is already connected to resource {resource}.",
+            file=sys.stderr,
+        )
+        done(1)
+    connected.touch()
     d = envdir(project)
     d.mkdir(parents=True, exist_ok=True)
     url = os.environ["FAKE_DB_URL"]
@@ -158,6 +191,17 @@ if clean and clean[0] == "deploy":
 if clean and clean[0] == "api":
     if "-X" in clean:
         done()  # PATCH project settings
+    path = clean[1].split("?")[0]
+    if path == "/v2/integrations/integration/neon":
+        products = [{"id": "iap_neon", "slug": "neon", "name": "Neon"}]
+        print(json.dumps({"id": "oac_neon", "slug": "neon", "products": products}))
+        done()
+    if path == "/v1/integrations/integration/oac_neon/products/iap_neon/plans":
+        plans = [{"id": "plan_launch", "name": "Launch", "cost": "$19/month"}]
+        if not os.environ.get("FAKE_NO_FREE_PLAN"):
+            plans.append({"id": FREE_PLAN, "name": "Free", "cost": "$0"})
+        print(json.dumps({"plans": plans}))
+        done()
     if os.environ.get("FAKE_DOMAINS_FAIL"):
         print("Error: request failed", file=sys.stderr)
         done(1)

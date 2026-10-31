@@ -31,6 +31,16 @@ trap 'rm -rf "$WORK"' EXIT
 : "${VERCEL_TOKEN:?VERCEL_TOKEN is not set}"
 
 vc() { vercel --token "$VERCEL_TOKEN" --non-interactive ${VERCEL_SCOPE:+--scope "$VERCEL_SCOPE"} "$@"; }
+# vc_logged NAME ARGS...: vc with its output kept in $WORK/NAME.log and shown only on
+# failure. With --non-interactive the CLI reports most errors as JSON on stdout, so
+# discarding stdout would hide why a command failed.
+vc_logged() {
+  local log="$WORK/$1.log" status=0
+  shift
+  vc "$@" >"$log" 2>&1 || status=$?
+  [ "$status" = 0 ] || cat "$log" >&2
+  return "$status"
+}
 py() { python3 "$HERE/vercel_env.py" "$@"; }
 step() { echo; echo "== $*"; }
 fail() {
@@ -43,7 +53,7 @@ fail() {
 # Sensitive can't be pulled for production; the development environment (which the
 # Neon integration also connects) is used for those instead.
 pull_api_env() {
-  vc env pull "$WORK/api.env" --environment production --project "$API" --yes >/dev/null \
+  vc_logged env-pull env pull "$WORK/api.env" --environment production --project "$API" --yes \
     || fail "Couldn't read environment variables of Vercel project $API."
   if vc env pull "$WORK/api-dev.env" --environment development --project "$API" --yes \
     >/dev/null 2>&1; then
@@ -57,8 +67,8 @@ pull_api_env() {
 set_var() {
   local name=$1 value=$2 project=$3
   shift 3
-  vc env add "$name" "$TARGETS" --value "$value" --project "$project" --no-sensitive --yes "$@" \
-    >/dev/null || fail "Couldn't set $name on Vercel project $project."
+  vc_logged "env-add-$name" env add "$name" "$TARGETS" --value "$value" --project "$project" \
+    --no-sensitive --yes "$@" || fail "Couldn't set $name on Vercel project $project."
 }
 
 ensure_project() {
@@ -109,6 +119,38 @@ prod_url() {
   fi
 }
 
+MANUAL_DB="In Vercel, open $API → Storage → Create Database → Neon, choose the Free plan, Connect, then re-run this workflow."
+
+# create_neon: a Neon Postgres database named $DB_NAME on Neon's free plan, asked for
+# by id. Without --plan Vercel picks the integration's default plan, and Dalal never
+# creates anything that costs money without asking.
+create_neon() {
+  local ids plan iid pid target
+  if ! vc api /v2/integrations/integration/neon --raw >"$WORK/neon.json" 2>"$WORK/neon.err" \
+    || ! ids=$(py neon-product <"$WORK/neon.json"); then
+    cat "$WORK/neon.err" >&2
+    fail "Couldn't look up the Neon integration on Vercel. $MANUAL_DB"
+  fi
+  read -r iid pid target <<<"$ids"
+  vc api "/v1/integrations/integration/$iid/products/$pid/plans?metadata=%7B%7D" --raw \
+    >"$WORK/plans.json" 2>"$WORK/plans.err" \
+    || { cat "$WORK/plans.err" >&2; fail "Couldn't list Neon's billing plans. $MANUAL_DB"; }
+  plan=$(py free-plan <"$WORK/plans.json") \
+    || fail "Neon offers no free plan to this account, and Dalal won't create a paid database. $MANUAL_DB"
+  echo "Neon plan: free ($plan)"
+  vc integration accept-terms neon --yes >/dev/null 2>&1 || true
+  # From a scratch directory: `integration add` may install agent skill files into the
+  # current directory, and the repo root is what gets deployed.
+  (cd "$WORK" && vc_logged neon-add integration add "$target" --name "$DB_NAME" --plan "$plan" \
+    --no-connect --no-env-pull) \
+    || echo "::warning::'integration add' failed; $DB_NAME may already exist. Trying to connect it."
+  if ! vc_logged neon-connect integration resource connect "$DB_NAME" "$API" --yes; then
+    grep -qi "already connected" "$WORK/neon-connect.log" \
+      && fail "$DB_NAME is already connected to $API, but no DATABASE_URL reached $API (an env-var prefix?). In Vercel → $API → Storage, disconnect $DB_NAME, then re-run this workflow."
+    fail "Couldn't create or connect the Neon database automatically. $MANUAL_DB"
+  fi
+}
+
 step "Projects"
 ensure_project "$API"
 ensure_project "$WEB"
@@ -122,13 +164,7 @@ if ! py get "$WORK/api.env" DATABASE_URL POSTGRES_URL >/dev/null; then
     fail "$API has a database, but its URL is stored as Sensitive, so this workflow can't run migrations. In Vercel → $API → Settings → Environment Variables, make DATABASE_URL non-sensitive (or re-add it), then re-run."
   fi
   echo "No database on $API yet; creating a free Neon Postgres database ($DB_NAME)."
-  vc integration accept-terms neon --yes >/dev/null 2>&1 || true
-  vc integration add neon --name "$DB_NAME" --no-connect --no-env-pull \
-    || echo "::warning::'integration add' failed; it may already exist. Trying to connect it."
-  if ! vc integration resource connect "$DB_NAME" "$API" --yes; then
-    vc integration add neon --help || true
-    fail "Couldn't create or connect the Neon database automatically. In Vercel, open $API → Storage → Create Database → Neon (Free plan) → Connect, then re-run this workflow."
-  fi
+  create_neon
   pull_api_env
   py get "$WORK/api.env" DATABASE_URL POSTGRES_URL >/dev/null \
     || fail "Neon was connected but no readable DATABASE_URL reached $API. Check $API → Storage in Vercel, then re-run."

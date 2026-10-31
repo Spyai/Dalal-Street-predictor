@@ -23,8 +23,15 @@ not_configured() {
 if [ -n "${VERCEL_TOKEN:-}" ]; then
   command -v vercel >/dev/null || npm install -g --silent --no-audit --no-fund "vercel@${VERCEL_CLI_VERSION:-64.5.0}" >/dev/null
   vc() { vercel --token "$VERCEL_TOKEN" --non-interactive ${VERCEL_SCOPE:+--scope "$VERCEL_SCOPE"} "$@"; }
-  vc env pull "$WORK/api.env" --environment production --project "$API" --yes >/dev/null \
-    || not_configured "Couldn't read settings from Vercel project $API. Run the 'Deploy to Vercel' workflow first."
+  if ! vc env pull "$WORK/api.env" --environment production --project "$API" --yes \
+    >"$WORK/pull.log" 2>&1; then
+    grep -qi "not found" "$WORK/pull.log" \
+      && not_configured "Vercel project $API doesn't exist yet. Run the 'Deploy to Vercel' workflow first."
+    # Anything else (expired token, no access) must turn the run red, not skip it.
+    cat "$WORK/pull.log" >&2
+    echo "::error::Couldn't read settings from Vercel project $API; see the error above."
+    exit 1
+  fi
   # Sensitive database URLs can't be pulled for production; use development's (same DB).
   if vc env pull "$WORK/api-dev.env" --environment development --project "$API" --yes \
     >/dev/null 2>&1; then

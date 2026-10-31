@@ -31,7 +31,7 @@ at ₹0/month. A GitHub Actions workflow does the setup; you add one token.
 | Step | First run | Later runs |
 |---|---|---|
 | Projects | uses `dalal-street-predictor` for the web app (`frontend/`) and `dalal-streetpredictor` for the API (`backend/`), the two projects already imported from this repo, creating them if missing; sets each one's Root Directory so Vercel's own Git builds match | same |
-| Database | creates a free Neon Postgres (`dalal-db`) and connects it to the API project | reuses it |
+| Database | creates a Neon Postgres (`dalal-db`) on Neon's **Free** plan, asked for by id, and connects it to the API project; stops instead if no free plan is offered | reuses it |
 | Secrets | generates `SECRET_KEY` and `SETUP_TOKEN`, stored only in Vercel | never rotates them |
 | Migrations | runs `app.cli migrate` | same |
 | Deploy | API in the Vercel region next to the database, then the web app pointed at it | same |
@@ -74,7 +74,8 @@ The workflow stops with a red run and a plain-English message in its Summary.
 | "VERCEL_TOKEN isn't set" | Step 3 above |
 | "VERCEL_TOKEN is limited to the project …" / "… to a team" / "User not found" | The token's scope is too narrow. Make a new one with Scope: Full Account (step 2), replace the secret, delete the old token |
 | "Couldn't create Vercel project" | The token expired or has the wrong scope. Make a new one |
-| "Couldn't create or connect the Neon database" | Vercel → `dalal-streetpredictor` → Storage → Create Database → Neon (Free) → Connect, then re-run |
+| "Couldn't create or connect the Neon database" / "won't create a paid database" | Vercel → `dalal-streetpredictor` → Storage → Create Database → Neon, choose the Free plan → Connect, then re-run |
+| "… is already connected to dalal-streetpredictor, but no DATABASE_URL reached it" | The database was connected with an env-var prefix. Vercel → `dalal-streetpredictor` → Storage → disconnect it, then re-run |
 | "… is stored as Sensitive" | Change that variable to a normal one with the same value. The jobs need to read it |
 | "/healthz didn't answer" | Vercel → `dalal-streetpredictor` → Logs shows the error |
 | Login page says "Can't reach the API" | Re-run the deploy; `BACKEND_URL` on `dalal-street-predictor` must point at the API project |

@@ -13,6 +13,10 @@ without evaluating them in a shell, so values containing $ or quotes are safe.
                                           print https://<production domain>
   vercel_env.py deploy FILE               read `vercel deploy` JSON output: print the
                                           production URL, or the error and exit 1
+  vercel_env.py neon-product < integration.json
+                                          print "<integration id> <product id> <add target>"
+  vercel_env.py free-plan < plans.json    print the id of the free billing plan; exit 1
+                                          if there is none (never pick a paid one)
 
 `vercel env pull` writes the placeholder "[SENSITIVE]" for variables stored as
 Sensitive; those are treated as present but unreadable, never as real values.
@@ -24,6 +28,7 @@ import json
 import re
 import sys
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlsplit
 
 SECRETISH = re.compile(
@@ -95,13 +100,16 @@ def parse(path: str) -> dict[str, str]:
         if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
             quote, value = value[0], value[1:-1]
             if quote == '"':
-                value = (
-                    value.replace("\\n", "\n")
-                    .replace('\\"', '"')
-                    .replace("\\\\", "\\")
-                )
+                # The CLI escapes only line breaks (escapeValue in vercel's env pull);
+                # quotes and backslashes are written as they are.
+                value = value.replace("\\n", "\n").replace("\\r", "\r")
         out[key] = value
     return out
+
+
+def quoted(value: str) -> str:
+    """A value written the way `vercel env pull` writes it, so parse() reads it back."""
+    return '"' + value.replace("\n", "\\n").replace("\r", "\\r") + '"'
 
 
 def readable(env: dict[str, str], key: str) -> str | None:
@@ -168,6 +176,36 @@ def deploy_result(text: str) -> tuple[str | None, str]:
     return deployment.get("productionUrl") or None, message
 
 
+def dicts(value: object) -> list[dict[str, Any]]:
+    return [v for v in value if isinstance(v, dict)] if isinstance(value, list) else []
+
+
+def neon_product(integration: dict[str, Any]) -> tuple[str, str, str] | None:
+    """(integration id, product id, `integration add` target) for Neon's Postgres product."""
+    products = dicts(integration.get("products"))
+    if not integration.get("id") or not products:
+        return None
+    postgres = [p for p in products if "postgres" in f"{p.get('slug')} {p.get('name')}".lower()]
+    product = (postgres or products)[0]
+    slug = str(integration.get("slug") or "neon")
+    target = slug if len(products) == 1 else f"{slug}/{product.get('slug')}"
+    return str(integration["id"]), str(product.get("id")), target
+
+
+FREE = re.compile(r"\bfree\b", re.I)
+ZERO_COST = re.compile(r"^\s*(free|\$?0+(\.0+)?)\b", re.I)
+
+
+def free_plan(payload: dict[str, Any]) -> str | None:
+    """The id of the free billing plan. Dalal never creates anything that costs money."""
+    plans = [p for p in dicts(payload.get("plans")) if not p.get("disabled")]
+    for plan in plans:
+        cost = str(plan.get("cost") or "")
+        if FREE.search(str(plan.get("name") or "")) and (not cost or ZERO_COST.match(cost)):
+            return str(plan["id"])
+    return None
+
+
 def main(argv: list[str]) -> int:
     if len(argv) < 2:
         print(__doc__, file=sys.stderr)
@@ -179,6 +217,18 @@ def main(argv: list[str]) -> int:
             print(message, file=sys.stderr)
             return 1
         print(url)
+        return 0
+    if cmd == "neon-product":
+        found_product = neon_product(json.load(sys.stdin))
+        if not found_product:
+            return 1
+        print(" ".join(found_product))
+        return 0
+    if cmd == "free-plan":
+        plan = free_plan(json.load(sys.stdin))
+        if not plan:
+            return 1
+        print(plan)
         return 0
     if cmd == "domain":
         found = production_domain(json.load(sys.stdin))
@@ -201,7 +251,7 @@ def main(argv: list[str]) -> int:
         if filled:
             with Path(argv[2]).open("a", encoding="utf-8") as fh:
                 for k in filled:
-                    fh.write(f"{k}={json.dumps(fallback[k])}\n")
+                    fh.write(f"{k}={quoted(fallback[k])}\n")
             print(f"read {', '.join(filled)} from the development environment", file=sys.stderr)
         return 0
     if cmd == "mask":

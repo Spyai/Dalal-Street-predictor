@@ -37,17 +37,63 @@ def _helper() -> Any:
 
 
 def test_parse_env_pull_file_without_shell_evaluation(tmp_path: Path) -> None:
+    # Written the way `vercel env pull` writes it: only \n and \r are escaped.
     f = tmp_path / ".env"
     f.write_text(
-        '# Created by Vercel CLI\nA="plain"\nB="has $(rm -rf /) and \\"quotes\\""\n'
-        'C=unquoted\nD="multi\\nline"\nEMPTY=""\n'
+        '# Created by Vercel CLI\nA="plain"\nB="has $(rm -rf /) and "quotes""\n'
+        'C=unquoted\nD="multi\\nline\\r"\nE="back\\slash \\\\ kept"\nEMPTY=""\n'
     )
     env = _helper().parse(str(f))
     assert env["A"] == "plain"
     assert env["B"] == 'has $(rm -rf /) and "quotes"'
     assert env["C"] == "unquoted"
-    assert env["D"] == "multi\nline"
+    assert env["D"] == "multi\nline\r"
+    assert env["E"] == "back\\slash \\\\ kept"
     assert env["EMPTY"] == ""
+
+
+def test_values_round_trip_through_the_pull_format(tmp_path: Path) -> None:
+    h = _helper()
+    value = 'p@ss\\w"rd $HOME\nline'
+    f = tmp_path / ".env"
+    f.write_text(f"K={h.quoted(value)}\n")
+    assert h.parse(str(f))["K"] == value
+
+
+def test_neon_free_plan_is_picked_and_paid_plans_never_are() -> None:
+    h = _helper()
+    plans = {
+        "plans": [
+            {"id": "p_launch", "name": "Launch", "cost": "$19/month"},
+            {"id": "p_free_off", "name": "Free", "cost": "$0", "disabled": True},
+            {"id": "p_free", "name": "Free", "cost": "$0"},
+        ]
+    }
+    assert h.free_plan(plans) == "p_free"
+    assert h.free_plan({"plans": [{"id": "x", "name": "Free trial", "cost": "$5/month"}]}) is None
+    assert h.free_plan({"plans": [{"id": "x", "name": "Scale"}]}) is None
+    assert h.free_plan({"error": {"code": "forbidden"}}) is None
+    one = {"id": "oac_1", "slug": "neon", "products": [{"id": "iap_1", "slug": "neon"}]}
+    assert h.neon_product(one) == ("oac_1", "iap_1", "neon")
+    two = {
+        "id": "oac_1",
+        "slug": "neon",
+        "products": [{"id": "iap_a", "slug": "auth"}, {"id": "iap_pg", "slug": "postgres"}],
+    }
+    assert h.neon_product(two) == ("oac_1", "iap_pg", "neon/postgres")
+
+
+def test_root_vercelignore_covers_backend_vercelignore() -> None:
+    """The CLI deploys from the repo root and reads only /.vercelignore."""
+    root = {
+        line.strip()
+        for line in (REPO / ".vercelignore").read_text().splitlines()
+        if line.strip() and not line.startswith("#")
+    }
+    for line in (REPO / "backend" / ".vercelignore").read_text().splitlines():
+        entry = line.strip()
+        if entry and not entry.startswith("#"):
+            assert entry in root or f"backend/{entry}" in root, entry
 
 
 @pytest.mark.parametrize(
@@ -181,7 +227,9 @@ def test_first_deploy_creates_everything_then_redeploy_is_idempotent(
     )
     deploys = [c for c in calls if " deploy " in f" {c} "]
     assert deploys and all(f"deploy {REPO} --prod" in c for c in deploys), "deploy from repo root"
-    assert any("integration add neon --name dalal-db" in c for c in calls)
+    # Neon's free plan, asked for by id; run outside the repo, which gets deployed.
+    assert any("integration add neon --name dalal-db --plan plan_free_123" in c for c in calls)
+    assert Path(fake_cli["FAKE_STATE"], "integration-add-cwd").read_text() != str(REPO)
     assert any("integration resource connect dalal-db dalal-api --yes" in c for c in calls)
     secret = _var(fake_cli, "dalal-api", "SECRET_KEY")
     assert len(secret) == 64
@@ -220,6 +268,32 @@ def test_deploy_stops_with_instructions_when_neon_cannot_be_created(
     assert not any(" deploy " in c for c in _calls(fake_cli)), "nothing deployed without a DB"
 
 
+def test_deploy_never_creates_a_paid_database(fake_cli: dict[str, str]) -> None:
+    res = _deploy({**fake_cli, "FAKE_NO_FREE_PLAN": "1"})
+    assert res.returncode == 1
+    assert "won't create a paid database" in res.stdout
+    assert "Free plan" in Path(fake_cli["GITHUB_STEP_SUMMARY"]).read_text()
+    assert not any("integration add" in c for c in _calls(fake_cli))
+
+
+def test_already_connected_database_without_url_explains_itself(fake_cli: dict[str, str]) -> None:
+    state = Path(fake_cli["FAKE_STATE"], "resources")
+    state.mkdir(parents=True)
+    (state / "dalal-db").touch()
+    (state / "dalal-db.connected-dalal-api").touch()  # connected, but no variables
+    res = _deploy(fake_cli)
+    assert res.returncode == 1
+    assert "already connected to dalal-api" in res.stdout
+    assert "disconnect dalal-db" in res.stdout
+
+
+def test_cli_errors_reported_on_stdout_reach_the_log(fake_cli: dict[str, str]) -> None:
+    res = _deploy({**fake_cli, "FAKE_ENV_ADD_FAIL": "SCHEDULER_MODE"})
+    assert res.returncode == 1
+    assert "Couldn't set SCHEDULER_MODE" in res.stdout
+    assert "maximum number of variables (SCHEDULER_MODE)" in res.stderr
+
+
 def test_deploy_requires_token(fake_cli: dict[str, str]) -> None:
     env = {k: v for k, v in fake_cli.items() if k != "VERCEL_TOKEN"}
     res = _deploy(env)
@@ -244,6 +318,16 @@ def test_jobs_skip_quietly_until_deployed(fake_cli: dict[str, str]) -> None:
     no_token = {k: v for k, v in fake_cli.items() if k != "VERCEL_TOKEN"}
     res, _, out = _jobs_env(no_token)
     assert res.returncode == 0 and "configured=false" in out
+
+
+def test_jobs_go_red_when_vercel_refuses_the_token(
+    migrated_db: None, fake_cli: dict[str, str]
+) -> None:
+    assert _deploy(fake_cli).returncode == 0
+    res, _, out = _jobs_env({**fake_cli, "FAKE_PULL_FAIL": "1"})
+    assert res.returncode == 1, "an API error must not look like 'not deployed yet'"
+    assert "configured=false" not in out
+    assert "Not authorized" in res.stderr
 
 
 def test_jobs_load_settings_from_vercel(migrated_db: None, fake_cli: dict[str, str]) -> None:

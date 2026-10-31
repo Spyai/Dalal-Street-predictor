@@ -1,0 +1,24 @@
+# The deploy workflow uploads the whole repo (`vercel deploy` from the root, so each
+# project's Root Directory applies), and the CLI reads only this ignore file.
+# Mirrors backend/.vercelignore, which Vercel's own Git builds use; a test keeps the
+# two in step. Without it the API would be built from backend/pyproject.toml instead
+# of backend/requirements.txt.
+backend/.venv
+**/__pycache__
+backend/.pytest_cache
+backend/.mypy_cache
+backend/.ruff_cache
+backend/tests
+backend/alembic
+backend/alembic.ini
+backend/pyproject.toml
+backend/Dockerfile
+# Left behind by `pip install ./backend` in the workflow.
+backend/build
+backend/*.egg-info
+# Local secrets and data never leave the machine.
+.env
+.env.*
+!.env.example
+/data
+/imports

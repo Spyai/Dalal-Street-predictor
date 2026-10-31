@@ -85,7 +85,7 @@ backend/
   app/security/    argon2 + TOTP auth, Fernet encryption for stored secrets
   alembic/         migrations (daily_bar and intraday_bar are hypertables)
   api/index.py      Vercel entrypoint (vercel.json, requirements.txt)
-  tests/           163 tests (4 skip until real fixtures are recorded): adapters, lookahead
+  tests/           170 tests (4 skip until real fixtures are recorded): adapters, lookahead
                    safety, calendar, auth, KV store (Redis vs Postgres), job runner, API,
                    deploy scripts
 frontend/          Next.js App Router + Tailwind + lightweight-charts (dark by default)
