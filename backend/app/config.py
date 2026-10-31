@@ -91,6 +91,28 @@ class Settings(BaseSettings):
     risk_per_trade_pct: float = 1.0
     min_sample_size: int = 100
 
+    # Stock ideas (Phase 3). Horizons are volatility-scaled (ATR multiples); costs are the
+    # round-trip delivery cost model used to rank ideas by expected value after costs.
+    ideas_max_per_horizon: int = 3  # brief §1: 0-3 high-conviction ideas, never 10 weak ones
+    ideas_min_p_target: float = 0.55  # P(target before stop) below this = not an idea
+    ideas_min_ev_pct: float = 0.5  # expected value after costs (%) below this = not an idea
+    ideas_universe_min_bars: int = 250  # a stock needs this much history to be considered
+    drivers_top_n: int = 8  # drivers shown per call/idea; the full list is one click away
+    swing_horizon_days: int = 10
+    swing_target_atr: float = 2.0
+    swing_stop_atr: float = 1.0
+    positional_horizon_days: int = 60
+    positional_target_atr: float = 4.0
+    positional_stop_atr: float = 2.0
+    brokerage_pct: float = 0.03  # per side, % of trade value (discount broker, delivery)
+    stt_delivery_pct: float = 0.1  # per side on delivery (buy and sell)
+    exchange_txn_pct: float = 0.00345  # NSE transaction charge per side
+    gst_pct: float = 18.0  # on brokerage + exchange charges
+    stamp_duty_pct: float = 0.015  # buy side only
+    sebi_fee_pct: float = 0.0001  # per side
+    slippage_pct: float = 0.1  # per side, assumed
+    paper_max_position_pct: float = 10.0  # one idea may not exceed this share of paper capital
+
     # One-time first-user setup through the web UI (/setup?token=...). Empty = disabled.
     setup_token: str = ""
 

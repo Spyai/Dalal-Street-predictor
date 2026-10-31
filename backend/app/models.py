@@ -309,3 +309,122 @@ class PredictionGrade(Base):
     error_category: Mapped[str | None] = mapped_column(String(32))  # Phase 4
     notes: Mapped[str | None] = mapped_column(Text)
     source: Mapped[str] = mapped_column(String(32))
+
+
+# --------------------------------------------------------------------- Phase 3
+
+
+class Idea(Base):
+    """One immutable stock-idea record (brief §4.2, §5): its own hash chain ("idea"), the
+    same append-only trigger as `prediction`. Outcomes live in `idea_outcome`."""
+
+    __tablename__ = "idea"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    seq: Mapped[int] = mapped_column(Integer, unique=True)
+    as_of: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    session_date: Mapped[date] = mapped_column(Date, index=True)  # first session to enter
+    is_late: Mapped[bool] = mapped_column(Boolean, default=False)
+    instrument_id: Mapped[int] = mapped_column(ForeignKey("instrument.id"), index=True)
+    symbol: Mapped[str] = mapped_column(String(64), index=True)
+    exchange: Mapped[str] = mapped_column(String(16))
+    horizon: Mapped[str] = mapped_column(String(16))  # swing | positional
+    horizon_days: Mapped[int] = mapped_column(Integer)
+    setup: Mapped[str] = mapped_column(String(32))  # breakout | momentum | mean_reversion | ...
+    direction: Mapped[str] = mapped_column(String(8), default="long")
+    entry_low: Mapped[float] = mapped_column(Float)
+    entry_high: Mapped[float] = mapped_column(Float)
+    stop: Mapped[float] = mapped_column(Float)
+    target_1: Mapped[float] = mapped_column(Float)
+    target_2: Mapped[float | None] = mapped_column(Float)
+    p_target: Mapped[float] = mapped_column(Float)  # P(target_1 before stop within horizon)
+    expected_return_low_pct: Mapped[float] = mapped_column(Float)
+    expected_return_high_pct: Mapped[float] = mapped_column(Float)
+    risk_reward: Mapped[float] = mapped_column(Float)
+    ev_pct_after_costs: Mapped[float] = mapped_column(Float)
+    position_qty: Mapped[int] = mapped_column(Integer)
+    position_value: Mapped[float] = mapped_column(Float)
+    risk_amount: Mapped[float] = mapped_column(Float)
+    reasons: Mapped[list] = mapped_column(JSON)
+    invalidation: Mapped[str] = mapped_column(Text)
+    drivers: Mapped[list] = mapped_column(JSON)
+    feature_snapshot: Mapped[dict] = mapped_column(JSON)
+    model_version_id: Mapped[int | None] = mapped_column(ForeignKey("model_version.id"))
+    strategy: Mapped[str] = mapped_column(String(32))
+    rank: Mapped[int] = mapped_column(Integer)
+    surveillance_unknown: Mapped[bool] = mapped_column(Boolean, default=True)
+    corrects_idea_id: Mapped[int | None] = mapped_column(ForeignKey("idea.id"))
+    note: Mapped[str | None] = mapped_column(Text)
+    prev_hash: Mapped[str] = mapped_column(String(64))
+    hash: Mapped[str] = mapped_column(String(64), unique=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+
+class IdeaOutcome(Base):
+    """What happened to an idea (mutable; one row per idea). Statuses: pending (not yet
+    entered), open, target, stop, expired, invalidated (gapped past the zone), void."""
+
+    __tablename__ = "idea_outcome"
+    __table_args__ = (UniqueConstraint("idea_id", name="uq_idea_outcome_idea"),)
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    idea_id: Mapped[int] = mapped_column(ForeignKey("idea.id"), index=True)
+    status: Mapped[str] = mapped_column(String(16), index=True)
+    entry_date: Mapped[date | None] = mapped_column(Date)
+    entry_price: Mapped[float | None] = mapped_column(Float)
+    exit_date: Mapped[date | None] = mapped_column(Date)
+    exit_price: Mapped[float | None] = mapped_column(Float)
+    gross_return_pct: Mapped[float | None] = mapped_column(Float)
+    costs_pct: Mapped[float | None] = mapped_column(Float)
+    net_return_pct: Mapped[float | None] = mapped_column(Float)
+    r_multiple: Mapped[float | None] = mapped_column(Float)
+    days_held: Mapped[int | None] = mapped_column(Integer)
+    max_favorable_pct: Mapped[float | None] = mapped_column(Float)
+    max_adverse_pct: Mapped[float | None] = mapped_column(Float)
+    graded_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    source: Mapped[str] = mapped_column(String(32))
+    notes: Mapped[str | None] = mapped_column(Text)
+    error_category: Mapped[str | None] = mapped_column(String(32))  # Phase 4
+
+
+class PaperTrade(Base):
+    """A simulated position with costs (brief §7.10). Auto-opened from ideas; manual ones
+    have idea_id NULL. Never a real order."""
+
+    __tablename__ = "paper_trade"
+
+    id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    idea_id: Mapped[int | None] = mapped_column(ForeignKey("idea.id"), index=True)
+    symbol: Mapped[str] = mapped_column(String(64), index=True)
+    exchange: Mapped[str] = mapped_column(String(16))
+    side: Mapped[str] = mapped_column(String(8), default="buy")
+    qty: Mapped[int] = mapped_column(Integer)
+    entry_date: Mapped[date] = mapped_column(Date)
+    entry_price: Mapped[float] = mapped_column(Float)
+    stop: Mapped[float | None] = mapped_column(Float)
+    target: Mapped[float | None] = mapped_column(Float)
+    exit_date: Mapped[date | None] = mapped_column(Date)
+    exit_price: Mapped[float | None] = mapped_column(Float)
+    status: Mapped[str] = mapped_column(String(8), default="open", index=True)
+    gross_pnl: Mapped[float | None] = mapped_column(Float)
+    costs: Mapped[float | None] = mapped_column(Float)
+    net_pnl: Mapped[float | None] = mapped_column(Float)
+    r_multiple: Mapped[float | None] = mapped_column(Float)
+    note: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class PaperEquity(Base):
+    """Daily paper-portfolio snapshot for the equity curve. `nifty_close` is the Nifty 50
+    price index (the total-return index is not available free; the UI says so)."""
+
+    __tablename__ = "paper_equity"
+
+    trade_date: Mapped[date] = mapped_column(Date, primary_key=True)
+    equity: Mapped[float] = mapped_column(Float)
+    cash: Mapped[float] = mapped_column(Float)
+    invested: Mapped[float] = mapped_column(Float)
+    open_positions: Mapped[int] = mapped_column(Integer)
+    nifty_close: Mapped[float | None] = mapped_column(Float)
+    source: Mapped[str] = mapped_column(String(32))

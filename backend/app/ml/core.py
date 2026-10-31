@@ -220,3 +220,118 @@ class TrainResult:
     metrics: WalkForwardMetrics
     trained_through: date
     train_rows: int
+
+
+# --------------------------------------------------------------------- Phase 3
+
+
+@dataclass(frozen=True)
+class HorizonSpec:
+    """A stock-idea horizon (brief §4.2), volatility-scaled: target and stop are ATR(14)
+    multiples of the entry price; the idea expires after `days` sessions."""
+
+    name: str
+    days: int
+    target_atr: float
+    stop_atr: float
+
+
+def horizons(settings: Settings | None = None) -> dict[str, HorizonSpec]:
+    s = settings or get_settings()
+    return {
+        "swing": HorizonSpec("swing", s.swing_horizon_days, s.swing_target_atr, s.swing_stop_atr),
+        "positional": HorizonSpec(
+            "positional",
+            s.positional_horizon_days,
+            s.positional_target_atr,
+            s.positional_stop_atr,
+        ),
+    }
+
+
+IDEA_STATUSES: tuple[str, ...] = (
+    "pending",
+    "open",
+    "target",
+    "stop",
+    "expired",
+    "invalidated",
+    "void",
+)
+
+
+@dataclass(frozen=True)
+class CostModel:
+    """Round-trip delivery costs, % of trade value (brief §4.2: configurable)."""
+
+    brokerage_pct: float
+    stt_delivery_pct: float
+    exchange_txn_pct: float
+    gst_pct: float
+    stamp_duty_pct: float
+    sebi_fee_pct: float
+    slippage_pct: float
+
+    @classmethod
+    def from_settings(cls, settings: Settings | None = None) -> CostModel:
+        s = settings or get_settings()
+        return cls(
+            brokerage_pct=s.brokerage_pct,
+            stt_delivery_pct=s.stt_delivery_pct,
+            exchange_txn_pct=s.exchange_txn_pct,
+            gst_pct=s.gst_pct,
+            stamp_duty_pct=s.stamp_duty_pct,
+            sebi_fee_pct=s.sebi_fee_pct,
+            slippage_pct=s.slippage_pct,
+        )
+
+    def round_trip_pct(self) -> float:
+        """Total cost of buying and selling, as % of the entry value (both sides)."""
+        per_side = self.brokerage_pct + self.exchange_txn_pct + self.sebi_fee_pct
+        gst = (self.brokerage_pct + self.exchange_txn_pct) * self.gst_pct / 100.0
+        per_side += gst + self.stt_delivery_pct + self.slippage_pct
+        return 2.0 * per_side + self.stamp_duty_pct
+
+
+@dataclass(frozen=True)
+class IdeaOutput:
+    """What the ideas engine says about one stock for one horizon, before ranking/sizing."""
+
+    symbol: str
+    exchange: str
+    horizon: str
+    horizon_days: int
+    setup: str
+    strategy: str
+    entry_low: float
+    entry_high: float
+    stop: float
+    target_1: float
+    target_2: float | None
+    p_target: float
+    expected_return_low_pct: float
+    expected_return_high_pct: float
+    risk_reward: float
+    ev_pct_after_costs: float
+    reasons: list[str]
+    invalidation: str
+    drivers: list[Driver]
+
+
+@dataclass(frozen=True)
+class IdeaRecordIn:
+    """Everything the idea ledger needs (app.services.ledger.record_idea)."""
+
+    session_date: date
+    as_of: datetime
+    instrument_id: int
+    output: IdeaOutput
+    position_qty: int
+    position_value: float
+    risk_amount: float
+    rank: int
+    feature_snapshot: FeatureRow
+    model_version_id: int | None
+    surveillance_unknown: bool = True
+    corrects_idea_id: int | None = None
+    note: str | None = None
