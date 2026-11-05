@@ -130,6 +130,11 @@ FEATURE_LABELS: dict[str, str] = {**STOCK_FEATURE_LABELS, **MARKET_CONTEXT_LABEL
 FEATURE_NAMES: list[str] = list(FEATURE_LABELS)
 # Not features: identity, price and the point-in-time universe verdict of each row.
 META_COLUMNS: tuple[str, ...] = ("instrument_id", "close", "n_bars", "eligible")
+# The label definition `triple_barrier_labels` implements, stored in every ideas model's
+# artifact. Bump it whenever the labelled event changes (anchor, zone, tie rule, window):
+# a champion trained on another definition is then replaced on the next training run
+# whatever its metrics say, because its out-of-sample numbers describe a different event.
+LABEL_VERSION = "2026-11-05.close-anchored.entry-zone.stop-wins-ties"
 # `triple_barrier_labels` output, in order.
 LABEL_COLUMNS: tuple[str, ...] = (
     "entry_session",

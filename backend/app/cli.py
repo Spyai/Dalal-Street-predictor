@@ -389,6 +389,9 @@ def cmd_train_ideas(args: argparse.Namespace) -> int:
                 continue
             champ = ideas_models.ideas_champion(db, h, s)
             promote, reason = model_registry.should_promote(champ, result, s)
+            relabelled = ideas_models.label_change_reason(champ)
+            if relabelled is not None and not promote:
+                promote, reason = True, relabelled
             if args.promote_always and not promote:
                 promote, reason = True, f"--promote-always ({reason})"
             mv = ideas_models.save_ideas_model(db, result, promote=promote, note=reason, settings=s)
@@ -442,7 +445,7 @@ def cmd_train_ideas(args: argparse.Namespace) -> int:
                     for r in lift
                     if isinstance(r, dict)
                 )
-                print(f"  hit rate by P(target) decile (1 = lowest): {cells}")
+                print(f"  hit rate by P(target) decile within each session (1 = lowest): {cells}")
             print(
                 f"  chosen out of sample: {result.params.get('n_estimators')} rounds, "
                 f"shrink {result.params.get('shrink')} towards the base rate"

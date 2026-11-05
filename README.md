@@ -174,8 +174,20 @@ python -m app.cli verify-ledger             # both chains
 
 ## Known gaps after Phase 3
 
+- **The idea models show no out-of-sample ranking skill yet.** The first training on five
+  years of Nifty 500 history (5 Nov 2026) put the within-session decile lift flat for both
+  horizons and the "best three ideas every session, bar ignored" replay at the all-candidates
+  hit rate (swing 30 % vs 28 %, positional 34 % vs 37 %). What the ideas carry is the
+  strategies' historical base rates after costs: swing (2 × ATR in 10 sessions) loses about
+  0.6 % per idea after costs across every strategy, so swing says "No edge today"; positional
+  (4 × ATR in 60 sessions) is about +0.8 % per idea, mostly momentum, with survivorship bias
+  in the history. The Scorecard shows these numbers next to every model; treat the ideas as
+  a disciplined, costed, graded watch-list, not a forecast.
 - **Every idea is unproven** until its setup/horizon has 100 graded outcomes; the UI and the
   Telegram brief say so beside every probability.
+- **The ideas models are retrained only by hand** (`train-ideas`); the Saturday retrain covers
+  the market-call model. A model trained on an older label definition is replaced on the next
+  training run regardless of its metrics (the artifact records the label version).
 - **Survivorship bias in history.** Universe membership is today's Nifty 500 applied to five
   years of bars; stocks that left the index are missing from training. Membership history is
   not published free; it will be recorded going forward from the daily sync.

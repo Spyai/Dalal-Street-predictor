@@ -9,6 +9,7 @@ the metrics carry the decile lift and the "best ideas every session" replay.
 
 from __future__ import annotations
 
+import json
 import math
 from datetime import timedelta
 
@@ -120,14 +121,68 @@ def test_lift_table_math() -> None:
     assert all(r["expectancy_pct"] is None for r in im.lift_table(p, y, nan_net, bins=2))
 
 
+def test_lift_within_groups_measures_ranking_not_base_rate_drift() -> None:
+    # Two sessions. Session A: base rate 100 %, session B: 0 %. Globally the high-p rows
+    # are all B's (a drift of the base rate between periods), so a global split shows an
+    # inverted lift; within each session the model ranks nothing, so the grouped table is flat.
+    p = np.array([0.1, 0.2, 0.3, 0.4, 0.6, 0.7, 0.8, 0.9])
+    y = np.array([1, 1, 1, 1, 0, 0, 0, 0])
+    groups = np.array(["A", "A", "A", "A", "B", "B", "B", "B"])
+    global_rows = im.lift_table(p, y, bins=2)
+    assert [r["hit_rate"] for r in global_rows] == [1.0, 0.0]
+    grouped = im.lift_table(p, y, bins=2, groups=groups)
+    assert [r["hit_rate"] for r in grouped] == [0.5, 0.5] and all(r["n"] == 4 for r in grouped)
+    # A real within-session ranking shows up as lift in the grouped table.
+    y2 = np.array([0, 0, 1, 1, 0, 0, 1, 1])
+    assert [r["hit_rate"] for r in im.lift_table(p, y2, bins=2, groups=groups)] == [0.0, 1.0]
+    # Small groups: 3 rows into 10 deciles land in deciles 2, 5 and 9 (percentile mid-points).
+    small = im.lift_table(
+        np.array([0.3, 0.1, 0.2]), np.array([1, 0, 1]), groups=np.array([1, 1, 1])
+    )
+    assert [r["decile"] for r in small] == [2, 6, 9] and [r["hit_rate"] for r in small] == [
+        0.0,
+        1.0,
+        1.0,
+    ]
+    with pytest.raises(ValueError, match="one key per row"):
+        im.lift_table(p, y, groups=np.array([1, 2]))
+
+
+def test_label_version_travels_with_the_model_and_forces_promotion(
+    trained: TrainResult,
+) -> None:
+    from app.ml.ideas_features import LABEL_VERSION
+    from app.models import ModelVersion
+
+    payload = json.loads(trained.artifact)
+    assert payload["label_version"] == LABEL_VERSION
+    current = ModelVersion(
+        name="ideas_swing", target="X", version="v1", kind="lgbm", artifact=trained.artifact
+    )
+    assert im.label_version_of(current) == LABEL_VERSION
+    assert im.label_change_reason(current) is None and im.label_change_reason(None) is None
+    legacy_payload = {k: v for k, v in payload.items() if k != "label_version"}
+    legacy = ModelVersion(
+        name="ideas_swing",
+        target="X",
+        version="v0",
+        kind="lgbm",
+        artifact=json.dumps(legacy_payload),
+    )
+    assert im.label_version_of(legacy) == im.LEGACY_LABEL_VERSION
+    reason = im.label_change_reason(legacy)
+    assert reason is not None and "not comparable" in reason and LABEL_VERSION in reason
+    broken = ModelVersion(name="ideas_swing", target="X", version="v?", kind="lgbm", artifact="{")
+    assert im.label_version_of(broken) == im.LEGACY_LABEL_VERSION
+
+
 def test_metrics_carry_the_top_k_replay_and_the_lift(trained: TrainResult) -> None:
     m = trained.metrics
     assert isinstance(m, im.IdeaModelMetrics)
     assert m.n_top > 0 and 0.0 <= m.hit_rate_top <= 1.0 and m.n_top <= m.n_oos
     assert m.n_top <= 3 * m.n_sessions  # at most ideas_max_per_horizon a session
     assert len(m.lift) == 10 and sum(int(r["n"]) for r in m.lift) == m.n_oos
-    means = [float(r["p_mean"]) for r in m.lift]  # type: ignore[arg-type]
-    assert means == sorted(means)
+    assert [int(r["decile"]) for r in m.lift] == list(range(1, 11))  # type: ignore[arg-type]
     assert math.isfinite(m.expectancy_top_pct)
     d = m.as_dict()
     assert d["n_top"] == m.n_top and d["lift"] == m.lift

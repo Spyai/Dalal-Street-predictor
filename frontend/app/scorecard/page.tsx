@@ -614,7 +614,7 @@ function LiftTable({ rows }: { rows: IdeaLiftRow[] }) {
       <table className="num w-full text-xs">
         <thead className="text-left text-faint">
           <tr>
-            <th className="py-1 font-normal">P(target) decile (OOS)</th>
+            <th className="py-1 font-normal">P(target) decile within the session (OOS)</th>
             <th className="py-1 text-right font-normal">n</th>
             <th className="py-1 text-right font-normal">Said</th>
             <th className="py-1 text-right font-normal">Hit rate</th>
@@ -637,8 +637,8 @@ function LiftTable({ rows }: { rows: IdeaLiftRow[] }) {
       </table>
       <p className={`text-[11px] ${flat ? "text-down" : "text-faint"}`}>
         {flat
-          ? "Flat: the tenth the model is most sure about hits about as often as the tenth it is least sure about. The ranking carries little beyond the strategies' base rates."
-          : "A ranking that carries information climbs from decile 1 to 10: the stocks the model is most sure about hit more often."}
+          ? "Flat: on a given day the candidates the model likes most hit about as often as the ones it likes least. The ranking carries little beyond the strategies' base rates; the ideas shown are those base rates plus payoff geometry."
+          : "A ranking that carries information climbs from decile 1 to 10: on a given day the candidates the model likes most hit more often."}
       </p>
     </div>
   );

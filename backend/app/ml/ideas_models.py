@@ -433,20 +433,44 @@ def calibration_bins_binary(
 
 
 def lift_table(
-    p: np.ndarray, y: np.ndarray, net: np.ndarray | None = None, bins: int = 10
+    p: np.ndarray,
+    y: np.ndarray,
+    net: np.ndarray | None = None,
+    bins: int = 10,
+    groups: np.ndarray | None = None,
 ) -> list[dict[str, float | int | None]]:
-    """Hit rate (and the mean of `net`, when given) by decile of P(target): equal-count
-    bins over the rows given, lowest probabilities first (decile 1) to highest (decile
-    `bins`). Rows: {"decile", "n", "p_mean", "hit_rate", "expectancy_pct"}; the last is
-    None without `net` or when every value in the bin is NaN. Empty for no rows."""
+    """Hit rate (and the mean of `net`, when given) by decile of P(target), lowest
+    probabilities first (decile 1) to highest (decile `bins`).
+
+    Without `groups`: equal-count bins over all rows. With `groups` (one key per row, the
+    session in training): each row is ranked among the rows of its own group and its decile
+    is that within-group percentile, so the table measures the ranking at the moment of
+    choice (which of today's candidates to show) and not the drift of the base rate between
+    periods, which a global split would show as lift or as its opposite. Rows: {"decile",
+    "n", "p_mean", "hit_rate", "expectancy_pct"}; the last is None without `net` or when
+    every value in the bin is NaN. Empty for no rows.
+    """
     pp = np.asarray(p, dtype=float).reshape(-1)
     yy = np.asarray(y, dtype=float).reshape(-1)
     if pp.size == 0 or bins < 1:
         return []
-    order = np.argsort(pp, kind="stable")
+    decile = np.zeros(pp.size, dtype=int)
+    if groups is None:
+        for d, idx in enumerate(np.array_split(np.argsort(pp, kind="stable"), bins), start=1):
+            decile[idx] = d
+    else:
+        g = np.asarray(groups).reshape(-1)
+        if g.size != pp.size:
+            raise ValueError("groups must have one key per row")
+        for key in np.unique(g):
+            members = np.flatnonzero(g == key)
+            ordered = members[np.argsort(pp[members], kind="stable")]
+            pct = (np.arange(ordered.size) + 0.5) / ordered.size
+            decile[ordered] = np.minimum((pct * bins).astype(int) + 1, bins)
     net_arr = None if net is None else np.asarray(net, dtype=float).reshape(-1)
     out: list[dict[str, float | int | None]] = []
-    for d, idx in enumerate(np.array_split(order, bins), start=1):
+    for d in range(1, bins + 1):
+        idx = np.flatnonzero(decile == d)
         if idx.size == 0:
             continue
         row: dict[str, float | int | None] = {
@@ -504,9 +528,10 @@ class IdeaModelMetrics(WalkForwardMetrics):
     a session by EV (one per symbol), bar ignored: what the desk would have shown had it
     always shown ideas. Compare with the all_candidates baseline: a ranking that carries
     information beats it.
-    lift: the out-of-sample rows by decile of P(target) (1 = lowest tenth, 10 = highest):
-    n, p_mean, hit_rate, expectancy_pct. A useful ranking climbs from decile 1 to 10; a
-    flat table means the probabilities carry nothing beyond the base rate.
+    lift: the out-of-sample rows by decile of P(target) within their own session (1 = the
+    candidates the model liked least that day, 10 = the most): n, p_mean, hit_rate,
+    expectancy_pct. A useful ranking climbs from decile 1 to 10; a flat table means the
+    probabilities carry nothing beyond the base rate at the moment of choice.
     """
 
     horizon: str = ""
@@ -903,7 +928,7 @@ def train_walk_forward(
         hit_rate_top=hit_rate(yo[top]) if top.any() else math.nan,
         n_top=int(top.sum()),
         expectancy_top_pct=_mean(net, top),
-        lift=lift_table(po, yo, net),
+        lift=lift_table(po, yo, net, groups=sess_idx[oos]),
         cost_round_trip_pct=cost,
         n_sessions=n_sessions,
         embargo_sessions=embargo,
@@ -928,6 +953,7 @@ def train_walk_forward(
             "target_atr": spec.target_atr,
             "stop_atr": spec.stop_atr,
             "objective": "binary",
+            "label_version": idf.LABEL_VERSION,
         },
         sort_keys=True,
     )
@@ -1140,6 +1166,40 @@ def ideas_champion(
 ) -> ModelVersion | None:
     """The champion ideas model for a horizon, or None before the first training."""
     return registry.champion(db, model_target(settings), name=model_name(horizon))
+
+
+LEGACY_LABEL_VERSION = "legacy (next-open anchored, no entry zone)"
+
+
+def label_version_of(mv: ModelVersion) -> str:
+    """The label definition an ideas model was trained on, from its artifact; models from
+    before the field existed are "legacy"."""
+    if not mv.artifact:
+        return LEGACY_LABEL_VERSION
+    try:
+        payload = json.loads(mv.artifact)
+    except ValueError:
+        return LEGACY_LABEL_VERSION
+    if not isinstance(payload, Mapping):
+        return LEGACY_LABEL_VERSION
+    version = payload.get("label_version")
+    return str(version) if version else LEGACY_LABEL_VERSION
+
+
+def label_change_reason(champion: ModelVersion | None) -> str | None:
+    """Why a freshly trained model must replace the champion whatever the metrics say:
+    the champion was trained on another label definition, so its out-of-sample numbers
+    describe a different event and cannot be compared. None when the labels agree (or
+    there is no champion: the ordinary promotion rule decides)."""
+    if champion is None:
+        return None
+    old = label_version_of(champion)
+    if old == idf.LABEL_VERSION:
+        return None
+    return (
+        f"label definition changed ({old} -> {idf.LABEL_VERSION}): the champion's "
+        "out-of-sample metrics describe a different event and are not comparable"
+    )
 
 
 def ideas_champion_light(
