@@ -19,8 +19,10 @@ candidates.
 Validation walks forward over SESSIONS, not rows (`ideas_features.walk_forward_folds`):
 fold j fits on every candidate of the sessions [0, k - embargo) and scores the candidates
 of sessions [k, k + step), with an embargo of `days` sessions (the horizon) between the
-last training session and the first test session, so no training label can have been
-resolved by a path that overlaps the test rows' features. Two knobs are chosen out of
+last training session and the first test session, and a row whose label resolved on or
+after the test start (its stock skipped sessions) is purged from that fold's training set
+as well, so no training label can have been resolved by a path that overlaps the test
+rows' features. Two knobs are chosen out of
 sample, sequentially, exactly as in `app.ml.models` (rounds scored every ROUND_STEP,
 shrinkage towards the fold's own training base rate = the candidates' hit rate); a fold's
 rows only ever inform the choice for later folds, and the final fit uses the pair chosen
@@ -338,6 +340,22 @@ def _as_date(x: object) -> date:
     return pd.Timestamp(str(x)).date()
 
 
+def _exit_ordinals(df: pd.DataFrame) -> np.ndarray | None:
+    """Each row's exit session as a proleptic ordinal (NaN when unknown), from the
+    `exit_session` column the label pipeline writes; None when the frame has none."""
+    if "exit_session" not in df.columns:
+        return None
+    out = np.full(len(df), np.nan)
+    for i, v in enumerate(df["exit_session"].tolist()):
+        if v is None or v is pd.NaT or (isinstance(v, float) and math.isnan(v)):
+            continue
+        try:
+            out[i] = float(_as_date(v).toordinal())
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def _optional_float(df: pd.DataFrame, col: str) -> np.ndarray | None:
     if col not in df.columns:
         return None
@@ -414,6 +432,38 @@ def calibration_bins_binary(
     return out
 
 
+def lift_table(
+    p: np.ndarray, y: np.ndarray, net: np.ndarray | None = None, bins: int = 10
+) -> list[dict[str, float | int | None]]:
+    """Hit rate (and the mean of `net`, when given) by decile of P(target): equal-count
+    bins over the rows given, lowest probabilities first (decile 1) to highest (decile
+    `bins`). Rows: {"decile", "n", "p_mean", "hit_rate", "expectancy_pct"}; the last is
+    None without `net` or when every value in the bin is NaN. Empty for no rows."""
+    pp = np.asarray(p, dtype=float).reshape(-1)
+    yy = np.asarray(y, dtype=float).reshape(-1)
+    if pp.size == 0 or bins < 1:
+        return []
+    order = np.argsort(pp, kind="stable")
+    net_arr = None if net is None else np.asarray(net, dtype=float).reshape(-1)
+    out: list[dict[str, float | int | None]] = []
+    for d, idx in enumerate(np.array_split(order, bins), start=1):
+        if idx.size == 0:
+            continue
+        row: dict[str, float | int | None] = {
+            "decile": d,
+            "n": int(idx.size),
+            "p_mean": finite(pp[idx].mean()),
+            "hit_rate": finite(yy[idx].mean()),
+            "expectancy_pct": None,
+        }
+        if net_arr is not None:
+            vals = net_arr[idx]
+            vals = vals[~np.isnan(vals)]
+            row["expectancy_pct"] = finite(vals.mean()) if vals.size else None
+        out.append(row)
+    return out
+
+
 def shrink_binary(p: np.ndarray, shrink: float, base_rate: float | None) -> np.ndarray:
     """(1 - shrink) * p + shrink * base_rate, clipped to [PROB_FLOOR, 1 - PROB_FLOOR].
 
@@ -450,6 +500,13 @@ class IdeaModelMetrics(WalkForwardMetrics):
     expectancy_*_pct: mean net return (%) per idea after the round-trip cost: +T on a hit,
     -S on a stop, the realised close-to-close move on expiry (0 when the frame has no
     realised column). NaN when the frame has no atr14_pct to size T and S from.
+    hit_rate_top / n_top / expectancy_top_pct: the top `ideas_max_per_horizon` candidates
+    a session by EV (one per symbol), bar ignored: what the desk would have shown had it
+    always shown ideas. Compare with the all_candidates baseline: a ranking that carries
+    information beats it.
+    lift: the out-of-sample rows by decile of P(target) (1 = lowest tenth, 10 = highest):
+    n, p_mean, hit_rate, expectancy_pct. A useful ranking climbs from decile 1 to 10; a
+    flat table means the probabilities carry nothing beyond the base rate.
     """
 
     horizon: str = ""
@@ -462,6 +519,10 @@ class IdeaModelMetrics(WalkForwardMetrics):
     expectancy_after_costs_pct: float = math.nan
     expectancy_ranked_pct: float = math.nan
     expectancy_all_candidates_pct: float = math.nan
+    hit_rate_top: float = math.nan
+    n_top: int = 0
+    expectancy_top_pct: float = math.nan
+    lift: list[dict[str, float | int | None]] = field(default_factory=list)
     cost_round_trip_pct: float = math.nan
     n_sessions: int = 0
     embargo_sessions: int = 0
@@ -484,6 +545,10 @@ class IdeaModelMetrics(WalkForwardMetrics):
                 "expectancy_after_costs_pct": finite(self.expectancy_after_costs_pct),
                 "expectancy_ranked_pct": finite(self.expectancy_ranked_pct),
                 "expectancy_all_candidates_pct": finite(self.expectancy_all_candidates_pct),
+                "hit_rate_top": finite(self.hit_rate_top),
+                "n_top": self.n_top,
+                "expectancy_top_pct": finite(self.expectancy_top_pct),
+                "lift": [dict(r) for r in self.lift],
                 "cost_round_trip_pct": finite(self.cost_round_trip_pct),
                 "n_sessions": self.n_sessions,
                 "embargo_sessions": self.embargo_sessions,
@@ -678,6 +743,8 @@ def train_walk_forward(
             f"no realised column: expired ideas count as {EXPIRY_RETURN_PCT:g}% in the expectancy"
         )
 
+    exit_ord = _exit_ordinals(df)
+    n_purged_extra = 0
     oos_p = np.full(n, np.nan)
     oos = np.zeros(n, dtype=bool)
     base_used = np.full(n, np.nan)
@@ -690,6 +757,13 @@ def train_walk_forward(
     )
     for fold in plan:
         train = sess_idx <= pos[fold.train_end]
+        if exit_ord is not None:
+            # Purge by the row's own exit: a label that resolved on or after the test
+            # start (a bar gap stretched its window past the session embargo) never trains
+            # this fold.
+            late = train & (exit_ord >= float(fold.test_start.toordinal()))
+            n_purged_extra += int(late.sum())
+            train &= ~late
         test = (sess_idx >= pos[fold.test_start]) & (sess_idx <= pos[fold.test_end])
         n_test = int(test.sum())
         if n_test == 0 or not train.any():
@@ -724,6 +798,11 @@ def train_walk_forward(
         n_scored += n_test
     if not folds:
         raise ValueError("walk-forward produced no out-of-sample fold")
+    if n_purged_extra:
+        notes.append(
+            f"{n_purged_extra} training row(s) purged beyond the embargo: their label "
+            "resolved inside a test window (bar gaps after the signal)"
+        )
 
     po, yo = oos_p[oos], y[oos]
     n_oos = int(oos.sum())
@@ -749,9 +828,10 @@ def train_walk_forward(
         ev = np.full(n_oos, np.nan)
         selected = po >= s.ideas_min_p_target
         net = np.full(n_oos, np.nan)
-    ranked = _ranked_mask(
-        selected, ev, po, sess_idx[oos], symbols[oos], int(s.ideas_max_per_horizon)
-    )
+    cap = int(s.ideas_max_per_horizon)
+    ranked = _ranked_mask(selected, ev, po, sess_idx[oos], symbols[oos], cap)
+    # The same replay with the bar ignored: the best `cap` a session, every session.
+    top = _ranked_mask(np.ones(n_oos, dtype=bool), ev, po, sess_idx[oos], symbols[oos], cap)
 
     def _mean(a: np.ndarray, mask: np.ndarray) -> float:
         vals = a[mask]
@@ -820,6 +900,10 @@ def train_walk_forward(
         expectancy_after_costs_pct=_mean(net, selected),
         expectancy_ranked_pct=_mean(net, ranked),
         expectancy_all_candidates_pct=_mean(net, np.ones(n_oos, dtype=bool)),
+        hit_rate_top=hit_rate(yo[top]) if top.any() else math.nan,
+        n_top=int(top.sum()),
+        expectancy_top_pct=_mean(net, top),
+        lift=lift_table(po, yo, net),
         cost_round_trip_pct=cost,
         n_sessions=n_sessions,
         embargo_sessions=embargo,
@@ -1106,6 +1190,14 @@ class TrainingData:
         if self.frame.empty or "label" not in self.frame.columns:
             return 0
         return int(pd.to_numeric(self.frame["label"], errors="coerce").notna().sum())
+
+    @property
+    def n_invalidated(self) -> int:
+        """Candidates the 09:20 rule would not have filled (next open outside the entry
+        zone): never traded, so never labelled, and excluded from training."""
+        if self.frame.empty or "invalidated" not in self.frame.columns:
+            return 0
+        return int(self.frame["invalidated"].fillna(False).astype(bool).sum())
 
 
 def _session_bars_through(bars: pd.DataFrame, cal: TradingCalendar, through: date) -> pd.DataFrame:

@@ -583,7 +583,13 @@ def test_label_uses_only_bars_after_the_signal(world: World) -> None:
     window_end = sessions[sessions.index(d) + SWING.days]
     base = triple_barrier_labels(daily_frame(db, inst.id), sessions, SWING)
     labelled = base[base["label"].notna()]
-    assert len(labelled) == len(sessions) - 13 - SWING.days  # ATR warm-up, purged tail
+    invalidated = base[base["invalidated"].astype(bool)]
+    # ATR warm-up and the purged tail are unlabelled; so is every signal whose next open
+    # fell outside the entry zone (the 09:20 rule would not have filled it). A no-fill is
+    # known as soon as the next open is, window closed or not.
+    closed_invalidated = invalidated[invalidated["window_closed"]]
+    assert len(labelled) + len(closed_invalidated) == len(sessions) - 13 - SWING.days
+    assert invalidated["label"].isna().all()
     assert set(labelled["label"]) <= {0.0, 1.0} and labelled["label"].mean() not in (0.0, 1.0)
     assert (labelled["exit_session"] > labelled.index).all()
     assert all(
@@ -607,21 +613,25 @@ def test_label_uses_only_bars_after_the_signal(world: World) -> None:
     # Sanity: the signal whose window is entirely garbage does change.
     assert after.at[window_end, "exit_price"] != base.at[window_end, "exit_price"]
 
-    # (2) Doubling every price dated <= D: ATR(D)/close(D) is unchanged, so D's barrier
-    # distances, entry, exit, label and realised return are unchanged (the path is bars > D).
+    # (2) Doubling every price (D's bars and the path alike): ATR(D)/close(D), the fill
+    # decision, the % distances, the label and the realised return are unchanged, and every
+    # price column (entry, the barriers anchored at close(D), the exit) doubles with them.
     db.execute(
         text(
             "UPDATE daily_bar SET open = open * 2, high = high * 2, low = low * 2, "
-            "close = close * 2 WHERE instrument_id = :i AND trade_date <= :d"
+            "close = close * 2 WHERE instrument_id = :i"
         ),
-        {"i": inst.id, "d": d},
+        {"i": inst.id},
     )
     db.flush()
     scaled = triple_barrier_labels(daily_frame(db, inst.id), [d], SWING).iloc[0]
+    prices = {"entry_price", "target_price", "stop_price", "exit_price"}
     for col in LABEL_COLUMNS:
         a, b = scaled[col], base.at[d, col]
         if isinstance(a, float) and math.isnan(a):
             assert math.isnan(b), col
+        elif col in prices:
+            assert a == pytest.approx(2.0 * b), col
         else:
             assert a == pytest.approx(b) if isinstance(a, float) else a == b, col
 
@@ -639,7 +649,8 @@ def test_purging_leaves_the_last_horizon_days_unlabelled(world: World) -> None:
     for sym in symbols:
         sub = frame[frame["symbol"] == sym].set_index("session_date")
         unl = set(sub.index[sub["label"].isna()])
-        assert unl == tail | set(world.sessions[:13])  # purged tail + ATR warm-up
+        inv = set(sub.index[sub["invalidated"].astype(bool)])
+        assert unl == tail | set(world.sessions[:13]) | inv  # purged tail + ATR warm-up + no fill
         assert set(sub.index[~sub["window_closed"]]) == tail
         # The live candidate (last session) has no entry yet; the one before has an entry.
         assert sub.at[world.sessions[-1], "entry_session"] is None

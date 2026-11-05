@@ -44,7 +44,7 @@ from app.jobs.runner import JobContext, JobResult, JobSkipped
 from app.ml import baselines, core, features, ideas_models, models, ranking, strategies
 from app.ml import ideas_features as idf
 from app.ml import registry as model_registry
-from app.ml.core import FeatureRow, IdeaRecordIn, MarketCallRecordIn, finite
+from app.ml.core import FeatureRow, IdeaOutput, IdeaRecordIn, MarketCallRecordIn, finite
 from app.models import (
     DailyBar,
     Idea,
@@ -677,6 +677,7 @@ def open_check(ctx: JobContext) -> JobResult:
         summary.append(
             f"{fills.filled} idea(s) filled, {fills.invalidated} invalidated, "
             f"{fills.pending} still pending"
+            + (f", {fills.unfunded} filled without paper cash" if fills.unfunded else "")
         )
     message = "; ".join([*summary, *problems])
     return JobResult("partial" if problems else "success", message, details)
@@ -973,6 +974,58 @@ def _idea_details(i: Idea) -> dict[str, Any]:
     }
 
 
+def _output_details(o: IdeaOutput, rank: int, s: Settings) -> dict[str, Any]:
+    """A would-be idea (not recorded) in the shape of `_idea_details`, sized like one."""
+    qty, value, risk = ranking.size_position(ranking.entry_mid(o), o.stop, s)
+    return {
+        "symbol": o.symbol,
+        "horizon": o.horizon,
+        "setup": o.setup,
+        "strategy": o.strategy,
+        "rank": rank,
+        "entry_low": o.entry_low,
+        "entry_high": o.entry_high,
+        "stop": o.stop,
+        "target_1": o.target_1,
+        "target_2": o.target_2,
+        "p_target": finite(o.p_target),
+        "ev_pct_after_costs": finite(o.ev_pct_after_costs),
+        "risk_reward": finite(o.risk_reward),
+        "position_qty": qty,
+        "position_value": value,
+        "risk_amount": risk,
+        "reasons": list(o.reasons),
+        "invalidation": o.invalidation,
+    }
+
+
+def ideas_dry_run(ctx: JobContext) -> IdeasOutcome:
+    """What the ideas engine says right now, recording nothing in either ledger (the
+    `ideas --dry-run` CLI). Bars are refreshed as the 07:30 run would refresh them (that
+    is data, not a record); the recording guard is reported under "recording_block", not
+    applied, so a dry run on an unverified calendar still shows the ranking."""
+    s, db = ctx.settings, ctx.db
+    session = core.session_for(ctx.calendar, ctx.now)
+    through = ctx.calendar.previous_trading_day(session)
+    chain = registry.market_data_chain(db, include_broker=False)
+    refresh = _refresh_bars(
+        db,
+        _reference_instruments(db, s.prediction_target_symbols),
+        through,
+        chain,
+        s.backfill_years,
+        session=session,
+        now=ctx.now,
+    )
+    db.commit()
+    out = generate_ideas(ctx, session, through, chain, dry_run=True)
+    out.details["reference_refresh"] = refresh.problems or "ok"
+    blocked = recording_block(ctx, session, through)
+    if blocked is not None:
+        out.details["recording_block"] = blocked
+    return out
+
+
 def _horizon_status(out: IdeasOutcome, horizon: str, status: str, *, problem: bool = False) -> None:
     out.details[horizon] = {"status": status}
     if out.notes is not None:
@@ -988,7 +1041,11 @@ def _ideas_summary(out: IdeasOutcome, horizons: Iterable[str]) -> str:
         status = str(d.get("status", "not generated"))
         if d.get("ideas"):
             n = len(d["ideas"])
-            extra = " (already recorded)" if status == "already recorded" else ""
+            extra = ""
+            if status == "already recorded":
+                extra = " (already recorded)"
+            elif status.startswith("dry run"):
+                extra = " (dry run, not recorded)"
             parts.append(f"{h} {n} idea{'' if n == 1 else 's'}{extra}")
         elif status.startswith(ranking.NO_EDGE_TEXT):
             parts.append(f"{h} {ranking.NO_EDGE_TEXT}")
@@ -1053,8 +1110,14 @@ def generate_ideas(
     chain: list[MarketDataProvider],
     *,
     blocked: str | None = None,
+    dry_run: bool = False,
 ) -> IdeasOutcome:
     """07:30, after the calls: the stock ideas for `session`, per horizon, into the ledger.
+
+    `dry_run` scores and ranks exactly the same way but writes nothing to the idea ledger
+    (the `ideas --dry-run` CLI): every horizon is scored even when the session already
+    has ideas, the would-be ideas are listed under each horizon's details with the status
+    "dry run", and `recorded` stays 0.
 
     Steps: (1) ideas already recorded for the session are left alone, per horizon
     (re-runs are idempotent; the race between two live runs is closed by the idea ledger
@@ -1079,15 +1142,20 @@ def generate_ideas(
     )
     assert out.notes is not None
     existing = ledger.ideas_for_session(db, session, current_only=True)
-    out.ideas = list(existing)
-    for h in specs:
-        mine = [i for i in existing if i.horizon == h]
-        if mine:
-            out.details[h] = {
-                "status": "already recorded",
-                "ideas": [_idea_details(i) for i in mine],
-            }
-    todo = [h for h in specs if h not in out.details]
+    if dry_run:
+        out.details["dry_run"] = True
+        out.details["already_recorded"] = len(existing)
+        todo = list(specs)
+    else:
+        out.ideas = list(existing)
+        for h in specs:
+            mine = [i for i in existing if i.horizon == h]
+            if mine:
+                out.details[h] = {
+                    "status": "already recorded",
+                    "ideas": [_idea_details(i) for i in mine],
+                }
+        todo = [h for h in specs if h not in out.details]
     if not todo:
         out.summary = _ideas_summary(out, specs)
         return out
@@ -1171,6 +1239,13 @@ def generate_ideas(
             out.details[h]["status"] = text
             out.notes[h] = text
             continue
+        if dry_run:
+            out.details[h]["status"] = "dry run: not recorded"
+            out.details[h]["ideas"] = [
+                {**_output_details(o, rank, s), "status": "dry run"}
+                for rank, o in enumerate(kept, start=1)
+            ]
+            continue
         recorded_rows: list[dict[str, Any]] = []
         for rank, o in enumerate(kept, start=1):
             qty, value, risk = ranking.size_position(ranking.entry_mid(o), o.stop, s)
@@ -1231,6 +1306,7 @@ class FillReport:
     filled: int = 0
     invalidated: int = 0
     pending: int = 0  # still waiting for the session's open
+    unfunded: int = 0  # filled, but the paper book had no cash left for a position
 
 
 def _outcome_details(o: IdeaOutcome | None) -> dict[str, Any]:
@@ -1297,9 +1373,19 @@ def fill_ideas(
         if outcome.status == "open":
             rep.filled += 1
             try:
-                trade = paper.open_trade_for_idea(db, idea, outcome, now=ctx.now)
-                entry["paper_trade_id"] = trade.id
-                entry["qty"] = trade.qty
+                trade = paper.open_trade_for_idea(
+                    db, idea, outcome, now=ctx.now, settings=ctx.settings
+                )
+                if trade is None:
+                    rep.unfunded += 1
+                    entry["paper_trade"] = (
+                        "not opened: no cash left in the paper book (the idea is still graded)"
+                    )
+                else:
+                    entry["paper_trade_id"] = trade.id
+                    entry["qty"] = trade.qty
+                    if trade.qty < idea.position_qty:
+                        entry["paper_trade"] = f"sized down to {trade.qty} shares: cash"
             except ValueError as exc:
                 entry["paper_trade"] = f"not opened: {exc}"
                 rep.problems.append(
@@ -1415,7 +1501,13 @@ def grade_ideas(
         source = str(bars["source"].iloc[-1]) if "source" in bars.columns else "close_grading"
         try:
             outcome = idea_grading.grade_idea(
-                db, idea, bars, now=ctx.now, source=source, settings=s
+                db,
+                idea,
+                bars,
+                now=ctx.now,
+                source=source,
+                settings=s,
+                is_session=ctx.calendar.is_trading_day,
             )
         except ValueError as exc:
             rep.problems.append(f"{idea.symbol} {idea.horizon} (seq {idea.seq}): not graded: {exc}")

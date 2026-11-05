@@ -29,6 +29,7 @@ Commands:
                                 universe's historical strategy candidates; same
                                 champion/challenger rule as `train`
     ideas [--force]             the 07:30 run (market calls + stock ideas), now
+    ideas --dry-run             score and rank now, print, record nothing
     ideas --void SEQ --reason TEXT [--category no_session|data_error]
                                 mark one idea as ungradeable; the ledger row stays
     paper [--summary]           the paper portfolio: trades, equity curve, metrics
@@ -373,7 +374,8 @@ def cmd_train_ideas(args: argparse.Namespace) -> int:
                 continue
             print(
                 f"  {data.n_stocks} universe stocks with bars through {data.through}; "
-                f"{data.n_candidates} strategy candidates, {data.n_labelled} labelled; "
+                f"{data.n_candidates} strategy candidates, {data.n_labelled} labelled, "
+                f"{data.n_invalidated} would not have filled (open outside the entry zone); "
                 f"walk-forward from {s.wf_min_train_days} sessions, step {s.wf_step_days}, "
                 f"embargo {spec.days} ..."
             )
@@ -428,6 +430,23 @@ def cmd_train_ideas(args: argparse.Namespace) -> int:
                         f"hit rate={_pct(_f(entry.get('hit_rate')))} "
                         f"selected={int(entry.get('n_selected') or 0)}"
                     )
+            print(
+                f"  ranking check, bar ignored: best {s.ideas_max_per_horizon} a session hit rate="
+                f"{_pct(_f(m.get('hit_rate_top')))} (n={m.get('n_top')}) "
+                f"expectancy={_pct_pt(_f(m.get('expectancy_top_pct')))}"
+            )
+            lift = m.get("lift")
+            if isinstance(lift, list) and lift:
+                cells = " ".join(
+                    f"d{int(_f(r.get('decile')) or 0)}={_pct(_f(r.get('hit_rate')))}"
+                    for r in lift
+                    if isinstance(r, dict)
+                )
+                print(f"  hit rate by P(target) decile (1 = lowest): {cells}")
+            print(
+                f"  chosen out of sample: {result.params.get('n_estimators')} rounds, "
+                f"shrink {result.params.get('shrink')} towards the base rate"
+            )
             print(f"  {'PROMOTED' if promote else 'rejected'}: {reason}")
     return 1 if failures else 0
 
@@ -448,7 +467,84 @@ def cmd_ideas(args: argparse.Namespace) -> int:
     if args.reason or args.category:
         print("--reason / --category only make sense with --void SEQ", file=sys.stderr)
         return 2
+    if args.dry_run:
+        return _ideas_dry_run()
     return _run_named_job("premarket_prediction", args.force)
+
+
+def _ideas_dry_run() -> int:
+    """Score and rank the next session's candidates right now and print what the 07:30 run
+    would record, the nearest misses included. Nothing is written to either ledger."""
+    from app.config import IST
+    from app.jobs import tasks
+    from app.jobs.runner import JobContext
+    from app.ml import core
+    from app.services.calendar import TradingCalendar
+
+    s = get_settings()
+    now = datetime.now(UTC)
+    with session_scope() as db:
+        cal = TradingCalendar.load(db)
+        ctx = JobContext(
+            db=db, now=now, today=now.astimezone(IST).date(), calendar=cal, settings=s, force=True
+        )
+        out = tasks.ideas_dry_run(ctx)
+        db.commit()  # refreshed bars stay; no ledger row was written
+    d = out.details
+    print(
+        f"dry run for session {d.get('session')} (signal session {d.get('signal_session')}); "
+        "nothing recorded"
+    )
+    if d.get("recording_block"):
+        print(f"  a live run would not record: {d['recording_block']}")
+    if d.get("already_recorded"):
+        print(f"  {d['already_recorded']} idea(s) already in the ledger for this session")
+    uni = d.get("universe") or {}
+    if uni:
+        print(
+            f"  universe: {uni.get('with_bar')} of {uni.get('instruments')} stocks have a bar "
+            f"for {d.get('signal_session')}"
+        )
+    cands = d.get("candidates") or {}
+    if cands:
+        print(
+            f"  candidates: {cands.get('n')} from {cands.get('eligible')} eligible stocks; "
+            f"by strategy {cands.get('by_strategy')}"
+        )
+    rk = d.get("ranking") or {}
+    if rk:
+        print(
+            f"  ranking: {rk.get('n_cleared')} of {rk.get('n_candidates')} candidates cleared "
+            f"the bar ({rk.get('n_unpriced')} unpriced, {rk.get('n_unsizable')} unsizable); "
+            f"best P(target) {_pct(_f(rk.get('best_p_target')))}, "
+            f"best EV {_pct_pt(_f(rk.get('best_ev_pct')))}"
+        )
+    for h in core.horizons(s):
+        hd = d.get(h) or {}
+        print(f"== {h}: {hd.get('status', 'not scored')}")
+        for row in hd.get("ideas") or []:
+            print(
+                f"  #{row['rank']} {row['symbol']} {row['setup']} "
+                f"P(target)={_pct(_f(row.get('p_target')))} "
+                f"EV={_pct_pt(_f(row.get('ev_pct_after_costs')))} "
+                f"entry {row['entry_low']:,.2f}-{row['entry_high']:,.2f} "
+                f"stop {row['stop']:,.2f} target {row['target_1']:,.2f} "
+                f"qty {row['position_qty']}"
+            )
+        closest = (rk.get("closest") or {}).get(h) or []
+        if closest:
+            print(
+                "  best by EV: "
+                + "; ".join(
+                    f"{c['symbol']} ({c['strategy']}) P={_pct(_f(c.get('p_target')))} "
+                    f"EV={_pct_pt(_f(c.get('ev_pct_after_costs')))}"
+                    f"{'' if c.get('cleared') else ' (under the bar)'}"
+                    for c in closest
+                )
+            )
+    for problem in out.problems:
+        print(f"  problem: {problem}")
+    return 0
 
 
 def _void_idea(seq: int, reason: str | None, category: str | None) -> int:
@@ -725,6 +821,11 @@ def main(argv: list[str] | None = None) -> int:
     sp.set_defaults(fn=cmd_train_ideas)
     sp = sub.add_parser("ideas")
     sp.add_argument("--force", action="store_true", help="run even on a weekend or holiday")
+    sp.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="score and rank the candidates now, print them, record nothing",
+    )
     sp.add_argument("--void", type=int, metavar="SEQ", help="mark this idea as ungradeable")
     sp.add_argument("--reason", help="why it can never be graded (required with --void)")
     sp.add_argument(

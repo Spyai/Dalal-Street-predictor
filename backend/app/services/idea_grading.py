@@ -32,7 +32,7 @@ same bars gives the same row.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Any
@@ -134,13 +134,20 @@ def _as_date(x: object) -> date:
     return pd.Timestamp(str(x)).date()
 
 
-def session_bars(bars: pd.DataFrame, start: date | None = None) -> list[SessionBar]:
+def session_bars(
+    bars: pd.DataFrame,
+    start: date | None = None,
+    *,
+    is_session: Callable[[date], bool] | None = None,
+) -> list[SessionBar]:
     """The OHLC rows of `bars` as sessions sorted by date, from `start` on.
 
     Accepts `market_data.daily_frame` output (a datetime index) or a frame with a `date`
-    / `trade_date` column. Raises ValueError for a missing price column or a bar with a
-    non-finite open, high, low or close (naming its date): a hole in the data is not a
-    price.
+    / `trade_date` column. `is_session` (the trading calendar's `is_trading_day`) drops
+    bars dated on non-sessions (a Muhurat or holiday print), so the walk counts the same
+    sessions the training labels did. Raises ValueError for a missing price column or a
+    bar with a non-finite open, high, low or close (naming its date): a hole in the data
+    is not a price.
     """
     if bars is None or len(bars) == 0:
         return []
@@ -165,6 +172,8 @@ def session_bars(bars: pd.DataFrame, start: date | None = None) -> list[SessionB
     ):
         d = _as_date(d_raw)
         if start is not None and d < start:
+            continue
+        if is_session is not None and not is_session(d):
             continue
         prices = [finite(o), finite(h), finite(lo), finite(c)]
         if any(p is None or p <= 0.0 for p in prices):
@@ -336,21 +345,24 @@ def grade_idea(
     now: datetime,
     source: str,
     settings: Settings | None = None,
+    is_session: Callable[[date], bool] | None = None,
 ) -> IdeaOutcome:
     """15:45: walk the sessions since entry and settle the idea (exit rule, module doc).
 
     `bars_after_entry` holds the daily bars of the idea's instrument from its
     `session_date` on (`market_data.daily_frame(db, instrument_id, start=session_date)`;
-    earlier rows are ignored). A pending idea is first filled from the entry session's
-    open with the entry rule; without that session's bar nothing can be said and
-    ValueError is raised. An invalidated or voided idea is not graded (ValueError).
+    earlier rows are ignored; `is_session` drops non-session prints, see `session_bars`).
+    A pending idea is first filled from the entry session's open with the entry rule;
+    without that session's bar nothing can be said and ValueError is raised, and the same
+    holds for a filled idea whose entry session's bar is missing: the window is never
+    re-anchored on a later bar. An invalidated or voided idea is not graded (ValueError).
     """
     existing = outcome_of(db, idea.id)
     status = status_of(existing)
     if status in UNGRADEABLE_STATUSES:
         raise ValueError(f"idea seq {idea.seq} is {status}: nothing to grade")
     s = settings or get_settings()
-    bars = session_bars(bars_after_entry, idea.session_date)
+    bars = session_bars(bars_after_entry, idea.session_date, is_session=is_session)
 
     if existing is None or existing.entry_price is None or existing.entry_date is None:
         if not bars or bars[0].trade_date != idea.session_date:
@@ -370,6 +382,11 @@ def grade_idea(
     else:
         entry_date, entry_price = existing.entry_date, existing.entry_price
         bars = [b for b in bars if b.trade_date >= entry_date]
+        if not bars or bars[0].trade_date != entry_date:
+            raise ValueError(
+                f"idea seq {idea.seq} was filled on {entry_date.isoformat()} but there is no "
+                "bar for that session: cannot grade it"
+            )
 
     walk = walk_exit(entry_price, idea.stop, idea.target_1, bars, idea.horizon_days)
     common = {

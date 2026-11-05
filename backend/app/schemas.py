@@ -651,6 +651,9 @@ class PaperOut(BaseModel):
     sortino: float | None
     total_return_pct: float | None
     nifty_return_pct: float | None
+    min_cash: float | None
+    max_exposure_pct: float | None
+    levered_days: int
     equity_curve: list[EquityPointOut]
     open_trades: list[PaperTradeOut]
     recent_closed: list[PaperTradeOut]

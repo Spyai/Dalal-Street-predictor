@@ -778,7 +778,7 @@ def test_today_ideas_say_there_is_no_model_before_training(logged_in: TestClient
     )
     assert "train-ideas" in ideas["note"]
     assert ideas["surveillance_note"] == SURVEILLANCE_NOTE and "not checked" in SURVEILLANCE_NOTE
-    assert ideas["min_p_target"] == 0.55 and ideas["min_ev_pct"] == 0.5
+    assert ideas["min_p_target"] == 0.40 and ideas["min_ev_pct"] == 0.5
     assert ideas["max_per_horizon"] == 3
 
 
@@ -801,7 +801,7 @@ def test_today_ideas_say_no_edge_only_when_the_engine_ran(
     for g in ideas["by_horizon"]:
         assert g["no_edge"] is True
         assert g["note"].startswith(f"No edge today ({g['horizon']})")
-        assert "P(target) >= 55%" in g["note"] and "EV >= 0.5%" in g["note"]
+        assert "P(target) >= 40%" in g["note"] and "EV >= 0.5%" in g["note"]
     assert ideas["note"].startswith("No edge today")
 
 
@@ -1117,7 +1117,10 @@ def test_paper_endpoint_with_a_closed_trade_and_equity_curve(
     assert body["total_net_pnl"] == pytest.approx(50 * 40.0 - cost)
     assert body["expectancy"] == pytest.approx(50 * 40.0 - cost)
     assert body["avg_win_pct"] == pytest.approx(4.0 - CostModel.from_settings().round_trip_pct())
-    assert body["n_days"] == 2 and body["n_returns"] == 1 and body["sharpe"] is None
+    # Curve statistics start from the paper capital: two snapshots give two daily returns.
+    assert body["n_days"] == 2 and body["n_returns"] == 2 and "sharpe" in body
+    assert body["levered_days"] == 0 and body["min_cash"] is not None
+    assert "max_exposure_pct" in body
     assert body["nifty_return_pct"] == pytest.approx(1.0)
     assert body["equity_curve"][1]["nifty_rebased"] == pytest.approx(1_010_000.0)
     assert body["open_trades"] == [] and len(body["recent_closed"]) == 1

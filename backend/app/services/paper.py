@@ -48,6 +48,8 @@ PAPER_NOTE = (
     "no market impact. Benchmark is the Nifty 50 price index rebased to the paper capital "
     "(the total-return index is not available). Sharpe and Sortino use daily equity "
     "returns annualised with sqrt(252) and no risk-free rate."
+    " Curve statistics (drawdown, Sharpe, Sortino) start from the paper capital on the"
+    " session before the first snapshot; the Nifty 50 leg starts at the first snapshot."
 )
 
 
@@ -161,14 +163,33 @@ def trade_for_idea(db: Session, idea: Idea | int) -> PaperTrade | None:
     ).first()
 
 
-def open_trade_for_idea(
-    db: Session, idea: Idea, outcome: IdeaOutcome, *, now: datetime | None = None
-) -> PaperTrade:
-    """One paper position for a filled idea: the recorded qty at the outcome's entry price.
+def cash_as_of(db: Session, trade_date: date, *, settings: Settings | None = None) -> float:
+    """Cash in the paper book at the close of `trade_date`: the paper capital plus the net
+    P&L of every trade closed by then, less the cost basis of every position open then.
+    Never borrows: the book has exactly what it started with and what it made."""
+    s = settings or get_settings()
+    open_, closed = positions_as_of(db, trade_date)
+    realised = sum(float(t.net_pnl) for t in closed if t.net_pnl is not None)
+    return s.paper_capital + realised - sum(t.qty * t.entry_price for t in open_)
 
-    Idempotent: an idea already has at most one trade, which is returned as it is. The
-    outcome must be a fill (`status == "open"` with an entry); anything else is a caller
-    bug. `now` is unused for the row (created_at is the database's) and kept for symmetry.
+
+def open_trade_for_idea(
+    db: Session,
+    idea: Idea,
+    outcome: IdeaOutcome,
+    *,
+    now: datetime | None = None,
+    settings: Settings | None = None,
+) -> PaperTrade | None:
+    """One paper position for a filled idea: the recorded qty at the outcome's entry price,
+    cut to what the book's cash can pay for.
+
+    The book never borrows: when `cash_as_of(entry_date)` covers fewer shares than the
+    idea's qty, the trade is sized down and its note says so; when it covers none, no
+    trade is opened and None is returned (the idea is still graded, the paper book just
+    sat it out). Idempotent: an idea already has at most one trade, which is returned as
+    it is. The outcome must be a fill (`status == "open"` with an entry); anything else
+    is a caller bug. `now` is unused for the row (created_at is the database's).
     """
     existing = trade_for_idea(db, idea)
     if existing is not None:
@@ -180,18 +201,27 @@ def open_trade_for_idea(
     if idea.position_qty <= 0:
         raise ValueError(f"idea seq {idea.seq} has no position size (qty {idea.position_qty})")
     entry = _positive(outcome.entry_price, "entry_price")
+    cash = cash_as_of(db, outcome.entry_date, settings=settings)
+    affordable = math.floor(cash / entry) if cash > 0.0 else 0
+    qty = int(idea.position_qty)
+    note = f"auto: idea seq {idea.seq} ({idea.horizon}, {idea.setup})"
+    if affordable <= 0:
+        return None
+    if affordable < qty:
+        note += f"; sized down from {qty} to {affordable} shares: Rs {cash:,.0f} cash available"
+        qty = affordable
     trade = PaperTrade(
         idea_id=idea.id,
         symbol=idea.symbol,
         exchange=idea.exchange,
         side="buy",
-        qty=int(idea.position_qty),
+        qty=qty,
         entry_date=outcome.entry_date,
         entry_price=entry,
         stop=finite(idea.stop),
         target=finite(idea.target_1),
         status="open",
-        note=f"auto: idea seq {idea.seq} ({idea.horizon}, {idea.setup})",
+        note=note,
     )
     db.add(trade)
     db.flush()
@@ -295,13 +325,13 @@ def sync_trade_with_outcome(
 ) -> PaperTrade | None:
     """Keep the paper book in step with an idea's outcome after grading.
 
-    A filled idea without a trade gets one; a graded idea (target / stop / expired) with
-    an open trade has it closed at the outcome's exit; anything else (pending,
-    invalidated, void, or already in step) changes nothing. Returns the trade, or None
-    when the idea has none.
+    A filled idea without a trade gets one (sized to the book's cash, none when the cash
+    is gone); a graded idea (target / stop / expired) with an open trade has it closed at
+    the outcome's exit; anything else (pending, invalidated, void, or already in step)
+    changes nothing. Returns the trade, or None when the idea has none.
     """
     if outcome.status == "open":
-        return open_trade_for_idea(db, idea, outcome, now=now)
+        return open_trade_for_idea(db, idea, outcome, now=now, settings=settings)
     trade = trade_for_idea(db, idea)
     if trade is None:
         if outcome.status in TERMINAL_STATUSES and outcome.entry_price is not None:
@@ -314,7 +344,9 @@ def sync_trade_with_outcome(
                 graded_at=outcome.graded_at,
                 source=outcome.source,
             )
-            trade = open_trade_for_idea(db, idea, filled, now=now)
+            trade = open_trade_for_idea(db, idea, filled, now=now, settings=settings)
+            if trade is None:
+                return None  # no cash that day: the book sat this idea out
         else:
             return None
     if (
@@ -477,6 +509,9 @@ class PortfolioSummary:
     sortino: float | None
     total_return_pct: float | None  # last equity vs the paper capital
     nifty_return_pct: float | None  # Nifty 50 price index over the same snapshots
+    min_cash: float | None  # lowest cash on any snapshot (negative = the book borrowed)
+    max_exposure_pct: float | None  # highest invested / equity on any snapshot, %
+    levered_days: int  # snapshots on which cash was negative
     equity_curve: list[dict[str, Any]]
     open_trades: list[dict[str, Any]]
     recent_closed: list[dict[str, Any]]
@@ -511,7 +546,12 @@ def portfolio_summary(
 
     curve = equity_curve(db)
     equity = [e.equity for e in curve]
-    returns = daily_returns(equity) if equity else np.asarray([], dtype=float)
+    # The curve starts from the paper capital on the session before the first snapshot, so
+    # the first session's move counts in the drawdown and the ratios.
+    series = [s.paper_capital, *equity] if equity else []
+    returns = daily_returns(series) if series else np.asarray([], dtype=float)
+    cashes = [e.cash for e in curve]
+    exposures = [e.invested / e.equity * 100.0 for e in curve if e.equity > 0.0]
     nifty = [e.nifty_close for e in curve]
     nifty_rebased = rebased(nifty, s.paper_capital)
     nifty_known = [v for v in nifty if v is not None]
@@ -545,13 +585,16 @@ def portfolio_summary(
         total_net_pnl=finite(sum(pnls)) if pnls else None,
         n_days=len(curve),
         n_returns=int(returns.size),
-        max_drawdown_pct=finite(max_drawdown_pct(equity)),
+        max_drawdown_pct=finite(max_drawdown_pct(series)),
         sharpe=finite(sharpe_ratio(returns)),
         sortino=finite(sortino_ratio(returns)),
         total_return_pct=finite(pct_change(equity[-1], s.paper_capital)) if equity else None,
         nifty_return_pct=finite(pct_change(nifty_known[-1], nifty_known[0]))
         if len(nifty_known) >= 2
         else None,
+        min_cash=finite(min(cashes)) if cashes else None,
+        max_exposure_pct=finite(max(exposures)) if exposures else None,
+        levered_days=sum(1 for c in cashes if c < 0.0),
         equity_curve=curve_rows,
         open_trades=[trade_dict(t) for t in open_],
         recent_closed=[

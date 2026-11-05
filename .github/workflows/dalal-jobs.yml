@@ -49,6 +49,7 @@ on:
           - train-ideas
           - predict --force
           - ideas --force
+          - ideas --dry-run
           - verify-ledger
 
 permissions:
@@ -127,7 +128,7 @@ jobs:
           esac
           # Every command the workflow may run, as a regex (an unquoted variable so bash
           # reads it as one; the spaces are part of the pattern).
-          ALLOW='^(migrate|sync-instruments|backfill|test-telegram|train|train-ideas( --horizon [a-z]+)?|predict( --force)?|ideas( --force)?|verify-ledger|run-job [a-z_]+( --force)?)$'
+          ALLOW='^(migrate|sync-instruments|backfill|test-telegram|train|train-ideas( --horizon [a-z]+)?|predict( --force)?|ideas( --force)?( --dry-run)?|verify-ledger|run-job [a-z_]+( --force)?)$'
           if ! [[ "$CMD" =~ $ALLOW ]]; then
             echo "Refusing unexpected command: $CMD"; exit 1
           fi

@@ -1,7 +1,7 @@
 """From scored candidates to the day's ideas: price levels, EV after costs, the bar, the
 ranking, the caps and position sizing (brief §4.2; contract §2 "Ranking").
 
-    levels   entry zone = close(D) +/- ENTRY_ZONE_ATR x ATR(14); stop = close x (1 - k_s x
+    levels   entry zone = close(D) +/- core.ENTRY_ZONE_ATR x ATR(14); stop = close x (1 - k_s x
              ATR%); target_1 = close x (1 + k_t x ATR%); target_2 = 1.5 x the target_1
              distance. k_t / k_s come from the horizon (`core.HorizonSpec`). T and S are the
              % distances from the zone's midpoint, the same distances the labels used.
@@ -27,13 +27,13 @@ from dataclasses import dataclass, field
 
 from app.config import Settings, get_settings
 from app.ml import costs
-from app.ml.core import Driver, HorizonSpec, IdeaOutput, finite, horizons
+from app.ml.core import ENTRY_ZONE_ATR, Driver, HorizonSpec, IdeaOutput, finite, horizons
 from app.ml.strategies import STRATEGY_NAMES, Candidate
 
-ENTRY_ZONE_ATR = 0.5  # half-width of the entry zone, in ATR(14), around the close of D
 TARGET_2_MULTIPLE = 1.5  # target_2 distance = 1.5 x target_1 distance
 NO_EDGE_TEXT = "No edge today"
 PRICE_DECIMALS = 2
+CLOSEST_N = 5  # candidates per horizon the report lists by EV, bar or no bar
 
 
 def no_edge_text(horizon: str | None = None, settings: Settings | None = None) -> str:
@@ -198,6 +198,9 @@ class RankReport:
     best_p_target: float | None
     best_ev_pct: float | None
     no_edge: dict[str, str]  # horizon -> "No edge today ..." for horizons with no idea
+    # horizon -> the CLOSEST_N best priced candidates by EV whether or not they cleared
+    # the bar: on a "No edge" day this is how far off the nearest miss was.
+    closest: dict[str, list[dict[str, object]]] = field(default_factory=dict)
 
     def as_dict(self) -> dict[str, object]:
         return {
@@ -209,7 +212,18 @@ class RankReport:
             "best_p_target": finite(self.best_p_target),
             "best_ev_pct": finite(self.best_ev_pct),
             "no_edge": dict(self.no_edge),
+            "closest": {h: [dict(r) for r in rows] for h, rows in self.closest.items()},
         }
+
+
+def _closest_row(out: IdeaOutput, cleared: bool) -> dict[str, object]:
+    return {
+        "symbol": out.symbol,
+        "strategy": out.strategy,
+        "p_target": finite(out.p_target),
+        "ev_pct_after_costs": finite(out.ev_pct_after_costs),
+        "cleared": cleared,
+    }
 
 
 def _sort_key(out: IdeaOutput) -> tuple[float, float, int, str]:
@@ -232,6 +246,7 @@ def rank_report(scored: Iterable[ScoredLike], settings: Settings | None = None) 
     """
     s = settings or get_settings()
     outputs: dict[str, list[IdeaOutput]] = {}
+    priced: dict[str, list[tuple[IdeaOutput, bool]]] = {}
     n_candidates = n_unpriced = n_cleared = n_unsizable = 0
     best_p: float | None = None
     best_ev: float | None = None
@@ -250,7 +265,9 @@ def rank_report(scored: Iterable[ScoredLike], settings: Settings | None = None) 
         best_ev = (
             out.ev_pct_after_costs if best_ev is None else max(best_ev, out.ev_pct_after_costs)
         )
-        if not clears_bar(out, s):
+        cleared = clears_bar(out, s)
+        priced.setdefault(out.horizon, []).append((out, cleared))
+        if not cleared:
             continue
         n_cleared += 1
         if size_position(entry_mid(out), out.stop, s)[0] <= 0:
@@ -273,6 +290,12 @@ def rank_report(scored: Iterable[ScoredLike], settings: Settings | None = None) 
             ideas.extend(kept)
         else:
             no_edge[h] = no_edge_text(h, s)
+    closest = {
+        h: [
+            _closest_row(o, c) for o, c in sorted(rows, key=lambda oc: _sort_key(oc[0]))[:CLOSEST_N]
+        ]
+        for h, rows in priced.items()
+    }
     return RankReport(
         ideas=ideas,
         n_candidates=n_candidates,
@@ -282,6 +305,7 @@ def rank_report(scored: Iterable[ScoredLike], settings: Settings | None = None) 
         best_p_target=best_p,
         best_ev_pct=best_ev,
         no_edge=no_edge,
+        closest=closest,
     )
 
 

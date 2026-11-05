@@ -208,6 +208,7 @@ docker compose run --rm backend python -m app.cli train                 # first 
 docker compose run --rm backend python -m app.cli predict --force       # record a call now
 docker compose run --rm backend python -m app.cli train-ideas           # idea models (both horizons)
 docker compose run --rm backend python -m app.cli ideas --force         # today's ideas now
+docker compose run --rm backend python -m app.cli ideas --dry-run       # preview, nothing recorded
 docker compose run --rm backend python -m app.cli paper --summary       # paper portfolio stats
 docker compose run --rm backend python -m app.cli verify-ledger         # check both hash chains
 docker compose run --rm backend python -m app.cli scorecard

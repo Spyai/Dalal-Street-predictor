@@ -76,6 +76,14 @@ export default function PaperPage() {
           statistic here as unproven until there are {data.min_sample_size}.
         </Notice>
       )}
+      {data.levered_days > 0 && (
+        <Notice tone="down">
+          Cash went negative on {data.levered_days} snapshot{data.levered_days === 1 ? "" : "s"}
+          (lowest {fmtRupees(data.min_cash)}): the book was implicitly borrowing, so the returns
+          above are on more than the paper capital. Auto trades are now cut to the cash available;
+          this can only come from manual trades.
+        </Notice>
+      )}
 
       <div className="grid gap-4 lg:grid-cols-2">
         <Section title="Trade statistics (closed paper trades)">
@@ -96,6 +104,8 @@ export default function PaperPage() {
             <Row label="Sortino (paper, annualised)" value={`${fmtNum(data.sortino, 2)} (n=${data.n_returns})`} />
             <Row label="Max drawdown" value={data.max_drawdown_pct === null ? "—" : `${data.max_drawdown_pct.toFixed(2)}%`} tone="text-down" />
             <Row label="Snapshots" value={String(data.n_days)} />
+            <Row label="Lowest cash" value={fmtRupees(data.min_cash)} tone={data.min_cash !== null && data.min_cash < 0 ? "text-down" : ""} />
+            <Row label="Peak exposure (invested / equity)" value={fmtPct(data.max_exposure_pct)} />
           </dl>
           <p className="mt-2 text-[11px] text-faint">{data.note}</p>
         </Section>

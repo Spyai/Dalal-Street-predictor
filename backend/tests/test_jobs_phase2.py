@@ -69,7 +69,7 @@ SATURDAY_1000 = datetime(2026, 10, 31, 10, 0, tzinfo=IST)
 SETTINGS = Settings(prediction_targets=TARGET, wf_min_train_days=150, wf_step_days=60)
 ALLOWLIST = (
     "^(migrate|sync-instruments|backfill|test-telegram|train|train-ideas( --horizon [a-z]+)?|"
-    "predict( --force)?|ideas( --force)?|verify-ledger|run-job [a-z_]+( --force)?)$"
+    "predict( --force)?|ideas( --force)?( --dry-run)?|verify-ledger|run-job [a-z_]+( --force)?)$"
 )
 
 

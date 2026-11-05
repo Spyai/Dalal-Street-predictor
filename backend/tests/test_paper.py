@@ -368,10 +368,14 @@ def test_summary_aggregates_trades_and_the_curve(db: Session) -> None:
     assert s.sample_warning is False  # min_sample_size 3 reached
     assert portfolio_summary(db).sample_warning is True  # the default 100 is not
 
+    # The curve statistics start from the paper capital on the session before the first
+    # snapshot, so four snapshots give four daily returns (the first one 0 here).
     equity = [1_000_000.0, 1_000_200.0, 1_000_000.0, 1_000_400.0]
-    r = daily_returns(equity)
-    assert s.n_days == 4 and s.n_returns == 3
+    r = daily_returns([cheap.paper_capital, *equity])
+    assert s.n_days == 4 and s.n_returns == 4
     assert s.max_drawdown_pct == pytest.approx(200.0 / 1_000_200.0 * 100)
+    assert s.min_cash == pytest.approx(1_000_000.0) and s.levered_days == 0  # cash = equity here
+    assert s.max_exposure_pct == 0.0  # the test rows carry no invested amount
     assert s.sharpe == pytest.approx(sharpe_ratio(r))
     assert s.sortino == pytest.approx(sortino_ratio(r))
     assert s.total_return_pct == pytest.approx(0.04)
@@ -393,11 +397,19 @@ def test_summary_aggregates_trades_and_the_curve(db: Session) -> None:
 
 
 def test_summary_with_too_few_snapshots_has_no_ratios(db: Session) -> None:
-    db.add(_equity_row(SESSION, 1_000_000.0, 25_000.0))
-    db.add(_equity_row(D1, 1_001_000.0, 25_100.0))
+    db.add(_equity_row(SESSION, 1_001_000.0, 25_000.0))
     db.commit()
     s = portfolio_summary(db)
-    assert s.n_days == 2 and s.n_returns == 1
+    assert s.n_days == 1 and s.n_returns == 1  # capital -> first snapshot: one return
     assert s.sharpe is None and s.sortino is None  # one return: no deviation
     assert s.max_drawdown_pct == 0.0 and s.total_return_pct == pytest.approx(0.1)
-    assert s.nifty_return_pct == pytest.approx(0.4)
+    assert s.nifty_return_pct is None  # one close: no move to report
+    # A fall on the very first session is a drawdown from the capital, not from nothing.
+    db.add(_equity_row(D1, 990_000.0, 25_100.0, cash=-5_000.0))
+    db.commit()
+    s2 = portfolio_summary(db)
+    assert s2.n_days == 2 and s2.n_returns == 2
+    assert s2.max_drawdown_pct == pytest.approx(11_000.0 / 1_001_000.0 * 100)
+    assert s2.min_cash == -5_000.0 and s2.levered_days == 1
+    assert s2.max_exposure_pct == pytest.approx(995_000.0 / 990_000.0 * 100)
+    assert s2.nifty_return_pct == pytest.approx(0.4)

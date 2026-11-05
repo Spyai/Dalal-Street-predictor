@@ -43,6 +43,7 @@ from app.models import (
 )
 from app.providers.base import Bar
 from app.services import brief, idea_grading, instruments, ledger, paper
+from app.services.calendar import TradingCalendar
 from app.services.ideas_scorecard import IdeaTrack
 from app.services.market_data import upsert_daily_bars
 from tests.test_idea_grading import bars as grading_bars
@@ -78,7 +79,7 @@ PLAIN = [f"PLAIN{i}" for i in range(6)]
 BREAKOUT, OVERSOLD = "BRKOUT", "OVRSLD"
 ALLOWLIST = (
     "^(migrate|sync-instruments|backfill|test-telegram|train|train-ideas( --horizon [a-z]+)?|"
-    "predict( --force)?|ideas( --force)?|verify-ledger|run-job [a-z_]+( --force)?)$"
+    "predict( --force)?|ideas( --force)?( --dry-run)?|verify-ledger|run-job [a-z_]+( --force)?)$"
 )
 # The market model's small walk-forward window (as in Phase 2) and a ranking bar every
 # priced candidate clears, so the ideas reach the ledger: the tests are about the loop,
@@ -698,7 +699,7 @@ def test_morning_brief_ideas_section(db: Session) -> None:
     assert "EV +" in line and "after costs" in line and "R:R 2.0" in line
     assert "50 shares ≈ ₹50,000" in line
     assert "breakout/swing so far: unproven (no graded ideas yet)" in line
-    assert "<b>No edge today</b> (positional): no candidate clears P(target) &gt;= 55%" in msg
+    assert "<b>No edge today</b> (positional): no candidate clears P(target) &gt;= 40%" in msg
     assert "ASM/GSM surveillance status: unknown" in msg and "paper positions" in msg
     assert f"Idea ledger head: seq {idea.seq}, {idea.hash[:12]}" in msg
     assert "Ledger head:" not in msg.replace("Idea ledger head:", "")  # no prediction anchor
@@ -966,7 +967,7 @@ def _bash_matches(cmd: str) -> bool:
 def test_jobs_workflow_offers_the_phase3_commands_and_the_allowlist_holds() -> None:
     wf = _workflow()
     options = wf["on"]["workflow_dispatch"]["inputs"]["command"]["options"]
-    assert {"train-ideas", "ideas --force"} <= set(options)
+    assert {"train-ideas", "ideas --force", "ideas --dry-run"} <= set(options)
     steps = {s.get("id") or s.get("name"): s for s in wf["jobs"]["run"]["steps"]}
     pick, run = steps["pick"]["run"], steps["Run"]["run"]
     assert f"ALLOW='{ALLOWLIST}'" in pick and '[[ "$CMD" =~ $ALLOW ]]' in pick
@@ -974,7 +975,12 @@ def test_jobs_workflow_offers_the_phase3_commands_and_the_allowlist_holds() -> N
     # Evaluated by bash exactly as the workflow does: every option, the horizon form...
     for opt in options:
         assert _bash_matches(opt), opt
-    for ok in ("train-ideas --horizon swing", "train-ideas --horizon positional", "ideas"):
+    for ok in (
+        "train-ideas --horizon swing",
+        "train-ideas --horizon positional",
+        "ideas",
+        "ideas --force --dry-run",
+    ):
         assert _bash_matches(ok), ok
     # ...and nothing else: no injection, no extra flags, no other commands.
     for bad in (
@@ -1057,3 +1063,60 @@ def test_premarket_marks_a_late_idea(
     d = _last_run(db, "premarket_prediction").details["ideas"]["swing"]["ideas"][0]
     assert d["is_late"] is True and d["surveillance_unknown"] is True
     assert SESSION and AS_OF  # the shared ledger constants are importable (owner C's helpers)
+
+
+# ------------------------------------------------------------------ dry run
+
+
+def _ctx(db: Session) -> runner.JobContext:
+    return runner.JobContext(
+        db=db,
+        now=FRIDAY_0730,
+        today=FRIDAY,
+        calendar=TradingCalendar.load(db),
+        settings=SETTINGS,
+        force=True,
+    )
+
+
+def test_dry_run_scores_everything_and_records_nothing(
+    db: Session,
+    champion: ModelVersion,  # noqa: F811
+    stocks: dict[str, list[Bar]],
+    ideas_champions: dict[str, ModelVersion],
+    fakes: dict[str, Any],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    out = tasks.ideas_dry_run(_ctx(db))
+    db.commit()
+    assert out.recorded == 0 and out.ideas == [] and _ideas(db) == []
+    assert out.details["dry_run"] is True and out.details["already_recorded"] == 0
+    assert out.details["session"] == FRIDAY.isoformat()
+    assert out.details["signal_session"] == LAST.isoformat()
+    for h in ("swing", "positional"):
+        d = out.details[h]
+        assert d["status"] == "dry run: not recorded"
+        assert d["model_version"] == ideas_champions[h].version
+        assert d["ideas"] and all(r["status"] == "dry run" for r in d["ideas"])
+        assert all(r["position_qty"] > 0 and r["p_target"] is not None for r in d["ideas"])
+        assert [r["rank"] for r in d["ideas"]] == list(range(1, len(d["ideas"]) + 1))
+    closest = out.details["ranking"]["closest"]
+    assert set(closest) == {"swing", "positional"}
+    assert all(c["cleared"] for c in closest["swing"]) and len(closest["swing"]) <= 5
+    assert "(dry run, not recorded)" in out.summary
+    assert fakes["sent"] == []  # no brief for a rehearsal
+    assert ledger.verify_ledger(db, "idea").ok
+
+    # A live run afterwards records as usual; a dry run then still scores every horizon
+    # and reports what the ledger already holds.
+    assert _run("premarket_prediction", FRIDAY_0730) == "success"
+    n = len(_ideas(db))
+    assert n > 0
+    again = tasks.ideas_dry_run(_ctx(db))
+    assert again.details["already_recorded"] == n and again.recorded == 0
+    assert len(_ideas(db)) == n and again.details["swing"]["status"] == "dry run: not recorded"
+
+    # The CLI: prints, exits 0, writes nothing.
+    monkeypatch.setattr(cli, "get_settings", lambda: SETTINGS)
+    assert cli.main(["ideas", "--dry-run"]) == 0
+    assert len(_ideas(db)) == n

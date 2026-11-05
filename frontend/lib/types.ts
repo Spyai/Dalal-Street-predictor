@@ -345,6 +345,9 @@ export interface Paper {
   sortino: number | null;
   total_return_pct: number | null;
   nifty_return_pct: number | null;
+  min_cash: number | null; // lowest cash on any snapshot; negative means the book borrowed
+  max_exposure_pct: number | null; // highest invested / equity, %
+  levered_days: number; // snapshots with negative cash
   equity_curve: EquityPoint[];
   open_trades: PaperTrade[];
   recent_closed: PaperTrade[];
@@ -384,9 +387,21 @@ export interface IdeaOos {
   expectancy_after_costs_pct: number | null;
   expectancy_ranked_pct: number | null;
   expectancy_all_candidates_pct: number | null;
+  hit_rate_top: number | null;
+  n_top: number | null;
+  expectancy_top_pct: number | null;
   cost_round_trip_pct: number | null;
   n_sessions: number | null;
   embargo_sessions: number | null;
+}
+
+// One decile of out-of-sample P(target): 1 = the lowest tenth, 10 = the highest.
+export interface IdeaLiftRow {
+  decile: number;
+  n: number;
+  p_mean: number | null;
+  hit_rate: number | null;
+  expectancy_pct: number | null;
 }
 
 export interface IdeaOosBaseline {
@@ -409,6 +424,7 @@ export interface IdeaChampion {
   baselines: IdeaOosBaseline[];
   per_strategy: Record<string, Record<string, number | null>>;
   calibration: CalibrationBin[];
+  lift: IdeaLiftRow[];
   class_frequencies: Record<string, number | null> | null;
   notes: string[];
   oos_verdict: string;

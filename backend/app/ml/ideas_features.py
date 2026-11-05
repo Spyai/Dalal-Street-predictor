@@ -49,7 +49,7 @@ from sqlalchemy.orm import Session
 from app.config import Settings, get_settings
 from app.logging import get_logger
 from app.ml import features
-from app.ml.core import HorizonSpec
+from app.ml.core import ENTRY_ZONE_ATR, HorizonSpec
 from app.models import DailyBar, Instrument, MarketHoliday
 from app.services import indicators as ind
 from app.services.calendar import TradingCalendar
@@ -139,6 +139,7 @@ LABEL_COLUMNS: tuple[str, ...] = (
     "target_price",
     "stop_price",
     "window_closed",
+    "invalidated",
     "label",
     "expired",
     "exit_session",
@@ -507,7 +508,7 @@ def _empty_labels(index: pd.Index) -> pd.DataFrame:
     for col in LABEL_COLUMNS:
         if col in ("entry_session", "exit_session"):
             out[col] = pd.Series([None] * len(index), index=index, dtype=object)
-        elif col in ("window_closed", "expired"):
+        elif col in ("window_closed", "invalidated", "expired"):
             out[col] = False
         else:
             out[col] = np.nan
@@ -517,18 +518,27 @@ def _empty_labels(index: pd.Index) -> pd.DataFrame:
 def triple_barrier_labels(
     bars: pd.DataFrame, signal_sessions: Iterable[date], horizon: HorizonSpec
 ) -> pd.DataFrame:
-    """Triple-barrier outcome of a long entered at the open after each signal session.
+    """Triple-barrier outcome of the idea the desk would have recorded on each signal session.
+
+    The event is the one the ledger grades (app.services.idea_grading): levels are set
+    from the signal session D, target = close(D) x (1 + k_t x ATR14(D)/close(D)) and
+    stop = close(D) x (1 - k_s x ...); the idea is filled at the next session's open only
+    when that open lies inside the entry zone close(D) +/- core.ENTRY_ZONE_ATR x ATR14(D),
+    otherwise it is `invalidated` (never traded, so never labelled: these rows are
+    excluded from training and reported as a share). The window is the `days` bars from
+    the entry bar on; the stop wins a same-bar tie.
 
     `bars`: one stock's session bars (DatetimeIndex; open/high/low/close; as returned by
     `services.market_data.daily_frame`, with non-session bars already dropped). Returns a
     frame indexed by the signal sessions in the given order with LABEL_COLUMNS:
     entry_session/entry_price (the next bar and its open; None/NaN when there is none yet),
-    target_pct/stop_pct (k_t, k_s x ATR14(D)/close(D) in %), target_price/stop_price,
-    window_closed (`days` bars exist after D), label (1.0 target first, 0.0 stop first or
-    expired, NaN when not labelled), expired, exit_session/exit_price (barrier price, the
-    open if the session gapped through it, or the last close on expiry), realised_return_pct
-    (exit vs entry, %), days_held (entry session = 1). A signal not among the bar dates or
-    with no ATR yet stays unlabelled. Nothing after the window is read.
+    target_pct/stop_pct (k_t, k_s x ATR14(D)/close(D) in %), target_price/stop_price
+    (anchored at close(D)), window_closed (`days` bars exist after D), invalidated (the
+    open was outside the zone), label (1.0 target first, 0.0 stop first or expired, NaN
+    when not labelled), expired, exit_session/exit_price (barrier price, the open if the
+    session gapped through it, or the last close on expiry), realised_return_pct (exit vs
+    entry, %), days_held (entry session = 1). A signal not among the bar dates or with no
+    ATR yet stays unlabelled. Nothing after the window is read.
     """
     signals = [_as_date(d) for d in signal_sessions]
     index = pd.Index(signals, dtype=object, name="session_date")
@@ -560,16 +570,15 @@ def triple_barrier_labels(
         entry_pos = pos + 1
         has_entry = valid & (entry_pos < n)
         entry_price = np.where(has_entry, o[np.clip(entry_pos, 0, n - 1)], np.nan)
-        target_price = entry_price * (1.0 + target_pct / 100.0)
-        stop_price = entry_price * (1.0 - stop_pct / 100.0)
+        anchor = np.where(valid, c[posc], np.nan)  # close(D): the levels the ledger records
+        target_price = anchor * (1.0 + target_pct / 100.0)
+        stop_price = anchor * (1.0 - stop_pct / 100.0)
+        zone_half = ENTRY_ZONE_ATR * np.where(valid, atr[posc], np.nan)
+        priced = np.isfinite(target_pct) & (target_pct > 0.0) & (stop_pct > 0.0)
+        in_zone = has_entry & priced & (np.abs(entry_price - anchor) <= zone_half)
+        invalidated = has_entry & priced & ~in_zone  # the 09:20 rule would not have filled
         window_closed = valid & (pos + days < n)
-        labelled = (
-            window_closed
-            & np.isfinite(entry_price)
-            & np.isfinite(target_pct)
-            & (target_pct > 0.0)
-            & (stop_pct > 0.0)
-        )
+        labelled = window_closed & in_zone
 
         rows = np.arange(m)
         idx = np.clip(entry_pos[:, None] + np.arange(days)[None, :], 0, n - 1)
@@ -607,6 +616,7 @@ def triple_barrier_labels(
     out["target_price"] = target_price
     out["stop_price"] = stop_price
     out["window_closed"] = window_closed
+    out["invalidated"] = invalidated
     out["label"] = label
     out["expired"] = expired
     out["exit_session"] = pd.Series(

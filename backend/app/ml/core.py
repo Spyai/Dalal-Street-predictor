@@ -224,6 +224,13 @@ class TrainResult:
 
 # --------------------------------------------------------------------- Phase 3
 
+# Half-width of an idea's entry zone around the close of the signal session, in ATR(14).
+# Shared by the live levels (app.ml.ranking.price_levels), the 09:20 fill rule and the
+# training labels (app.ml.ideas_features.triple_barrier_labels), so the model's P(target)
+# is the probability of the very event the ledger grades: filled inside the zone, then
+# the recorded target before the recorded stop.
+ENTRY_ZONE_ATR = 0.5
+
 
 @dataclass(frozen=True)
 class HorizonSpec:

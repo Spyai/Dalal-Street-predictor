@@ -56,6 +56,9 @@ OOS_KEYS: tuple[str, ...] = (
     "expectancy_after_costs_pct",
     "expectancy_ranked_pct",
     "expectancy_all_candidates_pct",
+    "hit_rate_top",
+    "n_top",
+    "expectancy_top_pct",
     "cost_round_trip_pct",
     "n_sessions",
     "embargo_sessions",
@@ -244,24 +247,46 @@ def oos_baselines(metrics: Mapping[str, Any]) -> list[dict[str, Any]]:
 
 
 def oos_verdict_text(oos: Mapping[str, Any], baselines: list[dict[str, Any]]) -> str:
-    """One plain-words line about the walk-forward period: the selected ideas' hit rate
-    against every candidate's, and the expectancy after costs. Says so when a number is
-    missing."""
+    """Plain words about the walk-forward period: the selected ideas' hit rate against
+    every candidate's and the expectancy after costs; when nothing cleared the bar, that;
+    and, when stored, the replay that shows the best ideas every session regardless of
+    the bar. Says so when a number is missing."""
     hit = finite(oos.get("hit_rate"))
     n_sel = finite(oos.get("n_selected"))
-    if hit is None or n_sel is None:
-        return "No out-of-sample hit rate was stored with this model."
-    text = f"Out of sample {int(n_sel)} ideas cleared the bar and hit the target {hit:.0%}"
     base = next((b for b in baselines if b["name"] == "all_candidates"), None)
-    if base is not None and base["hit_rate"] is not None and base["n"] > 0:
-        text += f" of the time, against {base['hit_rate']:.0%} for every candidate (n={base['n']})."
+    base_text = (
+        f"{base['hit_rate']:.0%} for every candidate (n={base['n']})"
+        if base is not None and base["hit_rate"] is not None and base["n"] > 0
+        else None
+    )
+    if n_sel is not None and int(n_sel) == 0:
+        text = "Out of sample no candidate cleared the bar, so the bar itself is untested."
+    elif hit is None or n_sel is None:
+        text = "No out-of-sample hit rate was stored with this model."
     else:
-        text += " of the time; no all-candidates baseline was stored to compare with."
-    exp = finite(oos.get("expectancy_after_costs_pct"))
-    if exp is not None:
-        text += f" Expectancy after costs {exp:+.2f}% per idea."
-    else:
-        text += " No expectancy after costs was stored."
+        text = f"Out of sample {int(n_sel)} ideas cleared the bar and hit the target {hit:.0%}"
+        if base_text is not None:
+            text += f" of the time, against {base_text}."
+        else:
+            text += " of the time; no all-candidates baseline was stored to compare with."
+        exp = finite(oos.get("expectancy_after_costs_pct"))
+        if exp is not None:
+            text += f" Expectancy after costs {exp:+.2f}% per idea."
+        else:
+            text += " No expectancy after costs was stored."
+    top = finite(oos.get("hit_rate_top"))
+    n_top = finite(oos.get("n_top"))
+    if top is not None and n_top is not None and int(n_top) > 0:
+        text += (
+            f" Showing the best ideas every session regardless of the bar would have hit "
+            f"{top:.0%} (n={int(n_top)})"
+        )
+        if base_text is not None:
+            text += f" against {base_text}"
+        exp_top = finite(oos.get("expectancy_top_pct"))
+        if exp_top is not None:
+            text += f", {exp_top:+.2f}% per idea after costs"
+        text += "."
     return text
 
 
@@ -279,6 +304,7 @@ def champion_summary(
     baselines = oos_baselines(metrics)
     per_strategy = metrics.get("per_strategy")
     calibration = metrics.get("calibration")
+    lift = metrics.get("lift")
     freq = metrics.get("class_frequencies")
     return {
         "id": mv.id,
@@ -292,6 +318,7 @@ def champion_summary(
         "baselines": baselines,
         "per_strategy": dict(per_strategy) if isinstance(per_strategy, Mapping) else {},
         "calibration": list(calibration) if isinstance(calibration, list) else [],
+        "lift": list(lift) if isinstance(lift, list) else [],
         "class_frequencies": dict(freq) if isinstance(freq, Mapping) else None,
         "notes": list(metrics.get("notes") or []),
         "oos_verdict": oos_verdict_text(oos, baselines),

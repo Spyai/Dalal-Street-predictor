@@ -788,7 +788,11 @@ def test_training_data_from_the_database(seeded: tuple[Session, list[date], int]
     # Purging: the last `days` sessions are unlabelled, everything before is labelled.
     last_labelled = max(days[: len(days) - spec.days])
     assert frame.loc[frame["session_date"] > last_labelled, "label"].isna().all()
-    assert frame.loc[frame["session_date"] <= last_labelled, "label"].notna().all()
+    before = frame["session_date"] <= last_labelled
+    # ...unless the next open was outside the entry zone: never filled, never labelled.
+    assert (frame.loc[before, "label"].notna() | frame.loc[before, "invalidated"]).all()
+    assert frame.loc[frame["invalidated"], "label"].isna().all()
+    assert td.n_invalidated == int(frame["invalidated"].sum())
     assert frame["label"].dropna().isin([0.0, 1.0]).all()
     # Every candidate is one of the labelled universe rows, with the same label.
     uni = td.universe
@@ -833,7 +837,10 @@ def test_training_data_from_the_database(seeded: tuple[Session, list[date], int]
         td2.frame, on=["symbol", "session_date", "strategy"], suffixes=("", "_2")
     )
     assert len(merged) == len(labelled_before)
-    assert (merged["label"] == merged["label_2"]).all()
+    same = (merged["label"] == merged["label_2"]) | (
+        merged["label"].isna() & merged["label_2"].isna()  # both unlabelled (no fill)
+    )
+    assert same.all()
     assert np.allclose(merged["rsi14"], merged["rsi14_2"], equal_nan=True)
 
 

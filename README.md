@@ -146,11 +146,20 @@ volume, 12-month-minus-1-month momentum, RSI mean reversion in an uptrend, and a
 the 20-DMA. One LightGBM model per horizon (swing: 10 sessions, target 2 × ATR, stop 1 × ATR;
 positional: 60 sessions, 4 × / 2 × ATR) gives each candidate the probability that the target
 is hit before the stop, trained walk-forward on triple-barrier labels with an embargo so no
-training window overlaps a test signal. Ideas are ranked by expected value after brokerage,
-STT, exchange charges, GST, stamp duty and slippage; at most three per horizon make it, each
-with an entry zone, stop, two targets, the probability, risk-reward, a position size for 1 %
-of paper capital, 3–5 numbered reasons and what invalidates it. Nothing clears the bar → "No
-edge today". ASM/GSM status is never checked (NSE is unreachable from GitHub) and every idea
+training window overlaps a test signal. The label is exactly the event the ledger later
+grades: levels set from the signal session's close, a fill only when the next open lands
+inside the entry zone (otherwise the row is "would not have filled" and never trained on),
+then the recorded target before the recorded stop. Ideas are ranked by expected value after
+brokerage, STT, exchange charges, GST, stamp duty and slippage; the bar is EV ≥ 0.5 % after
+costs with a 40 % probability floor (with 2:1 targets the breakeven probability is about a
+third plus costs, so the floor only keeps lottery tickets out). At most three per horizon
+make it, each with an entry zone, stop, two targets, the probability, risk-reward, a position
+size for 1 % of paper capital (never more than the paper book's cash), 3–5 numbered reasons
+and what invalidates it. Nothing clears the bar → "No edge today", with the nearest misses
+in the job details. The Scorecard shows, per horizon, the out-of-sample hit rate by
+probability decile and what "the best three ideas every session, bar ignored" would have
+done against every candidate, so a model that only echoes the strategies' base rates is
+visible as such. ASM/GSM status is never checked (NSE is unreachable from GitHub) and every idea
 says so. At 09:20 an idea is filled at the open if the open is inside its zone, otherwise it
 is invalidated; at 15:45 open ideas are graded (target / stop / expired, with costs) and the
 paper book is marked to market.
@@ -158,6 +167,7 @@ paper book is marked to market.
 ```bash
 python -m app.cli train-ideas               # both horizons, walk-forward, promotes when no champion
 python -m app.cli ideas --force             # generate today's ideas now (also runs the market calls)
+python -m app.cli ideas --dry-run           # score and rank now, print, record nothing
 python -m app.cli paper --summary           # hit rate, expectancy, profit factor, drawdown, Sharpe
 python -m app.cli verify-ledger             # both chains
 ```

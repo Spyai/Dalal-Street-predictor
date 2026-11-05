@@ -9,6 +9,7 @@ import type {
   Champion,
   IdeaChampion,
   IdeaGroupStats,
+  IdeaLiftRow,
   IdeaRow,
   IdeasScorecard,
   LedgerVerify,
@@ -542,6 +543,11 @@ function IdeaChampionBox({ champion }: { champion: IdeaChampion }) {
         <Row label="OOS log loss" value={fmtNum(oos.log_loss, 3)} />
         <Row label="OOS expectancy after costs" value={fmtPct(oos.expectancy_after_costs_pct)} tone={tone(oos.expectancy_after_costs_pct)} />
         <Row label="All candidates' expectancy" value={fmtPct(oos.expectancy_all_candidates_pct)} tone={tone(oos.expectancy_all_candidates_pct)} />
+        <Row
+          label="Best ideas every session, bar ignored: hit rate"
+          value={`${fmtProb(oos.hit_rate_top)}${oos.n_top !== null && oos.n_top !== undefined ? ` (n=${oos.n_top})` : ""}`}
+        />
+        <Row label="Best ideas every session, bar ignored: expectancy" value={fmtPct(oos.expectancy_top_pct)} tone={tone(oos.expectancy_top_pct)} />
         <Row label="Promoted" value={champion.promoted_at ? `${fmtIstDateTime(champion.promoted_at)} IST` : "—"} />
       </dl>
       <p className={`text-sm ${worse ? "text-down" : "text-muted"}`}>{champion.oos_verdict}</p>
@@ -571,6 +577,7 @@ function IdeaChampionBox({ champion }: { champion: IdeaChampion }) {
           ))}
         </tbody>
       </table>
+      {champion.lift && champion.lift.length > 0 && <LiftTable rows={champion.lift} />}
       {Object.keys(champion.per_strategy).length > 0 && (
         <p className="num text-xs text-muted">
           Per strategy (OOS hit rate):{" "}
@@ -589,6 +596,50 @@ function IdeaChampionBox({ champion }: { champion: IdeaChampion }) {
           ))}
         </ul>
       )}
+    </div>
+  );
+}
+
+function LiftTable({ rows }: { rows: IdeaLiftRow[] }) {
+  const first = rows[0];
+  const last = rows[rows.length - 1];
+  const flat =
+    first !== undefined &&
+    last !== undefined &&
+    first.hit_rate !== null &&
+    last.hit_rate !== null &&
+    last.hit_rate - first.hit_rate < 0.03;
+  return (
+    <div className="space-y-1">
+      <table className="num w-full text-xs">
+        <thead className="text-left text-faint">
+          <tr>
+            <th className="py-1 font-normal">P(target) decile (OOS)</th>
+            <th className="py-1 text-right font-normal">n</th>
+            <th className="py-1 text-right font-normal">Said</th>
+            <th className="py-1 text-right font-normal">Hit rate</th>
+            <th className="py-1 text-right font-normal">Expectancy</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r) => (
+            <tr key={r.decile} className="border-t border-line">
+              <td className="py-1 text-muted">
+                {r.decile === 1 ? "1 (lowest)" : r.decile === rows.length ? `${r.decile} (highest)` : String(r.decile)}
+              </td>
+              <td className="py-1 text-right">{r.n}</td>
+              <td className="py-1 text-right">{fmtProb(r.p_mean)}</td>
+              <td className="py-1 text-right">{fmtProb(r.hit_rate)}</td>
+              <td className={`py-1 text-right ${tone(r.expectancy_pct)}`}>{fmtPct(r.expectancy_pct)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <p className={`text-[11px] ${flat ? "text-down" : "text-faint"}`}>
+        {flat
+          ? "Flat: the tenth the model is most sure about hits about as often as the tenth it is least sure about. The ranking carries little beyond the strategies' base rates."
+          : "A ranking that carries information climbs from decile 1 to 10: the stocks the model is most sure about hit more often."}
+      </p>
     </div>
   );
 }
