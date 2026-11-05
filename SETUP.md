@@ -173,17 +173,24 @@ Then: `docker compose run --rm backend python -m app.cli import-holidays /import
 
 ---
 
+## Intraday alerts need an always-on host
+
+The brief's 09:15–15:30 intraday monitoring (entry / target / stop hits, unusual volume) polls
+every minute, which neither GitHub Actions nor Vercel can do. It stays unbuilt until Dalal runs
+on a machine that is on all day (this Docker setup on a laptop, a small VPS, or a free Oracle
+Cloud VM). Everything else in Phase 3 works on the free hosting.
+
 ## Daily routine
 
 | IST | What happens | You |
 |---|---|---|
 | 06:05 | Holiday calendar refresh | — |
 | 07:00 | Kite login reminder (only if no token today) | Tap the Telegram link |
-| 07:30 | Pre-market prediction: Nifty 50 + Bank Nifty calls locked into the ledger, Telegram brief | Read the brief |
+| 07:30 | Pre-market prediction: Nifty 50 + Bank Nifty calls and up to 3 swing + 3 positional stock ideas locked into the ledgers, Telegram brief | Read the brief |
 | 08:45 | Instrument + universe sync | — |
-| 09:20 | Open check: the gap call is graded against the open | — |
+| 09:20 | Open check: the gap call is graded; ideas are filled inside their entry zone or invalidated | — |
 | every 10 min | Global cues refresh | — |
-| 15:45 | Close grading: every open call is graded against the close | — |
+| 15:45 | Close grading: calls graded against the close, ideas against target/stop/expiry, paper book marked to market | — |
 | 19:30 | Evening pull: FII/DII, bhavcopy + delivery %, gap-fill | — |
 | Sat 10:00 | Weekly retrain: a challenger is promoted only if it beats the champion out of sample | — |
 
@@ -199,7 +206,10 @@ docker compose run --rm backend python -m app.cli jobs
 docker compose run --rm backend python -m app.cli run-job evening_data_pull
 docker compose run --rm backend python -m app.cli train                 # first market-call model
 docker compose run --rm backend python -m app.cli predict --force       # record a call now
-docker compose run --rm backend python -m app.cli verify-ledger         # check the hash chain
+docker compose run --rm backend python -m app.cli train-ideas           # idea models (both horizons)
+docker compose run --rm backend python -m app.cli ideas --force         # today's ideas now
+docker compose run --rm backend python -m app.cli paper --summary       # paper portfolio stats
+docker compose run --rm backend python -m app.cli verify-ledger         # check both hash chains
 docker compose run --rm backend python -m app.cli scorecard
 docker compose run --rm backend python -m app.cli reset-user
 make test                                           # backend tests (throwaway DB on :55432)

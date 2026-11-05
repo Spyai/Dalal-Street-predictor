@@ -15,8 +15,8 @@ fails the build if the Kite adapter references an order endpoint.
 |---|---|---|
 | **1. Data foundation** | Docker Compose, TimescaleDB schema, provider adapters (Kite, yfinance, NSE), backfill, scheduler, holiday calendar, Today page (global cues, FII/DII), Stock page with chart, password + TOTP login, `/health` | **Done** |
 | **2. Market call + ledger** | 52-feature point-in-time pipeline with leakage tests, walk-forward LightGBM (Nifty 50 + Bank Nifty), four naive baselines, append-only hash-chained ledger with verify, 07:30 / 09:20 / 15:45 jobs, Saturday champion/challenger retrain, Scorecard page, Today market-call cards, Telegram morning brief | **Done** |
-| 3. Stock ideas + paper trading | Universe filters, swing/positional models, rule-based strategies, EV ranking after costs, Ideas, paper portfolio, intraday alerts | Next |
-| 4. Self-review loop | Nightly reflection, LLM post-mortems, journal, champion/challenger retrain with MLflow, kill switch | — |
+| **3. Stock ideas + paper trading** | Nifty 500 universe filter (turnover, history, price), four transparent candidate strategies, triple-barrier labels, walk-forward LightGBM per horizon (swing 2–10 days, positional 1–3 months), ranking by expected value after a configurable cost model, idea ledger (second hash chain), 09:20 fills, target/stop/expiry grading, paper portfolio with equity curve, Ideas and Paper pages, drivers top 8 + all factors | **Done** (intraday alerts need an always-on host) |
+| 4. Self-review loop | Nightly reflection, LLM post-mortems, journal, champion/challenger retrain with MLflow, kill switch | Next |
 | 5. Depth | Screener, sectors, F&O, events, news sentiment, backtester, broker portfolio import, alerts manager | — |
 
 ## Honesty rules, as implemented
@@ -80,17 +80,20 @@ docker compose run --rm backend python -m app.cli backfill
 backend/
   app/providers/   adapters + polite HTTP client (robots.txt, rate limit, block cooldown)
   app/services/    calendar, instruments, market data, backfill, cues, flows, indicators, kite auth,
-                   ledger (hash chain + verify), grading, scorecard, brief (Telegram text)
+                   ledger (two hash chains + verify), grading, idea_grading, paper, scorecard,
+                   ideas_scorecard, brief (Telegram text)
   app/ml/          core vocabulary, features (point-in-time), events, models (walk-forward
-                   LightGBM + quantiles + drivers), baselines, metrics, registry (champion in Postgres)
+                   LightGBM + quantiles + drivers), baselines, metrics, registry (champion in
+                   Postgres); ideas_features, strategies, ideas_models, costs, ranking
   app/jobs/        schedule (definitions.py), runner (retries/skips/alerts/--force), scheduler process
-  app/api/         FastAPI routers: auth, today, stocks, kite, scorecard, health
+  app/api/         FastAPI routers: auth, today, stocks, kite, scorecard, ideas, paper, health
   app/security/    argon2 + TOTP auth, Fernet encryption for stored secrets
   alembic/         migrations (daily_bar and intraday_bar are hypertables)
   api/index.py      Vercel entrypoint (vercel.json, requirements.txt)
-  tests/           ~330 tests (4 skip until real fixtures are recorded): adapters, lookahead
-                   leakage (features, walk-forward), ledger hashing + immutability, grading,
-                   scorecard, calendar, auth, KV store (Redis vs Postgres), jobs, API, deploy scripts
+  tests/           ~520 tests (4 skip until real fixtures are recorded): adapters, lookahead
+                   leakage (features, labels, walk-forward with embargo), both ledgers' hashing +
+                   immutability, grading, paper math, scorecards, calendar, auth, KV store (Redis
+                   vs Postgres), jobs, API, deploy scripts
 frontend/          Next.js App Router + Tailwind + lightweight-charts (dark by default)
 .github/workflows/ vercel-deploy.yml (one-secret deploy), dalal-jobs.yml (job schedule on Vercel)
 .github/scripts/   the deploy/job scripts those workflows run (tested with a fake Vercel CLI)
@@ -133,6 +136,44 @@ python -m app.cli grade --force         # grade whatever can be graded
 python -m app.cli verify-ledger         # recompute the hash chain; exit 1 if broken
 python -m app.cli scorecard             # the verdict and metrics in the terminal
 ```
+
+## How the stock ideas work (Phase 3)
+
+After the market calls, the 07:30 job scores every Nifty 500 stock that passes the universe
+filter (≥ ₹10 cr average daily turnover, ≥ 250 sessions of history, a bar in the last five
+sessions, price ≥ ₹20). Four transparent strategies propose candidates: 20-day breakout with
+volume, 12-month-minus-1-month momentum, RSI mean reversion in an uptrend, and a pullback to
+the 20-DMA. One LightGBM model per horizon (swing: 10 sessions, target 2 × ATR, stop 1 × ATR;
+positional: 60 sessions, 4 × / 2 × ATR) gives each candidate the probability that the target
+is hit before the stop, trained walk-forward on triple-barrier labels with an embargo so no
+training window overlaps a test signal. Ideas are ranked by expected value after brokerage,
+STT, exchange charges, GST, stamp duty and slippage; at most three per horizon make it, each
+with an entry zone, stop, two targets, the probability, risk-reward, a position size for 1 %
+of paper capital, 3–5 numbered reasons and what invalidates it. Nothing clears the bar → "No
+edge today". ASM/GSM status is never checked (NSE is unreachable from GitHub) and every idea
+says so. At 09:20 an idea is filled at the open if the open is inside its zone, otherwise it
+is invalidated; at 15:45 open ideas are graded (target / stop / expired, with costs) and the
+paper book is marked to market.
+
+```bash
+python -m app.cli train-ideas               # both horizons, walk-forward, promotes when no champion
+python -m app.cli ideas --force             # generate today's ideas now (also runs the market calls)
+python -m app.cli paper --summary           # hit rate, expectancy, profit factor, drawdown, Sharpe
+python -m app.cli verify-ledger             # both chains
+```
+
+## Known gaps after Phase 3
+
+- **Every idea is unproven** until its setup/horizon has 100 graded outcomes; the UI and the
+  Telegram brief say so beside every probability.
+- **Survivorship bias in history.** Universe membership is today's Nifty 500 applied to five
+  years of bars; stocks that left the index are missing from training. Membership history is
+  not published free; it will be recorded going forward from the daily sync.
+- **No intraday alerts** (brief §3 09:15–15:30) on the free hosting: the job stays unbuilt until
+  Dalal runs on an always-on machine (SETUP.md).
+- **ASM/GSM lists, delivery %, fundamentals and news** are not used (no reachable source yet;
+  fundamentals and news are Phase 5).
+- **Nifty 50 price index, not TRI**, on the paper equity curve.
 
 ## Known gaps after Phase 2
 

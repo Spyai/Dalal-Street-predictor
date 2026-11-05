@@ -23,8 +23,9 @@ at ₹0/month. A GitHub Actions workflow does the setup; you add one token.
    Settings → Environment Variables**, for Production and Preview. Leave **Sensitive** off: the
    scheduled jobs read these values, and Vercel won't hand out Sensitive ones. Set the Kite
    redirect URL to `https://<your link>/api/kite/callback`, and re-run the deploy.
-7. **Train the first model.** Actions → **Dalal jobs** → Run workflow → `train` (about 2
-   minutes), then `predict --force` to record the first call. The Today page shows it.
+7. **Train the first models.** Actions → **Dalal jobs** → Run workflow → `train` (about 2
+   minutes) and `train-ideas` (about 10 minutes), then `ideas --force` to record the first
+   calls and ideas. The Today, Ideas and Paper pages show them.
 8. **Merge the PR into `main`.** GitHub only runs scheduled workflows from the default
    branch, so the daily jobs (07:30 call, 09:20 and 15:45 grading, Saturday retrain) start
    then. Pushes to `main` redeploy automatically.
