@@ -94,9 +94,10 @@ class Settings(BaseSettings):
     # Stock ideas (Phase 3). Horizons are volatility-scaled (ATR multiples); costs are the
     # round-trip delivery cost model used to rank ideas by expected value after costs.
     ideas_max_per_horizon: int = 3  # brief §1: 0-3 high-conviction ideas, never 10 weak ones
-    # P(target before stop) floor. The real bar is EV after costs (ideas_min_ev_pct); with
-    # 2:1 targets the breakeven P is ~1/3 + costs, so 0.40 only keeps lottery tickets out.
-    ideas_min_p_target: float = 0.40
+    # P(target before stop) floor. The real bar is EV after costs (ideas_min_ev_pct): with
+    # 2:1 targets EV >= 0.5% already needs P above ~1/3 + costs for any sane ATR, so 0.35
+    # only keeps lottery tickets (a huge payoff at a small P) out.
+    ideas_min_p_target: float = 0.35
     ideas_min_ev_pct: float = 0.5  # expected value after costs (%) below this = not an idea
     ideas_universe_min_bars: int = 250  # a stock needs this much history to be considered
     drivers_top_n: int = 8  # drivers shown per call/idea; the full list is one click away

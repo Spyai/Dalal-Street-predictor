@@ -189,18 +189,18 @@ def test_build_output_carries_levels_ev_and_text() -> None:
 
 def test_the_bar_needs_both_probability_and_ev() -> None:
     s = get_settings()
-    assert (s.ideas_min_p_target, s.ideas_min_ev_pct, s.ideas_max_per_horizon) == (0.40, 0.5, 3)
+    assert (s.ideas_min_p_target, s.ideas_min_ev_pct, s.ideas_max_per_horizon) == (0.35, 0.5, 3)
     # EV for a 2:1 setup = S (3p - 1) - cost. p 0.56, ATR 1 % -> S 1: 0.68 - 0.494 < 0.5.
     low_ev = ranking.build_output(scored("AAA", 0.56, atr=1.0))
     assert low_ev.p_target >= s.ideas_min_p_target and low_ev.ev_pct_after_costs < 0.5
     assert not ranking.clears_bar(low_ev)
-    # p 0.39 on a very volatile stock (ATR 8 %) has EV +0.87 % and still fails the floor.
-    low_p = ranking.build_output(scored("BBB", 0.39, atr=8.0))
+    # p 0.34 on an absurdly volatile stock (ATR 60 %) has EV +0.71 % and still fails the floor.
+    low_p = ranking.build_output(scored("BBB", 0.34, atr=60.0))
     assert low_p.ev_pct_after_costs > 0.5 and not ranking.clears_bar(low_p)
     assert ranking.clears_bar(ranking.build_output(scored("CCC", 0.56, atr=2.0)))
     # p 0.46 on a 3 % ATR stock: EV = 3 (1.38 - 1) - 0.494 = +0.65 % -> over the bar.
     assert ranking.clears_bar(ranking.build_output(scored("DDD", 0.46, atr=3.0)))
-    assert ranking.rank_ideas([scored("AAA", 0.56, atr=1.0), scored("BBB", 0.39, atr=8.0)]) == []
+    assert ranking.rank_ideas([scored("AAA", 0.56, atr=1.0), scored("BBB", 0.34, atr=60.0)]) == []
     stricter = settings(ideas_min_p_target=0.6)
     assert not ranking.clears_bar(ranking.build_output(scored("CCC", 0.56, atr=2.0)), stricter)
 
@@ -280,9 +280,9 @@ def test_no_edge_today_when_nothing_clears() -> None:
     assert report.as_dict()["closest"]["positional"][0]["cleared"] is False
     assert set(report.no_edge) == {"swing", "positional"}
     for text in report.no_edge.values():
-        assert text.startswith("No edge today") and "40%" in text and "0.5%" in text
+        assert text.startswith("No edge today") and "35%" in text and "0.5%" in text
     assert ranking.no_edge_text() == (
-        "No edge today: no candidate clears P(target) >= 40% and EV >= 0.5% after costs"
+        "No edge today: no candidate clears P(target) >= 35% and EV >= 0.5% after costs"
     )
     assert ranking.no_edge_text("swing").startswith("No edge today (swing):")
     assert ranking.NO_EDGE_TEXT == "No edge today"

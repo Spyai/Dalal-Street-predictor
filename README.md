@@ -151,8 +151,8 @@ grades: levels set from the signal session's close, a fill only when the next op
 inside the entry zone (otherwise the row is "would not have filled" and never trained on),
 then the recorded target before the recorded stop. Ideas are ranked by expected value after
 brokerage, STT, exchange charges, GST, stamp duty and slippage; the bar is EV ≥ 0.5 % after
-costs with a 40 % probability floor (with 2:1 targets the breakeven probability is about a
-third plus costs, so the floor only keeps lottery tickets out). At most three per horizon
+costs with a 35 % probability floor (with 2:1 targets EV ≥ 0.5 % already needs a probability
+above a third plus costs, so the floor only keeps lottery tickets out). At most three per horizon
 make it, each with an entry zone, stop, two targets, the probability, risk-reward, a position
 size for 1 % of paper capital (never more than the paper book's cash), 3–5 numbered reasons
 and what invalidates it. Nothing clears the bar → "No edge today", with the nearest misses

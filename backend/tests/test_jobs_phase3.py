@@ -699,7 +699,7 @@ def test_morning_brief_ideas_section(db: Session) -> None:
     assert "EV +" in line and "after costs" in line and "R:R 2.0" in line
     assert "50 shares ≈ ₹50,000" in line
     assert "breakout/swing so far: unproven (no graded ideas yet)" in line
-    assert "<b>No edge today</b> (positional): no candidate clears P(target) &gt;= 40%" in msg
+    assert "<b>No edge today</b> (positional): no candidate clears P(target) &gt;= 35%" in msg
     assert "ASM/GSM surveillance status: unknown" in msg and "paper positions" in msg
     assert f"Idea ledger head: seq {idea.seq}, {idea.hash[:12]}" in msg
     assert "Ledger head:" not in msg.replace("Idea ledger head:", "")  # no prediction anchor

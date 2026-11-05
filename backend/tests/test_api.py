@@ -778,7 +778,7 @@ def test_today_ideas_say_there_is_no_model_before_training(logged_in: TestClient
     )
     assert "train-ideas" in ideas["note"]
     assert ideas["surveillance_note"] == SURVEILLANCE_NOTE and "not checked" in SURVEILLANCE_NOTE
-    assert ideas["min_p_target"] == 0.40 and ideas["min_ev_pct"] == 0.5
+    assert ideas["min_p_target"] == 0.35 and ideas["min_ev_pct"] == 0.5
     assert ideas["max_per_horizon"] == 3
 
 
@@ -801,7 +801,7 @@ def test_today_ideas_say_no_edge_only_when_the_engine_ran(
     for g in ideas["by_horizon"]:
         assert g["no_edge"] is True
         assert g["note"].startswith(f"No edge today ({g['horizon']})")
-        assert "P(target) >= 40%" in g["note"] and "EV >= 0.5%" in g["note"]
+        assert "P(target) >= 35%" in g["note"] and "EV >= 0.5%" in g["note"]
     assert ideas["note"].startswith("No edge today")
 
 
