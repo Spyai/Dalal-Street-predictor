@@ -1,21 +1,29 @@
-"""The immutable, hash-chained prediction ledger (brief §5).
+"""The immutable, hash-chained ledgers (brief §5): market calls and stock ideas.
 
-Every market call is one `Prediction` row. Rows are never updated or deleted (a database
-trigger from migration 0003 rejects both); corrections are new rows that point at the
-original through `corrects_prediction_id`. Each row carries a SHA-256 over its own
-content plus the previous row's hash, so the chain (ordered by `seq`) makes any later
-edit, insertion or removal detectable by `verify_ledger`.
+Two chains, one set of rules. Every market call is one `Prediction` row on the chain
+named "prediction"; every stock idea is one `Idea` row on the chain named "idea". Rows
+are never updated or deleted (database triggers from migrations 0003 and 0004 reject
+both); corrections are new rows that point at the original through
+`corrects_prediction_id` / `corrects_idea_id`. Each row carries a SHA-256 over its own
+content plus the previous row's hash on the same chain, so each chain (ordered by its own
+`seq`) makes any later edit, insertion or removal detectable by `verify_ledger`.
 
-What exactly is hashed is fixed by `hashed_fields` and `canonical_json`: sorted keys, no
-whitespace, ASCII only, NaN/inf forbidden. Every float goes through `core.finite()`
-(10 decimals) before it is stored *and* before it is hashed, so a row re-read from
-Postgres (double precision columns, JSON columns) hashes to exactly the same digest.
-Datetimes are hashed as UTC ISO strings, dates as ISO dates.
+What exactly is hashed is fixed per chain (`HASHED_FIELDS`, `IDEA_HASHED_FIELDS`) and by
+`canonical_json`: sorted keys, no whitespace, ASCII only, NaN/inf forbidden. Every float
+goes through `core.finite()` (10 decimals) before it is stored *and* before it is hashed,
+so a row re-read from Postgres (double precision columns, JSON columns) hashes to exactly
+the same digest. Datetimes are hashed as UTC ISO strings, dates as ISO dates.
 
-One current call per (kind, target, session): `record_market_call` checks for an existing,
-non-superseded record *inside* the ledger lock and raises `LedgerConflict` instead of
-appending a duplicate, so two overlapping 07:30 runs cannot both record. A correction
-must name a record of the same target and session that nobody has corrected yet.
+One current call per (kind, target, session) and one current idea per (symbol, horizon,
+session): `record_market_call` and `record_idea` check for an existing, non-superseded
+record *inside* their chain's advisory lock (`hashtext('prediction_ledger')` and
+`hashtext('idea_ledger')`) and raise `LedgerConflict` instead of appending a duplicate,
+so two overlapping 07:30 runs cannot both record. A correction must name a record of the
+same call (or the same symbol and horizon) and session that nobody has corrected yet.
+
+The "prediction" chain's functions keep their Phase 2 signatures and behaviour exactly;
+the idea chain adds `record_idea`, `latest_idea`, `ideas_for_session`, `open_ideas`,
+`idea_history`, `head_idea` and `verify_ledger(db, chain="idea")`.
 """
 
 from __future__ import annotations
@@ -23,20 +31,22 @@ from __future__ import annotations
 import hashlib
 import json
 import numbers
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import Any
 
-from sqlalchemy import exists, select, text
+from sqlalchemy import exists, or_, select, text
 from sqlalchemy.orm import Session, aliased
 
 from app.config import Settings
-from app.ml.core import CLASSES, MarketCallRecordIn, finite, is_late
-from app.models import Prediction, PredictionGrade
+from app.ml.core import CLASSES, IdeaRecordIn, MarketCallRecordIn, finite, horizons, is_late
+from app.models import Idea, IdeaOutcome, Prediction, PredictionGrade
 
 GENESIS = "0" * 64
 LOCK_SQL = text("SELECT pg_advisory_xact_lock(hashtext('prediction_ledger'))")
+IDEA_LOCK_SQL = text("SELECT pg_advisory_xact_lock(hashtext('idea_ledger'))")
+CHAIN_NAMES: tuple[str, ...] = ("prediction", "idea")
 
 # The record fields covered by the hash, in the order they are documented (the digest
 # itself is order-independent because canonical_json sorts keys).
@@ -68,28 +78,96 @@ HASHED_FIELDS: tuple[str, ...] = (
     "note",
     "prev_hash",
 )
+# Every column of `idea` except id, hash and created_at: the whole record is signed.
+IDEA_HASHED_FIELDS: tuple[str, ...] = (
+    "seq",
+    "session_date",
+    "as_of",
+    "is_late",
+    "instrument_id",
+    "symbol",
+    "exchange",
+    "horizon",
+    "horizon_days",
+    "setup",
+    "direction",
+    "entry_low",
+    "entry_high",
+    "stop",
+    "target_1",
+    "target_2",
+    "p_target",
+    "expected_return_low_pct",
+    "expected_return_high_pct",
+    "risk_reward",
+    "ev_pct_after_costs",
+    "position_qty",
+    "position_value",
+    "risk_amount",
+    "reasons",
+    "invalidation",
+    "drivers",
+    "feature_snapshot",
+    "model_version_id",
+    "strategy",
+    "rank",
+    "surveillance_unknown",
+    "corrects_idea_id",
+    "note",
+    "prev_hash",
+)
 _DATE_FIELDS = {"session_date", "reference_date"}
 _DATETIME_FIELDS = {"as_of"}
+# Pending ideas have no outcome row at all, or one with status "pending".
+OPEN_STATUSES: tuple[str, ...] = ("pending", "open")
 
 
-class LedgerConflict(Exception):
-    """A current (non-superseded) record already exists for this kind, target and session.
+@dataclass(frozen=True)
+class Chain:
+    """One hash chain: its table, lock and the fields its hash covers."""
 
-    Raised under the ledger lock, so the caller can trust `existing` is the row the
-    other writer committed; the caller reports "already recorded" and moves on.
+    name: str
+    model: type[Prediction] | type[Idea]
+    lock_sql: Any
+    hashed_fields: tuple[str, ...]
+
+
+CHAINS: dict[str, Chain] = {
+    "prediction": Chain("prediction", Prediction, LOCK_SQL, HASHED_FIELDS),
+    "idea": Chain("idea", Idea, IDEA_LOCK_SQL, IDEA_HASHED_FIELDS),
+}
+
+
+def chain_spec(chain: str) -> Chain:
+    """The `Chain` named `chain`, or ValueError for a name that is not a ledger."""
+    try:
+        return CHAINS[chain]
+    except KeyError:
+        raise ValueError(f"unknown ledger chain {chain!r}; one of {', '.join(CHAINS)}") from None
+
+
+class LedgerConflict[R: (Prediction, Idea)](Exception):
+    """A current (non-superseded) record already exists for this call or idea and session.
+
+    Raised under the chain's lock, so the caller can trust `existing` is the row the
+    other writer committed (a `Prediction` from `record_market_call`, an `Idea` from
+    `record_idea`); the caller reports "already recorded" and moves on.
     """
 
-    def __init__(self, existing: Prediction) -> None:
+    def __init__(self, existing: R) -> None:
+        if isinstance(existing, Idea):
+            what = f"idea for {existing.symbol} ({existing.horizon})"
+        else:
+            what = f"{existing.kind} for {existing.target}"
         super().__init__(
-            f"{existing.kind} for {existing.target} on {existing.session_date.isoformat()} "
-            f"already recorded as seq {existing.seq}"
+            f"{what} on {existing.session_date.isoformat()} already recorded as seq {existing.seq}"
         )
-        self.existing = existing
+        self.existing: R = existing
 
 
 @dataclass(frozen=True)
 class LedgerVerification:
-    """Result of walking the whole chain. `first_bad_seq` is None when the ledger is intact."""
+    """Result of walking one whole chain. `first_bad_seq` is None when the chain is intact."""
 
     ok: bool
     checked: int
@@ -139,16 +217,33 @@ def _utc_iso(dt: datetime) -> str:
     return dt.astimezone(UTC).isoformat()
 
 
-def hashed_fields(p: Prediction | Mapping[str, object]) -> dict[str, Any]:
+def chain_of(p: Prediction | Idea | Mapping[str, object]) -> str:
+    """Which chain a row or a hashed-fields mapping belongs to.
+
+    A mapping is an idea's when it carries the idea-only key "horizon" and not the
+    call-only key "kind"; a mapping with neither is treated as a prediction's (the Phase 2
+    behaviour).
+    """
+    if isinstance(p, Idea):
+        return "idea"
+    if isinstance(p, Prediction):
+        return "prediction"
+    return "idea" if "horizon" in p and "kind" not in p else "prediction"
+
+
+def hashed_fields(
+    p: Prediction | Idea | Mapping[str, object], chain: str | None = None
+) -> dict[str, Any]:
     """Exactly the fields covered by the hash, normalised as they are stored.
 
-    Accepts an ORM row or any mapping with the same attribute names (for example a
-    modified copy of a previous `hashed_fields` result). Idempotent: feeding the result
-    back in returns an equal dict.
+    Accepts an ORM row of either chain or any mapping with the same attribute names (for
+    example a modified copy of a previous `hashed_fields` result); the chain is inferred
+    (`chain_of`) unless named. Idempotent: feeding the result back in returns an equal dict.
     """
+    spec = chain_spec(chain or chain_of(p))
     get = p.get if isinstance(p, Mapping) else lambda k, _d=None: getattr(p, k)
     out: dict[str, Any] = {}
-    for name in HASHED_FIELDS:
+    for name in spec.hashed_fields:
         v = get(name)
         if name in _DATE_FIELDS and isinstance(v, datetime):
             v = v.date()
@@ -173,6 +268,9 @@ def _check_probs(probs: Mapping[str, float]) -> dict[str, float]:
     return out
 
 
+# ============================================================================= predictions
+
+
 def record_market_call(
     db: Session,
     rec: MarketCallRecordIn,
@@ -180,7 +278,8 @@ def record_market_call(
     kind: str = "market_call",
     settings: Settings | None = None,
 ) -> Prediction:
-    """Append one record to the ledger and return the flushed row (the caller commits).
+    """Append one record to the prediction ledger and return the flushed row (the caller
+    commits).
 
     Takes a transaction-scoped advisory lock so two writers cannot pick the same `seq`
     or the same `prev_hash`; the second one waits until the first commits or rolls back.
@@ -296,7 +395,7 @@ def latest_call(db: Session, target: str, session_date: date) -> Prediction | No
 
 
 def head(db: Session) -> Prediction | None:
-    """The last record in the chain (highest `seq`), or None for an empty ledger."""
+    """The last record in the prediction chain (highest `seq`), or None for an empty ledger."""
     return db.scalars(select(Prediction).order_by(Prediction.seq.desc()).limit(1)).first()
 
 
@@ -348,17 +447,285 @@ def history(
     return [(p, g) for p, g in db.execute(stmt).all()]
 
 
-def verify_ledger(db: Session) -> LedgerVerification:
-    """Walk every row by `seq` and re-derive the chain.
+# ============================================================================= ideas
+
+
+def _positive(value: object, name: str) -> float:
+    v = finite(value)
+    if v is None or v <= 0.0:
+        raise ValueError(f"{name} missing or not positive: {value!r}")
+    return v
+
+
+def _non_negative(value: object, name: str) -> float:
+    v = finite(value)
+    if v is None or v < 0.0:
+        raise ValueError(f"{name} missing or negative: {value!r}")
+    return v
+
+
+def _finite_or_fail(value: object, name: str) -> float:
+    v = finite(value)
+    if v is None:
+        raise ValueError(f"{name} missing or not finite: {value!r}")
+    return v
+
+
+def _check_idea(rec: IdeaRecordIn, settings: Settings | None) -> dict[str, Any]:
+    """Validate an idea's numbers instead of silently fixing them; the checked values."""
+    out = rec.output
+    if rec.as_of.tzinfo is None:
+        raise ValueError("as_of must be timezone-aware")
+    if out.horizon not in horizons(settings):
+        raise ValueError(f"unknown horizon {out.horizon!r}")
+    if out.horizon_days <= 0:
+        raise ValueError(f"horizon_days must be positive, got {out.horizon_days!r}")
+    if not out.symbol or not out.exchange:
+        raise ValueError("an idea needs a symbol and an exchange")
+    if not out.setup or not out.strategy:
+        raise ValueError("an idea needs a setup and a strategy")
+    entry_low = _positive(out.entry_low, "entry_low")
+    entry_high = _positive(out.entry_high, "entry_high")
+    if entry_low > entry_high:
+        raise ValueError(f"entry zone is inverted: {entry_low} > {entry_high}")
+    stop = _positive(out.stop, "stop")
+    if stop >= entry_low:
+        raise ValueError(f"stop {stop} must be below the entry zone [{entry_low}, {entry_high}]")
+    target_1 = _positive(out.target_1, "target_1")
+    if target_1 <= entry_high:
+        raise ValueError(f"target_1 {target_1} must be above the entry zone")
+    target_2 = finite(out.target_2)
+    if out.target_2 is not None and (target_2 is None or target_2 <= target_1):
+        raise ValueError(f"target_2 {out.target_2!r} must be above target_1 {target_1}")
+    p_target = finite(out.p_target)
+    if p_target is None or p_target < 0.0 or p_target > 1.0:
+        raise ValueError(f"p_target missing or out of range: {out.p_target!r}")
+    if not isinstance(rec.position_qty, int) or isinstance(rec.position_qty, bool):
+        raise ValueError(f"position_qty must be an int, got {rec.position_qty!r}")
+    if rec.position_qty < 0:
+        raise ValueError(f"position_qty must not be negative, got {rec.position_qty!r}")
+    if not isinstance(rec.rank, int) or isinstance(rec.rank, bool) or rec.rank < 1:
+        raise ValueError(f"rank must be a positive int, got {rec.rank!r}")
+    if not isinstance(rec.instrument_id, int) or isinstance(rec.instrument_id, bool):
+        raise ValueError(f"instrument_id must be an int, got {rec.instrument_id!r}")
+    return {
+        "entry_low": entry_low,
+        "entry_high": entry_high,
+        "stop": stop,
+        "target_1": target_1,
+        "target_2": target_2,
+        "p_target": p_target,
+        "expected_return_low_pct": _finite_or_fail(
+            out.expected_return_low_pct, "expected_return_low_pct"
+        ),
+        "expected_return_high_pct": _finite_or_fail(
+            out.expected_return_high_pct, "expected_return_high_pct"
+        ),
+        "risk_reward": _positive(out.risk_reward, "risk_reward"),
+        "ev_pct_after_costs": _finite_or_fail(out.ev_pct_after_costs, "ev_pct_after_costs"),
+        "position_value": _non_negative(rec.position_value, "position_value"),
+        "risk_amount": _non_negative(rec.risk_amount, "risk_amount"),
+    }
+
+
+def record_idea(db: Session, rec: IdeaRecordIn, *, settings: Settings | None = None) -> Idea:
+    """Append one stock idea to the idea ledger and return the flushed row (the caller
+    commits).
+
+    Same rules as `record_market_call`, on the idea chain: the `hashtext('idea_ledger')`
+    advisory lock, `seq` and `prev_hash` continue the idea chain only, every float goes
+    through `finite()`, and the hash covers every column (`IDEA_HASHED_FIELDS`). Under
+    the lock a non-correction is refused with `LedgerConflict` when a current idea for
+    (symbol, horizon, session_date) already exists; a correction must name a current idea
+    for the same symbol, horizon and session (ValueError otherwise). Prices are checked
+    for sense (stop below the entry zone, target above it, p_target in [0, 1]); a missing
+    number is an error, never a default. `surveillance_unknown` is stored as given: the
+    engine sets True because no ASM/GSM source is reachable, and the UI says so.
+    """
+    checked = _check_idea(rec, settings)
+    out = rec.output
+
+    db.execute(IDEA_LOCK_SQL)
+    if rec.corrects_idea_id is None:
+        existing = latest_idea(db, out.symbol, out.horizon, rec.session_date)
+        if existing is not None:
+            raise LedgerConflict(existing)
+    else:
+        _check_idea_correction(db, rec)
+    last = db.scalars(select(Idea).order_by(Idea.seq.desc()).limit(1)).first()
+    seq = (last.seq if last is not None else 0) + 1
+    prev_hash = last.hash if last is not None else GENESIS
+
+    row = Idea(
+        seq=seq,
+        session_date=rec.session_date,
+        as_of=rec.as_of,
+        is_late=is_late(rec.as_of, rec.session_date, settings),
+        instrument_id=rec.instrument_id,
+        symbol=out.symbol,
+        exchange=out.exchange,
+        horizon=out.horizon,
+        horizon_days=int(out.horizon_days),
+        setup=out.setup,
+        direction="long",
+        entry_low=checked["entry_low"],
+        entry_high=checked["entry_high"],
+        stop=checked["stop"],
+        target_1=checked["target_1"],
+        target_2=checked["target_2"],
+        p_target=checked["p_target"],
+        expected_return_low_pct=checked["expected_return_low_pct"],
+        expected_return_high_pct=checked["expected_return_high_pct"],
+        risk_reward=checked["risk_reward"],
+        ev_pct_after_costs=checked["ev_pct_after_costs"],
+        position_qty=rec.position_qty,
+        position_value=checked["position_value"],
+        risk_amount=checked["risk_amount"],
+        reasons=[str(r) for r in out.reasons],
+        invalidation=str(out.invalidation),
+        drivers=normalise([d.as_dict() for d in out.drivers]),
+        feature_snapshot=normalise(dict(rec.feature_snapshot)),
+        model_version_id=rec.model_version_id,
+        strategy=out.strategy,
+        rank=rec.rank,
+        surveillance_unknown=bool(rec.surveillance_unknown),
+        corrects_idea_id=rec.corrects_idea_id,
+        note=rec.note,
+        prev_hash=prev_hash,
+    )
+    row.hash = record_hash(hashed_fields(row))
+    db.add(row)
+    db.flush()
+    return row
+
+
+def _idea_superseded() -> Any:
+    """SQL predicate: another idea corrects this one."""
+    later = aliased(Idea)
+    return exists().where(later.corrects_idea_id == Idea.id)
+
+
+def not_superseded_idea() -> Any:
+    """SQL predicate: no correction points at this `Idea` row (for aggregates)."""
+    return ~_idea_superseded()
+
+
+def _check_idea_correction(db: Session, rec: IdeaRecordIn) -> None:
+    original = db.get(Idea, rec.corrects_idea_id)
+    if original is None:
+        raise ValueError(f"corrects_idea_id {rec.corrects_idea_id} does not exist")
+    out = rec.output
+    if (
+        original.symbol != out.symbol
+        or original.horizon != out.horizon
+        or original.session_date != rec.session_date
+    ):
+        raise ValueError(
+            f"correction targets {out.symbol} {out.horizon} {rec.session_date.isoformat()} "
+            f"but idea seq {original.seq} is {original.symbol} {original.horizon} "
+            f"{original.session_date.isoformat()}"
+        )
+    superseded = db.scalar(select(Idea.seq).where(Idea.corrects_idea_id == original.id).limit(1))
+    if superseded is not None:
+        raise ValueError(f"idea seq {original.seq} is already corrected by seq {superseded}")
+
+
+def latest_idea(db: Session, symbol: str, horizon: str, session_date: date) -> Idea | None:
+    """The current idea for a symbol, horizon and session: highest `seq` that no correction
+    supersedes."""
+    return db.scalars(
+        select(Idea)
+        .where(
+            Idea.symbol == symbol,
+            Idea.horizon == horizon,
+            Idea.session_date == session_date,
+            ~_idea_superseded(),
+        )
+        .order_by(Idea.seq.desc())
+        .limit(1)
+    ).first()
+
+
+def head_idea(db: Session) -> Idea | None:
+    """The last record in the idea chain (highest `seq`), or None for an empty ledger."""
+    return db.scalars(select(Idea).order_by(Idea.seq.desc()).limit(1)).first()
+
+
+def ideas_for_session(db: Session, session_date: date, *, current_only: bool = False) -> list[Idea]:
+    """Every idea recorded for a session, in ledger order (by `seq`).
+
+    By default corrections and the originals they supersede are both listed (the ledger
+    is complete); `current_only=True` keeps only the ideas no correction supersedes, the
+    set the Today page shows.
+    """
+    stmt = select(Idea).where(Idea.session_date == session_date)
+    if current_only:
+        stmt = stmt.where(~_idea_superseded())
+    return list(db.scalars(stmt.order_by(Idea.seq.asc())).all())
+
+
+def open_ideas(db: Session, *, through: date | None = None) -> list[Idea]:
+    """Current ideas whose outcome is still pending or open, in ledger order.
+
+    "Pending" is an idea with no `idea_outcome` row yet or one whose status is "pending";
+    "open" is a filled position. Ideas a correction superseded are left out (the
+    correction is graded instead), as are invalidated, voided and graded ones. `through`
+    keeps ideas whose `session_date` is on or before that date (the open check fills the
+    session's own ideas; the close grading walks everything up to today).
+    """
+    stmt = (
+        select(Idea)
+        .outerjoin(IdeaOutcome, IdeaOutcome.idea_id == Idea.id)
+        .where(
+            or_(IdeaOutcome.id.is_(None), IdeaOutcome.status.in_(OPEN_STATUSES)),
+            ~_idea_superseded(),
+        )
+        .order_by(Idea.seq.asc())
+    )
+    if through is not None:
+        stmt = stmt.where(Idea.session_date <= through)
+    return list(db.scalars(stmt).all())
+
+
+def idea_history(
+    db: Session, horizon: str | None = None, limit: int = 50
+) -> list[tuple[Idea, IdeaOutcome | None]]:
+    """Recent ideas with their outcome (if any), newest `as_of` first, then highest seq."""
+    stmt = (
+        select(Idea, IdeaOutcome)
+        .outerjoin(IdeaOutcome, IdeaOutcome.idea_id == Idea.id)
+        .order_by(Idea.as_of.desc(), Idea.seq.desc())
+        .limit(limit)
+    )
+    if horizon is not None:
+        stmt = stmt.where(Idea.horizon == horizon)
+    return [(i, o) for i, o in db.execute(stmt).all()]
+
+
+# ============================================================================= verification
+
+
+def verify_ledger(db: Session, chain: str = "prediction") -> LedgerVerification:
+    """Walk every row of one chain by `seq` and re-derive it.
 
     A row is bad when its `seq` is not the previous one plus 1, its `prev_hash` is not
     the previous row's `hash` (GENESIS for seq 1), or its stored `hash` differs from the
-    digest recomputed from its content. The walk stops at the first bad row.
+    digest recomputed from its content. The walk stops at the first bad row. `chain` is
+    "prediction" (the default: the market-call ledger, exactly as in Phase 2) or "idea".
     """
+    spec = chain_spec(chain)
     # populate_existing: an audit must read the database, not objects cached in the session.
-    rows = db.scalars(
-        select(Prediction).order_by(Prediction.seq.asc()).execution_options(populate_existing=True)
-    ).all()
+    rows: Sequence[Prediction | Idea]
+    if spec.name == "idea":
+        rows = db.scalars(
+            select(Idea).order_by(Idea.seq.asc()).execution_options(populate_existing=True)
+        ).all()
+    else:
+        rows = db.scalars(
+            select(Prediction)
+            .order_by(Prediction.seq.asc())
+            .execution_options(populate_existing=True)
+        ).all()
     prev_hash = GENESIS
     prev_seq = 0
     for row in rows:
@@ -370,7 +737,7 @@ def verify_ledger(db: Session) -> LedgerVerification:
             return LedgerVerification(
                 False, prev_seq, row.seq, f"seq {row.seq}: prev_hash does not match seq {prev_seq}"
             )
-        if record_hash(hashed_fields(row)) != row.hash:
+        if record_hash(hashed_fields(row, spec.name)) != row.hash:
             return LedgerVerification(
                 False, prev_seq, row.seq, f"seq {row.seq}: stored hash does not match its content"
             )
@@ -378,3 +745,8 @@ def verify_ledger(db: Session) -> LedgerVerification:
     n = len(rows)
     msg = "ledger is empty" if n == 0 else f"{n} record{'s' if n != 1 else ''} verified"
     return LedgerVerification(True, n, None, msg)
+
+
+def verify_all(db: Session) -> dict[str, LedgerVerification]:
+    """`verify_ledger` for every chain, keyed by chain name."""
+    return {name: verify_ledger(db, name) for name in CHAIN_NAMES}

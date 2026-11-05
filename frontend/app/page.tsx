@@ -1,11 +1,21 @@
 "use client";
 
+import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import { api, ApiError } from "@/lib/api";
-import type { Cue, Flows, KiteStatus, MarketClock, Today } from "@/lib/types";
+import type { Cue, Flows, HorizonIdeas, Idea, KiteStatus, MarketClock, Today, TodayIdeas } from "@/lib/types";
 import { ago, fmtCr, fmtDate, fmtIstDateTime, fmtNum, fmtPct, tone } from "@/lib/format";
 import { Notice, StatusPill } from "@/components/Status";
 import { MarketCallCard, MarketCallEmpty } from "@/components/MarketCall";
+import {
+  HORIZON_LABEL,
+  IdeaStatusPill,
+  IdeaTrackLine,
+  SurveillanceBadge,
+  fmtLevel,
+  fmtProb,
+  fmtRupees,
+} from "@/components/Drivers";
 
 const REFRESH_MS = 60_000;
 
@@ -69,6 +79,8 @@ export default function TodayPage() {
         )}
       </section>
 
+      <IdeasSection ideas={data.ideas} upcomingSession={data.market_call_session} />
+
       <FlowsCard flows={data.flows} />
 
       <section className="space-y-2">
@@ -100,6 +112,161 @@ export default function TodayPage() {
           call. It will not invent a view of its own.
         </p>
       </section>
+    </div>
+  );
+}
+
+// The day's stock ideas per horizon (brief §4.2, §7.1). "No edge today" is the loudest
+// state and is only claimed when the engine ran and recorded nothing; every probability
+// carries its live track record; surveillance is marked as not checked on every idea.
+function IdeasSection({ ideas, upcomingSession }: { ideas: TodayIdeas; upcomingSession: string }) {
+  return (
+    <section className="card p-4">
+      <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+        <h2 className="label">
+          Stock ideas · session {fmtDate(ideas.session)}
+          {ideas.is_previous ? " (previous)" : ""}
+        </h2>
+        <div className="flex items-center gap-2 text-xs text-muted">
+          <span>
+            bar: P(target) ≥ {fmtProb(ideas.min_p_target)} · EV ≥ {ideas.min_ev_pct}% after costs · at
+            most {ideas.max_per_horizon} per horizon
+          </span>
+          <Link href="/ideas" className="underline hover:text-fg">
+            All ideas
+          </Link>
+        </div>
+      </div>
+      {ideas.is_previous && (
+        <p className="mb-2 text-xs text-muted">
+          No idea yet for {fmtDate(upcomingSession)}: the 07:30 IST job records them right after
+          the market calls. Shown are the latest session&apos;s ideas with their outcomes.
+        </p>
+      )}
+      {ideas.n_ideas === 0 && ideas.note && (
+        <div className="mb-3">
+          {ideas.note.startsWith("No edge today") ? (
+            <div className="rounded-md border border-warn/40 bg-warn/5 px-3 py-2">
+              <p className="text-2xl font-semibold text-warn">No edge today</p>
+              <p className="mt-1 text-sm text-muted">{ideas.note}</p>
+            </div>
+          ) : (
+            <Notice tone="info">{ideas.note}</Notice>
+          )}
+        </div>
+      )}
+      <div className="grid gap-4 md:grid-cols-2">
+        {ideas.by_horizon.map((g) => (
+          <HorizonGroup key={g.horizon} group={g} />
+        ))}
+      </div>
+      <p className="mt-3 text-[11px] text-warn">{ideas.surveillance_note}</p>
+    </section>
+  );
+}
+
+function HorizonGroup({ group }: { group: HorizonIdeas }) {
+  return (
+    <div>
+      <div className="mb-1.5 flex items-baseline justify-between">
+        <h3 className="text-sm font-medium">
+          {HORIZON_LABEL[group.horizon] ?? group.horizon}
+          <span className="ml-2 text-xs text-muted">
+            {group.horizon_days} sessions · target {group.target_atr}× ATR · stop {group.stop_atr}× ATR
+          </span>
+        </h3>
+        <span className="text-[11px] text-faint">
+          {group.champion_version ? `model ${group.champion_version}` : "no model"}
+        </span>
+      </div>
+      {group.ideas.length === 0 ? (
+        group.no_edge ? (
+          <div className="rounded-md border border-warn/40 bg-warn/5 px-3 py-2">
+            <p className="font-semibold text-warn">No edge today</p>
+            <p className="mt-0.5 text-xs text-muted">{group.note}</p>
+          </div>
+        ) : (
+          <p className="rounded-md border border-line px-3 py-2 text-xs text-muted">{group.note}</p>
+        )
+      ) : (
+        <div className="space-y-2">
+          {group.ideas.map((i) => (
+            <IdeaCard key={i.id} idea={i} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function IdeaCard({ idea }: { idea: Idea }) {
+  const o = idea.outcome;
+  return (
+    <div className="rounded-md border border-line p-3 text-sm">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <div className="flex flex-wrap items-baseline gap-x-2">
+          <Link href={`/ideas?seq=${idea.seq}`} className="text-lg font-semibold hover:underline">
+            {idea.symbol}
+          </Link>
+          <span className="text-xs text-muted">
+            #{idea.rank} · {idea.setup_label} · {idea.strategy_label}
+          </span>
+        </div>
+        <div className="flex items-center gap-1.5">
+          {idea.is_late && (
+            <span className="rounded border border-warn/40 px-1.5 py-px text-[10px] uppercase text-warn">
+              late
+            </span>
+          )}
+          <IdeaStatusPill status={o.status} title={o.notes ?? undefined} />
+        </div>
+      </div>
+      <dl className="num mt-2 grid grid-cols-2 gap-x-4 gap-y-0.5 text-xs sm:grid-cols-3">
+        <IdeaRow label="Entry zone" value={`${fmtLevel(idea.entry_low)}–${fmtLevel(idea.entry_high)}`} />
+        <IdeaRow label="Stop" value={fmtLevel(idea.stop)} tone="text-down" />
+        <IdeaRow
+          label="Targets"
+          value={`${fmtLevel(idea.target_1)}${idea.target_2 !== null ? ` / ${fmtLevel(idea.target_2)}` : ""}`}
+          tone="text-up"
+        />
+        <IdeaRow
+          label="Expected return"
+          value={`${fmtPct(idea.expected_return_low_pct)} to ${fmtPct(idea.expected_return_high_pct)}`}
+        />
+        <IdeaRow label="P(target before stop)" value={fmtProb(idea.p_target)} />
+        <IdeaRow label="EV after costs" value={fmtPct(idea.ev_pct_after_costs)} tone={tone(idea.ev_pct_after_costs)} />
+        <IdeaRow label="Risk / reward" value={`${fmtNum(idea.risk_reward, 2)} : 1`} />
+        <IdeaRow label="Position" value={`${idea.position_qty} sh · ${fmtRupees(idea.position_value)}`} />
+        <IdeaRow label="Risk" value={fmtRupees(idea.risk_amount)} />
+      </dl>
+      {o.status !== "pending" && (
+        <p className="num mt-1 text-xs text-muted">
+          {o.entry_price !== null ? `Entered ${fmtLevel(o.entry_price)}` : "Not entered"}
+          {o.exit_price !== null ? ` · exit ${fmtLevel(o.exit_price)} on ${fmtDate(o.exit_date)}` : ""}
+          {o.net_return_pct !== null ? (
+            <>
+              {" · net "}
+              <span className={tone(o.net_return_pct)}>{fmtPct(o.net_return_pct)}</span>
+            </>
+          ) : (
+            ""
+          )}
+          {o.notes && o.status === "invalidated" ? ` · ${o.notes}` : ""}
+        </p>
+      )}
+      <IdeaTrackLine track={idea.track} compact />
+      <div className="mt-1.5">
+        <SurveillanceBadge note={idea.surveillance_note} />
+      </div>
+    </div>
+  );
+}
+
+function IdeaRow({ label, value, tone = "" }: { label: string; value: string; tone?: string }) {
+  return (
+    <div className="flex justify-between gap-2">
+      <dt className="text-muted">{label}</dt>
+      <dd className={`text-right ${tone}`}>{value}</dd>
     </div>
   );
 }

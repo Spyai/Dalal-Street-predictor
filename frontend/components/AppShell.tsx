@@ -7,6 +7,8 @@ import { api } from "@/lib/api";
 
 const NAV = [
   { href: "/", label: "Today" },
+  { href: "/ideas", label: "Ideas", match: "/ideas" },
+  { href: "/paper", label: "Paper", match: "/paper" },
   { href: "/scorecard", label: "Scorecard", match: "/scorecard" },
   { href: "/stock/INDEX/NIFTY%2050", label: "Stocks", match: "/stock" },
   { href: "/health", label: "Health" },

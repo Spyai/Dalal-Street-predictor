@@ -1,14 +1,29 @@
 "use client";
 
+import Link from "next/link";
 import { useCallback, useEffect, useState } from "react";
 import { api, ApiError } from "@/lib/api";
-import type { CallClass, Champion, LedgerVerify, PredictionRow, Scorecard } from "@/lib/types";
-import { fmtDate, fmtIstDateTime, fmtNum, fmtPct } from "@/lib/format";
+import type {
+  CalibrationBin,
+  CallClass,
+  Champion,
+  IdeaChampion,
+  IdeaGroupStats,
+  IdeaRow,
+  IdeasScorecard,
+  LedgerVerify,
+  PredictionRow,
+  Scorecard,
+} from "@/lib/types";
+import { fmtDate, fmtIstDateTime, fmtNum, fmtPct, tone } from "@/lib/format";
 import { Notice } from "@/components/Status";
 import { COMPARISON_TONE, comparisonText, fmtProb } from "@/components/MarketCall";
+import { HORIZON_LABEL, IdeaStatusPill } from "@/components/Drivers";
 
-// The market-call scorecard (brief §6.3): every metric with its sample size, the naive
-// baselines beside the model, calibration, the champion model, and the ledger check.
+// The scorecard (brief §6.3): the market call's track record (every metric with its sample
+// size, the naive baselines beside the model, calibration, the champion model), the stock
+// ideas' track record (hit rate, average win / loss, expectancy, profit factor, by setup
+// and horizon, calibration of p_target, the ideas champions) and the ledger checks.
 
 const CLASS_TONE: Record<string, string> = { UP: "text-up", FLAT: "text-muted", DOWN: "text-down" };
 
@@ -34,11 +49,16 @@ export default function ScorecardPage() {
     load(target);
   }, [load, target]);
 
-  async function verifyLedger() {
+  const [chain, setChain] = useState<"prediction" | "idea">("prediction");
+
+  async function verifyLedger(which: "prediction" | "idea") {
     setVerifying(true);
     setVerifyError(null);
+    setChain(which);
     try {
-      setVerify(await api<LedgerVerify>("/api/scorecard/verify-ledger", { method: "POST" }));
+      setVerify(
+        await api<LedgerVerify>(`/api/scorecard/verify-ledger?chain=${which}`, { method: "POST" }),
+      );
     } catch (e) {
       setVerify(null);
       setVerifyError(e instanceof ApiError ? e.message : "Verification failed");
@@ -230,17 +250,28 @@ export default function ScorecardPage() {
         </Section>
       </div>
 
+      <IdeasScorecardSection />
+
       <Section title="Ledger">
         <div className="flex flex-wrap items-center gap-3">
           <button
-            onClick={verifyLedger}
+            onClick={() => verifyLedger("prediction")}
             disabled={verifying}
             className="rounded border border-line px-3 py-1 text-sm hover:bg-panel-2 disabled:opacity-40"
           >
-            {verifying ? "Verifying…" : "Verify ledger"}
+            {verifying && chain === "prediction" ? "Verifying…" : "Verify market-call ledger"}
+          </button>
+          <button
+            onClick={() => verifyLedger("idea")}
+            disabled={verifying}
+            className="rounded border border-line px-3 py-1 text-sm hover:bg-panel-2 disabled:opacity-40"
+          >
+            {verifying && chain === "idea" ? "Verifying…" : "Verify idea ledger"}
           </button>
           {verify && verify.ok && (
-            <span className="text-sm text-up">Intact: {verify.message}.</span>
+            <span className="text-sm text-up">
+              {chain === "idea" ? "Idea ledger" : "Market-call ledger"} intact: {verify.message}.
+            </span>
           )}
           {verify && !verify.ok && (
             <span className="text-sm text-down">
@@ -251,9 +282,9 @@ export default function ScorecardPage() {
           {verifyError && <span className="text-sm text-down">{verifyError}</span>}
         </div>
         <p className="mt-2 text-[11px] text-faint">
-          Every record carries a SHA-256 over its content and the previous record&apos;s hash.
-          Verification recomputes the whole chain from the database; any edit, gap or removal
-          shows up as the first bad sequence number.
+          Two chains, one per ledger: every record carries a SHA-256 over its content and the
+          previous record&apos;s hash. Verification recomputes the whole chain from the database;
+          any edit, gap or removal shows up as the first bad sequence number.
         </p>
       </Section>
 
@@ -267,6 +298,343 @@ export default function ScorecardPage() {
         )}
       </Section>
     </div>
+  );
+}
+
+// ---------------------------------------------------------------------------- stock ideas
+
+const IDEA_STATUSES = ["pending", "open", "target", "stop", "expired", "invalidated", "void"] as const;
+
+function IdeasScorecardSection() {
+  const [horizon, setHorizon] = useState<string>("");
+  const [data, setData] = useState<IdeasScorecard | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const path = horizon ? `/api/scorecard/ideas?horizon=${encodeURIComponent(horizon)}` : "/api/scorecard/ideas";
+    api<IdeasScorecard>(path)
+      .then((d) => {
+        setData(d);
+        setError(null);
+      })
+      .catch((e: unknown) => setError(e instanceof ApiError ? e.message : "Failed to load"));
+  }, [horizon]);
+
+  return (
+    <div id="ideas" className="space-y-4 border-t border-line pt-5">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <div>
+          <h2 className="text-lg font-semibold">Stock ideas</h2>
+          <p className="text-sm text-muted">
+            Track record of the ideas in the ledger after costs. Hit rate = the target came before
+            the stop (what P(target) predicts); win rate = positive net return. Every metric shows
+            its sample size.{" "}
+            <Link href="/ideas" className="underline hover:text-fg">
+              All ideas
+            </Link>{" "}
+            ·{" "}
+            <Link href="/paper" className="underline hover:text-fg">
+              Paper portfolio
+            </Link>
+          </p>
+        </div>
+        <div className="flex overflow-hidden rounded border border-line text-xs">
+          {[["", "Both horizons"], ...(data?.horizons ?? ["swing", "positional"]).map((h) => [h, HORIZON_LABEL[h] ?? h])].map(
+            ([value, label]) => (
+              <button
+                key={value}
+                onClick={() => setHorizon(value ?? "")}
+                className={`px-2.5 py-1 ${value === horizon ? "bg-panel-2 text-fg" : "text-muted hover:text-fg"}`}
+              >
+                {label}
+              </button>
+            ),
+          )}
+        </div>
+      </div>
+
+      {error && <Notice tone="down">{error}</Notice>}
+      {!data && !error && <p className="text-sm text-muted">Loading…</p>}
+      {data && <IdeasScorecardBody data={data} />}
+    </div>
+  );
+}
+
+function IdeasScorecardBody({ data }: { data: IdeasScorecard }) {
+  const n = data.n_graded;
+  return (
+    <>
+      <section className="card p-4">
+        <h3 className="label mb-1">Verdict</h3>
+        <p className="text-sm">{data.verdict}</p>
+        {data.sample_warning && (
+          <div className="mt-2">
+            <Notice tone="warn">
+              Sample size: {n} of {data.min_sample_size} graded ideas. Treat the ideas engine as
+              unproven until it has {data.min_sample_size}.
+            </Notice>
+          </div>
+        )}
+        <p className="num mt-2 text-xs text-muted">
+          {data.n_ideas} idea{data.n_ideas === 1 ? "" : "s"} in the ledger:{" "}
+          {IDEA_STATUSES.map((st, k) => (
+            <span key={st}>
+              {k > 0 && " · "}
+              {st} {data.by_status[st] ?? 0}
+            </span>
+          ))}
+        </p>
+      </section>
+
+      <section className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+        <Stat label="Hit rate (target before stop)" value={fmtProb(data.hit_rate)} n={n} />
+        <Stat label="Win rate (net > 0)" value={fmtProb(data.win_rate)} n={n} />
+        <Stat label="Average win / loss" value={`${fmtPct(data.avg_win_pct)} / ${fmtPct(data.avg_loss_pct)}`} n={n} hint="Mean net return of the winners / of the losers, % of entry" />
+        <Stat label="Expectancy per idea" value={fmtPct(data.expectancy_pct)} n={n} hint="Mean net return after costs" />
+        <Stat
+          label="Profit factor"
+          value={data.profit_factor === null ? (n > 0 ? "— (no losing idea yet)" : "—") : fmtNum(data.profit_factor, 2)}
+          n={n}
+          hint="Sum of winning returns over the sum of losing returns"
+        />
+        <Stat label="Average R multiple" value={data.avg_r_multiple === null ? "—" : `${fmtNum(data.avg_r_multiple, 2)} R`} n={n} />
+        <Stat label="Average sessions held" value={fmtNum(data.avg_days_held, 1)} n={n} />
+        <Stat label="Graded ideas" value={String(n)} n={data.n_ideas} hint="n below = ideas in the ledger (any status)" />
+      </section>
+
+      <div className="grid gap-4 lg:grid-cols-2">
+        <Section title="By setup">
+          {data.by_setup.length === 0 ? (
+            <Empty>No graded ideas yet.</Empty>
+          ) : (
+            <GroupTable rows={data.by_setup} keyName="setup" />
+          )}
+        </Section>
+        <Section title="By horizon">
+          <GroupTable rows={data.by_horizon} keyName="horizon" />
+        </Section>
+        <Section title="Calibration (P(target) vs observed hit rate)">
+          {data.calibration.length === 0 ? (
+            <Empty>No graded ideas yet.</Empty>
+          ) : (
+            <Calibration bins={data.calibration} />
+          )}
+        </Section>
+        <Section title="Champion ideas models">
+          <div className="space-y-4">
+            {Object.entries(data.champions).map(([h, c]) => (
+              <div key={h}>
+                <div className="mb-1 text-sm font-medium">{HORIZON_LABEL[h] ?? h}</div>
+                {c ? (
+                  <IdeaChampionBox champion={c} />
+                ) : (
+                  <Empty>
+                    No champion for {h}. Train one with <code>python -m app.cli train-ideas</code>;
+                    until then no {h} idea is generated.
+                  </Empty>
+                )}
+              </div>
+            ))}
+          </div>
+          <p className="mt-2 text-[11px] text-faint">
+            OOS = strict walk-forward over signal sessions with an embargo of the horizon&apos;s
+            length, scored against every candidate&apos;s hit rate and random universe stocks with
+            the same barriers.
+          </p>
+        </Section>
+      </div>
+
+      <Section title="Recent ideas">
+        {data.recent.length === 0 ? (
+          <Empty>No ideas recorded yet.</Empty>
+        ) : (
+          <div className="overflow-x-auto">
+            <RecentIdeasTable rows={data.recent} />
+          </div>
+        )}
+      </Section>
+    </>
+  );
+}
+
+function GroupTable({ rows, keyName }: { rows: IdeaGroupStats[]; keyName: "setup" | "horizon" }) {
+  return (
+    <table className="num w-full text-xs">
+      <thead className="text-left text-faint">
+        <tr>
+          <th className="py-1 font-normal">{keyName === "setup" ? "Setup" : "Horizon"}</th>
+          <th className="py-1 text-right font-normal">n</th>
+          <th className="py-1 text-right font-normal">Hit</th>
+          <th className="py-1 text-right font-normal">Win</th>
+          <th className="py-1 text-right font-normal">Avg win</th>
+          <th className="py-1 text-right font-normal">Avg loss</th>
+          <th className="py-1 text-right font-normal">Expect.</th>
+          <th className="py-1 text-right font-normal">PF</th>
+          <th className="py-1 text-right font-normal">Avg R</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map((r) => {
+          const key = (keyName === "setup" ? r.setup : r.horizon) ?? "?";
+          return (
+            <tr key={key} className="border-t border-line">
+              <td className="py-1 text-muted">{keyName === "horizon" ? HORIZON_LABEL[key] ?? key : key.replace(/_/g, " ")}</td>
+              <td className="py-1 text-right">{r.n}</td>
+              <td className="py-1 text-right">{fmtProb(r.hit_rate)}</td>
+              <td className="py-1 text-right">{fmtProb(r.win_rate)}</td>
+              <td className="py-1 text-right text-up">{fmtPct(r.avg_win_pct)}</td>
+              <td className="py-1 text-right text-down">{fmtPct(r.avg_loss_pct)}</td>
+              <td className={`py-1 text-right ${tone(r.expectancy_pct)}`}>{fmtPct(r.expectancy_pct)}</td>
+              <td className="py-1 text-right">{fmtNum(r.profit_factor, 2)}</td>
+              <td className="py-1 text-right">{fmtNum(r.avg_r_multiple, 2)}</td>
+            </tr>
+          );
+        })}
+      </tbody>
+    </table>
+  );
+}
+
+function Calibration({ bins }: { bins: CalibrationBin[] }) {
+  return (
+    <div className="space-y-2">
+      {bins.map((b) => (
+        <div key={`${b.bin_lo}-${b.bin_hi}`} className="text-xs">
+          <div className="num flex justify-between text-muted">
+            <span>
+              said {fmtProb(b.bin_lo)}–{fmtProb(b.bin_hi)}
+            </span>
+            <span>n = {b.n}</span>
+          </div>
+          <CalBar label="predicted" value={b.predicted_mean} cls="bg-accent" />
+          <CalBar label="observed" value={b.observed} cls="bg-up" />
+        </div>
+      ))}
+      <p className="text-[11px] text-faint">
+        Well calibrated means the two bars match in every row: when it says 60%, the target comes
+        before the stop about 60% of the time.
+      </p>
+    </div>
+  );
+}
+
+function IdeaChampionBox({ champion }: { champion: IdeaChampion }) {
+  const oos = champion.oos;
+  const all = champion.baselines.find((b) => b.name === "all_candidates");
+  const worse = oos.hit_rate !== null && all?.hit_rate !== null && all !== undefined && oos.hit_rate <= all.hit_rate;
+  return (
+    <div className="space-y-2">
+      <dl className="num grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
+        <Row label="Version" value={champion.version} />
+        <Row label="Trained through" value={fmtDate(champion.trained_through)} />
+        <Row label="Training candidates" value={String(champion.train_rows)} />
+        <Row label="OOS candidates" value={oos.n_oos === null ? "—" : String(oos.n_oos)} />
+        <Row
+          label="OOS hit rate (cleared the bar)"
+          value={`${fmtProb(oos.hit_rate)}${oos.n_selected !== null ? ` (n=${oos.n_selected})` : ""}`}
+          tone={worse ? "text-down" : ""}
+        />
+        <Row
+          label="OOS hit rate (ranked, capped)"
+          value={`${fmtProb(oos.hit_rate_ranked)}${oos.n_ranked !== null ? ` (n=${oos.n_ranked})` : ""}`}
+        />
+        <Row label="OOS Brier" value={fmtNum(oos.brier, 3)} />
+        <Row label="OOS log loss" value={fmtNum(oos.log_loss, 3)} />
+        <Row label="OOS expectancy after costs" value={fmtPct(oos.expectancy_after_costs_pct)} tone={tone(oos.expectancy_after_costs_pct)} />
+        <Row label="All candidates' expectancy" value={fmtPct(oos.expectancy_all_candidates_pct)} tone={tone(oos.expectancy_all_candidates_pct)} />
+        <Row label="Promoted" value={champion.promoted_at ? `${fmtIstDateTime(champion.promoted_at)} IST` : "—"} />
+      </dl>
+      <p className={`text-sm ${worse ? "text-down" : "text-muted"}`}>{champion.oos_verdict}</p>
+      <table className="num w-full text-xs">
+        <thead className="text-left text-faint">
+          <tr>
+            <th className="py-1 font-normal">Out of sample</th>
+            <th className="py-1 text-right font-normal">n</th>
+            <th className="py-1 text-right font-normal">Hit rate</th>
+            <th className="py-1 text-right font-normal">Brier</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr className="border-t border-line font-medium">
+            <td className="py-1">Model (ideas that cleared the bar)</td>
+            <td className="py-1 text-right">{oos.n_selected ?? "—"}</td>
+            <td className="py-1 text-right">{fmtProb(oos.hit_rate)}</td>
+            <td className="py-1 text-right">{fmtNum(oos.brier, 3)}</td>
+          </tr>
+          {champion.baselines.map((b) => (
+            <tr key={b.name} className="border-t border-line">
+              <td className="py-1 text-muted">{b.label}</td>
+              <td className="py-1 text-right">{b.n}</td>
+              <td className="py-1 text-right">{fmtProb(b.hit_rate)}</td>
+              <td className="py-1 text-right">{fmtNum(b.brier, 3)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {Object.keys(champion.per_strategy).length > 0 && (
+        <p className="num text-xs text-muted">
+          Per strategy (OOS hit rate):{" "}
+          {Object.entries(champion.per_strategy).map(([name, m], k) => (
+            <span key={name}>
+              {k > 0 && " · "}
+              {name.replace(/_/g, " ")} {fmtProb(m.hit_rate ?? null)} (n={m.n ?? "—"})
+            </span>
+          ))}
+        </p>
+      )}
+      {champion.notes.length > 0 && (
+        <ul className="list-disc pl-5 text-[11px] text-warn">
+          {champion.notes.map((note) => (
+            <li key={note}>{note}</li>
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function RecentIdeasTable({ rows }: { rows: IdeaRow[] }) {
+  return (
+    <table className="num w-full text-xs">
+      <thead className="text-left text-faint">
+        <tr>
+          <th className="py-1 font-normal">Session</th>
+          <th className="py-1 font-normal">Symbol</th>
+          <th className="py-1 font-normal">Horizon · setup</th>
+          <th className="py-1 text-right font-normal">P(target)</th>
+          <th className="py-1 text-right font-normal">EV</th>
+          <th className="py-1 font-normal">Outcome</th>
+          <th className="py-1 text-right font-normal">Net</th>
+          <th className="py-1 text-right font-normal">R</th>
+        </tr>
+      </thead>
+      <tbody>
+        {rows.map((r) => (
+          <tr key={r.id} className="border-t border-line">
+            <td className="py-1.5 pr-2 whitespace-nowrap text-muted">
+              {fmtDate(r.session_date)}
+              {r.is_late && <span className="ml-1 text-[10px] uppercase text-warn">late</span>}
+              {r.corrects_idea_id !== null && <span className="ml-1 text-[10px] uppercase text-faint">fix</span>}
+            </td>
+            <td className="py-1.5 pr-2 font-medium">
+              <Link href={`/ideas?seq=${r.seq}`} className="hover:underline">
+                {r.symbol}
+              </Link>
+            </td>
+            <td className="py-1.5 pr-2 whitespace-nowrap text-muted">
+              {HORIZON_LABEL[r.horizon] ?? r.horizon} · {r.setup.replace(/_/g, " ")}
+            </td>
+            <td className="py-1.5 text-right">{fmtProb(r.p_target)}</td>
+            <td className={`py-1.5 text-right ${tone(r.ev_pct_after_costs)}`}>{fmtPct(r.ev_pct_after_costs)}</td>
+            <td className="py-1.5 pl-2">
+              <IdeaStatusPill status={r.status} title={r.outcome_notes ?? undefined} />
+            </td>
+            <td className={`py-1.5 text-right ${tone(r.net_return_pct)}`}>{fmtPct(r.net_return_pct)}</td>
+            <td className="py-1.5 text-right">{r.r_multiple === null ? "—" : fmtNum(r.r_multiple, 2)}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
   );
 }
 

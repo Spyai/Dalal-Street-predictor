@@ -1,23 +1,34 @@
-"""Telegram texts for the market-call loop: the morning brief and the close summary.
+"""Telegram texts for the market-call and stock-ideas loops: the morning brief, the
+09:20 fill summary and the close summary.
 
 Telegram renders the HTML parse mode, so every string that did not originate here
-(target names, driver sentences, verdicts, timing guidance) goes through `html.escape`.
-Numbers are formatted by hand; a missing number is shown as an em dash, never a guess.
-The brief always carries the model's confidence or "No edge today", the live track record
-beside the call, and the footer the brief asks for. It also names the ledger head (seq and
-the first 12 hex digits of its hash) so the Telegram chat is an independent witness of the
-chain: a later edit to the database cannot rewrite what was sent that morning.
+(target names, symbols, driver sentences, verdicts, timing guidance, outcome notes) goes
+through `html.escape`. Numbers are formatted by hand; a missing number is shown as an em
+dash, never a guess. The brief always carries the model's confidence or "No edge today",
+the live track record beside the call, and the footer the brief asks for. It also names
+the ledger heads (seq and the first 12 hex digits of the hash, one per chain) so the
+Telegram chat is an independent witness of both chains: a later edit to the database
+cannot rewrite what was sent that morning.
+
+The ideas section (`ideas_section`) is one line per idea: symbol, horizon, setup, entry
+zone, stop, target with the expected-return range, P(target before stop), EV after costs,
+position size, and the live hit rate of that setup at that horizon so far ("unproven"
+until there is one). A horizon with no idea gets its honest line ("No edge today", or why
+the engine did not run). Surveillance (ASM/GSM) is never checked, and the section says so.
 """
 
 from __future__ import annotations
 
 import html
 from collections import defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from datetime import date
 
 from app.config import Settings, get_settings
-from app.models import Prediction, PredictionGrade
+from app.ml import ranking
+from app.ml.core import horizons
+from app.models import Idea, IdeaOutcome, PaperEquity, Prediction, PredictionGrade
+from app.services.ideas_scorecard import IdeaTrack
 from app.services.scorecard import Scorecard, baseline_label
 
 FOOTER = "Personal research tool. Not investment advice."
@@ -25,6 +36,10 @@ MISSING = "—"  # em dash
 HASH_PREFIX_LEN = 12
 TOP_DRIVERS_IN_BRIEF = 3
 GAP_LABELS: dict[str, str] = {"gap_up": "gap up", "gap_down": "gap down", "flat": "flat open"}
+IDEAS_HEADER = "<b>Stock ideas</b>"
+# Honesty rule (Phase 3 contract): no ASM/GSM source is reachable; the reader must check.
+SURVEILLANCE_LINE = "ASM/GSM surveillance status: unknown (not checked; verify before acting)."
+PAPER_LINE = "Sizes are paper positions from the paper risk settings, not orders."
 
 
 def _pct(x: float | None, dp: int = 2, *, sign: bool = True) -> str:
@@ -110,17 +125,112 @@ def ledger_anchor(head: Prediction | None) -> str | None:
     return f"Ledger head: seq {head.seq}, {_esc(str(head.hash)[:HASH_PREFIX_LEN])}"
 
 
+def idea_ledger_anchor(head: Idea | None) -> str | None:
+    """ "Idea ledger head: seq N, <12 hex>" for the idea chain's last record, or None."""
+    if head is None:
+        return None
+    return f"Idea ledger head: seq {head.seq}, {_esc(str(head.hash)[:HASH_PREFIX_LEN])}"
+
+
+def _price(x: float | None) -> str:
+    return MISSING if x is None else f"{x:,.2f}"
+
+
+def _money(x: float | None) -> str:
+    return MISSING if x is None else f"₹{x:,.0f}"
+
+
+def idea_track_line(track: IdeaTrack | None, settings: Settings | None = None) -> str:
+    """The live record of the idea's setup at its horizon, or "unproven"."""
+    s = settings or get_settings()
+    if track is None:
+        return "track record: unavailable"
+    label = f"{track.setup}/{track.horizon}" if track.setup else track.horizon
+    if track.n_graded == 0 or track.hit_rate is None:
+        return f"{_esc(label)} so far: unproven (no graded ideas yet)"
+    n = track.n_graded
+    line = f"{_esc(label)} so far: {track.hit_rate * 100:.0f}% hit target of {n} graded"
+    if track.expectancy_pct is not None:
+        line += f", {_pct(track.expectancy_pct)} net per idea"
+    if track.sample_warning:
+        line += f"; unproven (&lt; {s.min_sample_size} graded)"
+    return line
+
+
+def idea_line(i: Idea, track: IdeaTrack | None, settings: Settings | None = None) -> str:
+    """One line per idea (contract): symbol, horizon, setup, entry zone, stop, target with
+    the expected-return range, P(target before stop), EV after costs, size, track record."""
+    qty = i.position_qty
+    size = f"{qty} share{'' if qty == 1 else 's'} ≈ {_money(i.position_value)}"
+    if qty <= 0:
+        size = "no position (too small for the risk caps)"
+    line = (
+        f"• <b>{_esc(i.symbol)}</b> {_esc(i.horizon)}/{_esc(i.setup)}: "
+        f"entry {_price(i.entry_low)}–{_price(i.entry_high)}, stop {_price(i.stop)}, "
+        f"target {_price(i.target_1)} ({_pct(i.expected_return_low_pct, 1)} to "
+        f"{_pct(i.expected_return_high_pct, 1)}), P(target before stop) {_prob(i.p_target)}, "
+        f"EV {_pct(i.ev_pct_after_costs)} after costs, R:R {_num(i.risk_reward, 1)}, {size}; "
+        f"{idea_track_line(track, settings)}"
+    )
+    if i.is_late:
+        line += " [recorded late]"
+    return line
+
+
+def _no_edge_line(horizon: str, text: str) -> str:
+    """Bold the verdict and escape the rest (the ranking's text quotes ">=")."""
+    if text.startswith(ranking.NO_EDGE_TEXT):
+        return f"<b>{ranking.NO_EDGE_TEXT}</b>{_esc(text[len(ranking.NO_EDGE_TEXT) :])}"
+    return f"{_esc(horizon)}: {_esc(text)}"
+
+
+def ideas_section(
+    ideas: Iterable[tuple[Idea, IdeaTrack | None]],
+    settings: Settings | None = None,
+    *,
+    notes: Mapping[str, str] | None = None,
+) -> list[str]:
+    """The ideas block: one line per idea grouped by horizon (`core.horizons` order), the
+    horizon's note when it has none (`notes`, default "No edge today"), the surveillance
+    and paper-size caveats."""
+    s = settings or get_settings()
+    by_horizon: dict[str, list[tuple[Idea, IdeaTrack | None]]] = defaultdict(list)
+    for i, track in ideas:
+        by_horizon[i.horizon].append((i, track))
+    lines = [IDEAS_HEADER]
+    order = [*horizons(s), *(h for h in by_horizon if h not in horizons(s))]
+    for h in order:
+        rows = sorted(by_horizon.get(h, []), key=lambda it: (it[0].rank, it[0].seq))
+        if rows:
+            lines += [idea_line(i, track, s) for i, track in rows]
+        else:
+            text = (notes or {}).get(h) or ranking.no_edge_text(h, s)
+            lines.append(_no_edge_line(h, text))
+    if by_horizon:
+        lines.append(PAPER_LINE)
+    lines.append(SURVEILLANCE_LINE)
+    return lines
+
+
 def morning_brief(
     calls: list[tuple[Prediction, Scorecard | None]],
     session: date,
     settings: Settings | None = None,
     *,
     head: Prediction | None = None,
+    ideas: Iterable[tuple[Idea, IdeaTrack | None]] = (),
+    idea_head: Idea | None = None,
+    idea_notes: Mapping[str, str] | None = None,
 ) -> str:
-    """The 07:30 Telegram brief: one block per target, HTML-escaped, with the footer.
+    """The 07:30 Telegram brief: one block per target, the ideas section, HTML-escaped,
+    with the footer.
 
-    `head` is the ledger's last record (`ledger.head`); without it the highest-seq call
-    in `calls` stands in, so the anchor line is always present when something was recorded.
+    `head` is the prediction ledger's last record (`ledger.head`); without it the
+    highest-seq call in `calls` stands in, so the anchor line is always present when
+    something was recorded. The ideas section appears when there are `ideas` or when
+    `idea_notes` is given (the engine ran: a horizon without an idea shows its note, "No
+    edge today" by default); `idea_head` (`ledger.head_idea`) anchors the idea chain the
+    same way, with the highest-seq idea standing in.
     """
     s = settings or get_settings()
     parts = [f"<b>Dalal market call — {_day(session)}</b>"]
@@ -131,6 +241,14 @@ def morning_brief(
     anchor = ledger_anchor(head or max((p for p, _ in calls), key=lambda p: p.seq, default=None))
     if anchor is not None:
         parts.append(anchor)
+    idea_rows = list(ideas)
+    if idea_rows or idea_notes is not None:
+        parts.append("\n".join(ideas_section(idea_rows, s, notes=idea_notes)))
+        idea_anchor = idea_ledger_anchor(
+            idea_head or max((i for i, _ in idea_rows), key=lambda i: i.seq, default=None)
+        )
+        if idea_anchor is not None:
+            parts.append(idea_anchor)
     parts.append(f"<i>{FOOTER}</i>")
     return "\n\n".join(parts)
 
@@ -162,8 +280,77 @@ def _num(x: float | None, dp: int = 2) -> str:
     return MISSING if x is None else f"{x:.{dp}f}"
 
 
-def close_summary(grades: Iterable[tuple[Prediction, PredictionGrade]]) -> str:
-    """The 15:45 Telegram summary: every call graded in this run, grouped by session."""
+def _idea_head(i: Idea) -> str:
+    return f"{_esc(i.symbol)} ({_esc(i.horizon)}, {_esc(i.setup)})"
+
+
+def idea_outcome_line(i: Idea, o: IdeaOutcome) -> str:
+    """What happened to one idea: settled (target / stop / expired) with the exit and the
+    returns after costs, still open with its excursions, invalidated or void with why."""
+    head = _idea_head(i)
+    if o.status in ("target", "stop", "expired"):
+        when = o.exit_date.isoformat() if o.exit_date else MISSING
+        n = o.days_held
+        held = MISSING if n is None else f"{n} session{'' if n == 1 else 's'}"
+        return (
+            f"{head}: <b>{_esc(o.status)}</b> on {when} at {_price(o.exit_price)} — "
+            f"{_pct(o.gross_return_pct)} gross, {_pct(o.net_return_pct)} net after costs, "
+            f"{_num(o.r_multiple)}R, {held}"
+        )
+    if o.status == "open":
+        since = o.entry_date.isoformat() if o.entry_date else MISSING
+        return (
+            f"{head}: open since {since} at {_price(o.entry_price)}; best "
+            f"{_pct(o.max_favorable_pct)}, worst {_pct(o.max_adverse_pct)}"
+            + (f" ({_esc(o.notes)})" if o.notes else "")
+        )
+    why = f" — {_esc(o.notes)}" if o.notes else ""
+    return f"{head}: <b>{_esc(o.status)}</b>{why}"
+
+
+def equity_line(e: PaperEquity) -> str:
+    n = e.open_positions
+    line = (
+        f"Paper equity {e.trade_date.isoformat()}: {_money(e.equity)} "
+        f"(cash {_money(e.cash)}, invested {_money(e.invested)}, "
+        f"{n} open position{'' if n == 1 else 's'})"
+    )
+    if e.nifty_close is not None:
+        line += f"; Nifty 50 {_price(e.nifty_close)} (price index)"
+    return line
+
+
+def fill_summary(rows: Iterable[tuple[Idea, IdeaOutcome]], session: date) -> str:
+    """The 09:20 Telegram note: which ideas were filled at the open and which the gap
+    invalidated (brief §3)."""
+    lines = [f"<b>Dalal open check — {_day(session)}</b>"]
+    n = 0
+    for i, o in rows:
+        n += 1
+        if o.status == "open":
+            qty = i.position_qty
+            lines.append(
+                f"{_idea_head(i)}: <b>filled</b> at {_price(o.entry_price)} "
+                f"(zone {_price(i.entry_low)}–{_price(i.entry_high)}), "
+                f"{qty} share{'' if qty == 1 else 's'} paper"
+            )
+        else:
+            why = f": {_esc(o.notes)}" if o.notes else ""
+            lines.append(f"{_idea_head(i)}: <b>{_esc(o.status)}</b>{why}")
+    if n == 0:
+        lines.append("No idea was waiting for the open.")
+    return "\n\n".join(["\n".join(lines), f"<i>{FOOTER}</i>"])
+
+
+def close_summary(
+    grades: Iterable[tuple[Prediction, PredictionGrade]],
+    *,
+    ideas: Iterable[tuple[Idea, IdeaOutcome]] = (),
+    equity: PaperEquity | None = None,
+) -> str:
+    """The 15:45 Telegram summary: every call graded in this run, grouped by session, then
+    every idea whose outcome moved (settled, still open, invalidated) and the paper
+    equity snapshot when one was written."""
     by_session: dict[date, list[tuple[Prediction, PredictionGrade]]] = defaultdict(list)
     for p, g in grades:
         by_session[p.session_date].append((p, g))
@@ -171,6 +358,13 @@ def close_summary(grades: Iterable[tuple[Prediction, PredictionGrade]]) -> str:
     for session in sorted(by_session):
         lines = [f"<b>Dalal close grading — {_day(session)}</b>"]
         lines += [_grade_line(p, g) for p, g in by_session[session]]
+        parts.append("\n".join(lines))
+    idea_rows = list(ideas)
+    if idea_rows or equity is not None:
+        lines = ["<b>Ideas</b>"]
+        lines += [idea_outcome_line(i, o) for i, o in idea_rows] or ["No idea outcome moved."]
+        if equity is not None:
+            lines.append(equity_line(equity))
         parts.append("\n".join(lines))
     if not parts:
         parts.append("<b>Dalal close grading</b>\nNothing was graded.")

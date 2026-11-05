@@ -1,9 +1,13 @@
 "use client";
 
 import Link from "next/link";
-import type { CallClass, Comparison, MarketCall, Track } from "@/lib/types";
+import { api } from "@/lib/api";
+import type { CallClass, Comparison, Factors, MarketCall, Track } from "@/lib/types";
 import { fmtDate, fmtIstDateTime, fmtNum, fmtPct } from "@/lib/format";
 import { Notice } from "@/components/Status";
+import { Drivers, fmtProb } from "@/components/Drivers";
+
+export { fmtProb };
 
 // The market-call card (brief §7.1). Honesty first: "No edge today" is the loudest state,
 // every missing number renders "—", and the live track record sits under every call. After
@@ -28,11 +32,6 @@ const CONFIDENCE_STYLE: Record<string, string> = {
   low: "border-warn/40 text-warn",
   none: "border-warn/40 text-warn",
 };
-
-export function fmtProb(p: number | null | undefined): string {
-  if (p === null || p === undefined || Number.isNaN(p)) return "—";
-  return `${(p * 100).toFixed(0)}%`;
-}
 
 // Plain words for the paired comparison, shared by the Today card and the Scorecard page.
 export function comparisonText(c: Comparison, pairedN: number | null, minPairedN: number): string {
@@ -157,36 +156,13 @@ export function MarketCallCard({
         />
       </dl>
 
-      {call.drivers.length > 0 ? (
-        <div className="mt-3">
-          <div className="label mb-1">Top drivers</div>
-          <ul className="space-y-0.5 text-sm">
-            {call.drivers.map((d) => (
-              <li key={d.feature} className="flex gap-2">
-                <span
-                  className={`num w-3 shrink-0 ${
-                    d.contribution === null
-                      ? "text-faint"
-                      : d.contribution >= 0
-                        ? "text-up"
-                        : "text-down"
-                  }`}
-                  title={
-                    d.contribution === null
-                      ? "contribution unknown"
-                      : `contribution ${d.contribution.toFixed(3)} to ${call.predicted_class}`
-                  }
-                >
-                  {d.contribution === null ? "·" : d.contribution >= 0 ? "+" : "−"}
-                </span>
-                <span>{d.text}</span>
-              </li>
-            ))}
-          </ul>
-        </div>
-      ) : (
-        <p className="mt-3 text-xs text-faint">No driver breakdown recorded.</p>
-      )}
+      <div className="mt-3">
+        <Drivers
+          drivers={call.drivers}
+          target={call.predicted_class}
+          loadFactors={() => api<Factors>(`/api/today/market-call/${call.id}/factors`)}
+        />
+      </div>
 
       {call.timing_guidance && (
         <p className="mt-2 text-sm text-muted">

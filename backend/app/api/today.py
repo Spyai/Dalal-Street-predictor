@@ -5,6 +5,15 @@ is heading into. Once the market closes (15:30 IST) that session moves to the ne
 day, which has no call until the 07:30 job runs; the page then falls back to the latest
 earlier call for the target, flagged `is_previous`, so its 15:45 close grade is visible
 rather than an empty card. The "no call" note is only for a target with no call at all.
+
+The stock ideas follow the same rule (`today_ideas`): the current ideas of that session per
+horizon, else the latest earlier session's ideas with their outcomes, flagged `is_previous`.
+A horizon without an idea says why in words: "No edge today" only when the engine ran for
+that session (an ideas champion exists and the session's market call is in the ledger: the
+07:30 job generates ideas right after the calls) and recorded none; otherwise that there is
+no ideas model yet, or that the job has not run. Nothing is ever shown that is not in the
+ledger. `/api/today/market-call/{id}/factors` serves a call's full factor list (every
+feature of its snapshot with the recorded contribution) for the expandable "All factors".
 """
 
 from __future__ import annotations
@@ -13,31 +22,38 @@ from dataclasses import asdict
 from datetime import UTC, date, datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import Select, select
+from sqlalchemy import Select, func, select
 from sqlalchemy.orm import Session, defer
 
 from app.api.deps import current_user, kv_dep
+from app.api.ideas import SURVEILLANCE_NOTE, factors_out, ideas_out
 from app.api.kite import kite_status
 from app.cache import KV
 from app.config import IST, Settings, get_settings
 from app.db import get_db
 from app.jobs.definitions import get_spec
 from app.jobs.runner import run_job
-from app.ml.core import MODEL_NAME, session_for
-from app.models import AppUser, ModelVersion, Prediction, PredictionGrade
+from app.ml import ideas_models, models, ranking
+from app.ml.core import MODEL_NAME, horizons, session_for
+from app.models import AppUser, Idea, IdeaOutcome, ModelVersion, Prediction, PredictionGrade
 from app.schemas import (
     CueOut,
     DriverOut,
+    FactorsOut,
     FlowDayOut,
     FlowsOut,
     GradeOut,
+    HorizonIdeasOut,
+    IdeaOut,
     MarketCallOut,
     MarketClockOut,
+    TodayIdeasOut,
     TodayOut,
     TrackOut,
 )
 from app.services import flows, global_cues
 from app.services.calendar import TradingCalendar
+from app.services.ledger import not_superseded_idea
 from app.services.scorecard import MIN_PAIRED_N, Scorecard, not_superseded, scorecard
 
 router = APIRouter(prefix="/api/today", tags=["today"])
@@ -180,6 +196,138 @@ def market_calls(
     return calls, note, session
 
 
+# ----------------------------------------------------------------------------- ideas
+
+
+def ideas_for(db: Session, session: date) -> list[tuple[Idea, IdeaOutcome | None]]:
+    """The current (non-superseded) ideas of a session with their outcomes, by horizon and
+    rank, without the feature snapshot or the drivers."""
+    stmt = (
+        select(Idea, IdeaOutcome)
+        .options(defer(Idea.feature_snapshot), defer(Idea.drivers))
+        .outerjoin(IdeaOutcome, IdeaOutcome.idea_id == Idea.id)
+        .where(Idea.session_date == session, not_superseded_idea())
+        .order_by(Idea.horizon.asc(), Idea.rank.asc(), Idea.seq.asc())
+    )
+    return [(i, o) for i, o in db.execute(stmt).all()]
+
+
+def latest_ideas_session(db: Session, through: date) -> date | None:
+    """The latest session on or before `through` with an idea in the ledger."""
+    return db.scalar(select(func.max(Idea.session_date)).where(Idea.session_date <= through))
+
+
+def call_recorded(db: Session, session: date, settings: Settings) -> bool:
+    """Whether the 07:30 job recorded a market call for the session (it generates the
+    ideas right after the calls, so a recorded call means the ideas engine ran)."""
+    return any(
+        current_call(db, target, session) is not None
+        for target in settings.prediction_target_symbols
+    )
+
+
+def horizon_note(
+    horizon: str, session: date, *, has_ideas: bool, has_model: bool, ran: bool, settings: Settings
+) -> tuple[bool, str | None]:
+    """(no_edge, note) for one horizon of the Today page (module doc)."""
+    if has_ideas:
+        return False, None
+    if not has_model:
+        return False, (
+            f"No ideas model for {horizon} yet: train one with `python -m app.cli train-ideas`. "
+            f"Until then no {horizon} idea can be generated."
+        )
+    if ran:
+        return True, ranking.no_edge_text(horizon, settings)
+    return False, (
+        f"No {horizon} idea recorded for {session.isoformat()}: the 07:30 IST pre-market job "
+        "hasn't run yet (ideas are generated right after the market calls)."
+    )
+
+
+def today_ideas(
+    db: Session, cal: TradingCalendar, now: datetime, settings: Settings
+) -> TodayIdeasOut:
+    """The ideas to show per horizon, the session they are for, and the notes (module doc)."""
+    session = session_for(cal, now)
+    today = now.astimezone(IST).date()
+    shown = session
+    is_previous = False
+    rows = ideas_for(db, session)
+    if not rows:
+        previous = latest_ideas_session(db, today)
+        if previous is not None:
+            shown, is_previous, rows = previous, True, ideas_for(db, previous)
+    outs: list[IdeaOut] = ideas_out(db, rows, settings, is_previous=is_previous)
+    ran = call_recorded(db, shown, settings)
+    groups: list[HorizonIdeasOut] = []
+    any_model = False
+    for name, spec in horizons(settings).items():
+        mine = [o for o in outs if o.horizon == name]
+        champion = ideas_models.ideas_champion_light(db, name, settings)
+        any_model = any_model or champion is not None
+        no_edge, note = horizon_note(
+            name,
+            shown,
+            has_ideas=bool(mine),
+            has_model=champion is not None,
+            ran=ran,
+            settings=settings,
+        )
+        groups.append(
+            HorizonIdeasOut(
+                horizon=name,
+                horizon_days=spec.days,
+                target_atr=spec.target_atr,
+                stop_atr=spec.stop_atr,
+                ideas=mine,
+                no_edge=no_edge,
+                note=note,
+                champion_version=champion.version if champion is not None else None,
+            )
+        )
+    if outs:
+        note = ""
+    elif not any_model:
+        note = (
+            "No ideas model yet: train the swing and positional models with "
+            "`python -m app.cli train-ideas`. Until then no idea can be generated."
+        )
+    elif ran:
+        note = f"{ranking.NO_EDGE_TEXT}: no candidate cleared the bar for any horizon."
+    else:
+        note = (
+            f"No ideas recorded for {shown.isoformat()}: the 07:30 IST pre-market job hasn't "
+            "run yet (ideas are generated right after the market calls)."
+        )
+    return TodayIdeasOut(
+        session=shown,
+        is_previous=is_previous,
+        by_horizon=groups,
+        n_ideas=len(outs),
+        note=note,
+        surveillance_note=SURVEILLANCE_NOTE,
+        min_p_target=settings.ideas_min_p_target,
+        min_ev_pct=settings.ideas_min_ev_pct,
+        max_per_horizon=settings.ideas_max_per_horizon,
+    )
+
+
+@router.get("/market-call/{prediction_id}/factors", response_model=FactorsOut)
+def market_call_factors(
+    prediction_id: int, db: Session = Depends(get_db), _: AppUser = Depends(current_user)
+) -> FactorsOut:
+    """A market call's full factor list: its recorded drivers (largest |contribution|
+    first, the top `drivers_top_n` as `drivers`) and every feature of its snapshot, with
+    `contribution=None` where the ledger holds no contribution. 404 for an unknown call."""
+    p = db.get(Prediction, prediction_id)
+    if p is None or p.kind != MODEL_NAME:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"No market call with id {prediction_id}.")
+    return factors_out(
+        p.drivers, p.feature_snapshot, models.feature_label, get_settings().drivers_top_n
+    )
+
+
 @router.get("", response_model=TodayOut)
 def today(db: Session = Depends(get_db), _: AppUser = Depends(current_user)) -> TodayOut:
     settings = get_settings()
@@ -216,6 +364,7 @@ def today(db: Session = Depends(get_db), _: AppUser = Depends(current_user)) -> 
         market_call_session=call_session,
         market_call=calls,
         market_call_note=call_note,
+        ideas=today_ideas(db, cal, now, settings),
     )
 
 

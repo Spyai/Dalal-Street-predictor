@@ -3,7 +3,10 @@
 Jobs with fn=None are part of the plan but not built yet; /health lists them with the
 phase that delivers them, and the scheduler does not register them. Phase 2 adds the
 market-call loop: 07:30 prediction, 09:20 gap grade, 15:45 close grade and the Saturday
-retrain (`weekly_review`, Phase 4, will fold the retrain into the weekly report).
+retrain (`weekly_review`, Phase 4, will fold the retrain into the weekly report). Phase 3
+rides the stock ideas on the same three jobs (ideas at 07:30, fills at 09:20, grading and
+the paper equity snapshot at 15:45); `intraday_monitor` stays off: polling from 09:15 to
+15:30 needs an always-on host, which GitHub Actions + Vercel is not (SETUP.md).
 """
 
 from __future__ import annotations
@@ -79,9 +82,10 @@ def job_specs() -> list[JobSpec]:
         JobSpec(
             "intraday_monitor",
             "Intraday monitoring",
-            "09:15-15:30 trading days",
+            "09:15-15:30 trading days (off: needs an always-on host, see SETUP.md)",
             {"day_of_week": "mon-fri", "hour": "9-15", "minute": "*"},
             phase=3,
+            fn=None,  # not on GitHub Actions + Vercel: needs an always-on host (SETUP.md)
         ),
         JobSpec(
             "close_grading",

@@ -70,6 +70,32 @@ APP_KEYS = [
     "RETRAIN_MIN_BRIER_GAIN",
     "MLFLOW_TRACKING_URI",
     "MIN_SAMPLE_SIZE",
+    "PAPER_CAPITAL",
+    "RISK_PER_TRADE_PCT",
+    "MIN_AVG_TURNOVER_CR",
+    # Phase 3 stock-idea tunables (app/config.py "Stock ideas"): the p / EV bar, the cap
+    # per horizon, the universe rule, the horizons' ATR multiples, the cost model and the
+    # paper position cap, so the 07:30 ideas and the 15:45 grading use the same numbers
+    # the API shows.
+    "IDEAS_MAX_PER_HORIZON",
+    "IDEAS_MIN_P_TARGET",
+    "IDEAS_MIN_EV_PCT",
+    "IDEAS_UNIVERSE_MIN_BARS",
+    "DRIVERS_TOP_N",
+    "SWING_HORIZON_DAYS",
+    "SWING_TARGET_ATR",
+    "SWING_STOP_ATR",
+    "POSITIONAL_HORIZON_DAYS",
+    "POSITIONAL_TARGET_ATR",
+    "POSITIONAL_STOP_ATR",
+    "BROKERAGE_PCT",
+    "STT_DELIVERY_PCT",
+    "EXCHANGE_TXN_PCT",
+    "GST_PCT",
+    "STAMP_DUTY_PCT",
+    "SEBI_FEE_PCT",
+    "SLIPPAGE_PCT",
+    "PAPER_MAX_POSITION_PCT",
 ]
 # Direct (unpooled) connections first: migrations and long jobs shouldn't go through
 # a transaction-mode pooler.

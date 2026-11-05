@@ -1,10 +1,22 @@
-"""Job implementations: Phase 1 data jobs and the Phase 2 market-call loop.
+"""Job implementations: Phase 1 data jobs, the Phase 2 market-call loop and the Phase 3
+stock-ideas loop that rides on the same three jobs.
 
 Phase 2 (brief §3, §4.1, §5): `premarket_prediction` at 07:30 makes and locks the call,
 `open_check` at 09:20 grades the gap call, `close_grading` at 15:45 grades the close, and
 `weekly_retrain` on Saturday trains a challenger and promotes it only when it beats the
 champion out of sample. Every job returns per-target details for /health, says "partial"
 whenever a number it wanted was missing, and never substitutes a guess for it.
+
+Phase 3 (brief §4.2, §5, §6.3): after the market calls, the 07:30 run refreshes the
+universe's bars through the previous session, runs the rule-based strategies on the
+point-in-time features of that session, scores every candidate with the champion ideas
+model of each horizon, ranks by expected value after costs and records the survivors in
+the idea ledger (`generate_ideas`; "No edge today" for a horizon when nothing clears the
+bar, the training hint when a horizon has no model). The 09:20 run fills each pending
+idea at its session's open or invalidates it and opens the paper position; the 15:45 run
+grades every open idea against the bars since entry, keeps the paper book in step and
+snapshots the paper equity (a position without a close is reported, never marked at a
+guess). Intraday monitoring stays off: it needs an always-on host (SETUP.md).
 
 Honest skips beat mis-referenced records: the 07:30 job refuses to write a call when the
 previous session's target bar is missing, when the session's year has no holiday calendar
@@ -17,21 +29,33 @@ replaced by the final close.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import select
+import pandas as pd
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.config import IST, Settings
 from app.jobs.runner import JobContext, JobResult, JobSkipped
-from app.ml import baselines, core, features, models
+from app.ml import baselines, core, features, ideas_models, models, ranking, strategies
+from app.ml import ideas_features as idf
 from app.ml import registry as model_registry
-from app.ml.core import MarketCallRecordIn, finite
-from app.models import DailyBar, Instrument, Prediction, PredictionGrade
+from app.ml.core import FeatureRow, IdeaRecordIn, MarketCallRecordIn, finite
+from app.models import (
+    DailyBar,
+    Idea,
+    IdeaOutcome,
+    Instrument,
+    ModelVersion,
+    PaperEquity,
+    PaperTrade,
+    Prediction,
+    PredictionGrade,
+)
 from app.providers import registry
 from app.providers.base import AuthExpired, MarketDataProvider, NotConfigured, ProviderError
 from app.services import (
@@ -40,14 +64,18 @@ from app.services import (
     flows,
     global_cues,
     grading,
+    idea_grading,
+    ideas_scorecard,
     instruments,
     kite_auth,
     ledger,
+    paper,
     scorecard,
     telegram,
 )
 from app.services.backfill import run_backfill
 from app.services.market_data import (
+    daily_frame,
     ensure_recent,
     ingest_bhavcopy,
     last_final_global_day,
@@ -471,7 +499,8 @@ def premarket_prediction(ctx: JobContext) -> JobResult:
     otherwise the target's status says why it was not recorded. A target with no champion
     model is reported with the training hint; an existing call for the session is left
     alone (re-runs are idempotent, race-safe through the ledger lock, and do not re-send
-    the brief).
+    the brief). The stock ideas follow the calls (`generate_ideas`) under the same
+    recording guard; the brief goes out when a call or an idea was newly recorded.
     """
     s = ctx.settings
     db = ctx.db
@@ -531,23 +560,37 @@ def premarket_prediction(ctx: JobContext) -> JobResult:
             recorded += int(outcome.recorded)
     db.commit()  # the ledger rows are final before anything is announced
 
-    if recorded:
+    ideas_out = generate_ideas(ctx, session, through, chain, blocked=blocked)
+    details["ideas"] = ideas_out.details
+    problems += ideas_out.problems
+    db.commit()  # the idea ledger rows are final before anything is announced
+
+    if recorded or ideas_out.recorded:
         cards: list[tuple[Prediction, scorecard.Scorecard | None]] = [
             (p, scorecard.scorecard(db, p.target, settings=s)) for p in current
         ]
-        text = brief.morning_brief(cards, session, s, head=ledger.head(db))
+        text = brief.morning_brief(
+            cards,
+            session,
+            s,
+            head=ledger.head(db),
+            ideas=idea_tracks(db, ideas_out.ideas, s),
+            idea_head=ledger.head_idea(db),
+            idea_notes=ideas_out.notes,
+        )
         sent = telegram.send(text)
         details["brief"] = "sent" if sent else "not sent (Telegram not configured or failed)"
     else:
         details["brief"] = "not sent (nothing new recorded)"
 
     summary = [_call_summary(p) for p in current] or [f"no call recorded for {session}"]
+    summary.append(ideas_out.summary)
     message = "; ".join([*summary, *problems])
     return JobResult("partial" if problems else "success", message, details)
 
 
 def _session_open(
-    chain: list[MarketDataProvider], symbol: str, session: date
+    chain: list[MarketDataProvider], symbol: str, session: date, exchange: str = "INDEX"
 ) -> tuple[float, str] | None:
     """The session's opening print from the first provider that has a bar dated `session`.
 
@@ -557,7 +600,7 @@ def _session_open(
     """
     for provider in chain:
         try:
-            bars = provider.daily_bars(symbol, "INDEX", session, session)
+            bars = provider.daily_bars(symbol, exchange, session, session)
         except ProviderError as exc:
             mark_error(provider.name, exc)
             continue
@@ -576,12 +619,14 @@ def _grade_row(db: Session, prediction_id: int) -> PredictionGrade | None:
 
 
 def open_check(ctx: JobContext) -> JobResult:
-    """09:20: grade every gap call of the session against the actual open."""
+    """09:20: grade every gap call of the session against the actual open, then fill or
+    invalidate the session's pending ideas at that open (`fill_ideas`)."""
     db = ctx.db
     session = core.session_for(ctx.calendar, ctx.now)
     calls = ledger.calls_for_session(db, session)
-    if not calls:
-        raise JobSkipped(f"no market call recorded for {session}")
+    ideas = ledger.ideas_for_session(db, session, current_only=True)
+    if not calls and not ideas:
+        raise JobSkipped(f"no market call recorded for {session} and no idea to fill")
     chain = registry.market_data_chain(db)
     details: dict[str, Any] = {"session": session.isoformat()}
     problems: list[str] = []
@@ -617,7 +662,23 @@ def open_check(ctx: JobContext) -> JobResult:
             "gap_correct": g.gap_correct,
             "source": source,
         }
-    message = "; ".join([f"{graded} gap call(s) graded for {session}", *problems])
+
+    fills = fill_ideas(ctx, ideas, session, chain)
+    details["ideas"] = fills.details
+    problems += fills.problems
+    db.commit()
+    if fills.processed:
+        sent = telegram.send(brief.fill_summary(fills.processed, session))
+        details["ideas"]["summary"] = (
+            "sent" if sent else "not sent (Telegram not configured or failed)"
+        )
+    summary = [f"{graded} gap call(s) graded for {session}"]
+    if ideas:
+        summary.append(
+            f"{fills.filled} idea(s) filled, {fills.invalidated} invalidated, "
+            f"{fills.pending} still pending"
+        )
+    message = "; ".join([*summary, *problems])
     return JobResult("partial" if problems else "success", message, details)
 
 
@@ -630,7 +691,9 @@ def _sessions_back(cal: calendar.TradingCalendar, session: date, n: int) -> date
 
 
 def close_grading(ctx: JobContext) -> JobResult:
-    """15:45: fetch the session close, grade every ungraded call that has one, report.
+    """15:45: fetch the session close, grade every ungraded call that has one, report;
+    then grade the open ideas, keep the paper book in step and snapshot the paper equity
+    (`grade_ideas`).
 
     A call still without a close within the last UNRESOLVED_SESSIONS sessions is a
     problem (partial run). Older ones will not resolve by themselves (the session never
@@ -641,8 +704,12 @@ def close_grading(ctx: JobContext) -> JobResult:
     db = ctx.db
     session = ctx.calendar.last_completed_session(ctx.now)
     pending = ledger.ungraded(db, through=session)
-    if not pending:
-        raise JobSkipped(f"no ungraded market calls through {session}")
+    open_ideas = ledger.open_ideas(db, through=session)
+    has_book = db.scalar(select(PaperTrade.id).limit(1)) is not None
+    if not pending and not open_ideas and not has_book:
+        raise JobSkipped(
+            f"no ungraded market calls, open ideas or paper positions through {session}"
+        )
     details: dict[str, Any] = {"session": session.isoformat()}
     oldest_recent = _sessions_back(ctx.calendar, session, UNRESOLVED_SESSIONS - 1)
 
@@ -700,8 +767,14 @@ def close_grading(ctx: JobContext) -> JobResult:
     ]
     details["ungraded"] = remaining
     details["unresolvable"] = unresolvable
-    if graded:
-        sent = telegram.send(brief.close_summary(graded))
+
+    ideas_out = grade_ideas(ctx, open_ideas, session, chain, oldest_recent=oldest_recent)
+    details["ideas"] = ideas_out.details
+    db.commit()
+
+    if graded or ideas_out.graded:
+        text = brief.close_summary(graded, ideas=ideas_out.graded, equity=ideas_out.equity)
+        sent = telegram.send(text)
         details["summary"] = "sent" if sent else "not sent (Telegram not configured or failed)"
     message = f"{len(graded)} call(s) graded; {len(remaining)} still ungraded"
     if remaining:
@@ -711,7 +784,12 @@ def close_grading(ctx: JobContext) -> JobResult:
             f"; {len(unresolvable)} unresolvable (older than {UNRESOLVED_SESSIONS} sessions, "
             "see details)"
         )
-    return JobResult("partial" if remaining else "success", message, details)
+    if open_ideas or has_book:
+        message += "; " + ideas_out.summary
+    if ideas_out.problems:
+        message += "; " + "; ".join(ideas_out.problems)
+    partial = bool(remaining or ideas_out.problems)
+    return JobResult("partial" if partial else "success", message, details)
 
 
 def _retrain_target(db: Session, target: str, s: Settings) -> tuple[dict[str, Any], str | None]:
@@ -769,3 +847,643 @@ def weekly_retrain(ctx: JobContext) -> JobResult:
         )
     message = "; ".join([*summary, *problems])
     return JobResult("partial" if problems else "success", message, details)
+
+
+# ----------------------------------------------------------------------------- Phase 3
+
+TRAIN_IDEAS_HINT = "no ideas model: run `python -m app.cli train-ideas`"
+RETRAIN_IDEAS_HINT = "retrain needed (run `python -m app.cli train-ideas`)"
+UNIVERSE_HINT = "no universe instruments: run `python -m app.cli sync-instruments`"
+# Share of the universe that must have a bar for the signal session before ideas are
+# generated from it: the momentum decile is a cross-sectional rank, and "No edge today"
+# read off a half-empty universe would be a verdict about missing data, not the market.
+UNIVERSE_MIN_COVERAGE = 0.5
+MAX_ERROR_REASONS = 5  # distinct provider reasons kept in the run details
+STOCK_EXCHANGE = "NSE"
+IDEA_VOID_HINT = "void it with `python -m app.cli ideas --void {seq} --reason ...`"
+
+
+@dataclass
+class UniverseRefresh:
+    """What the pre-run universe refresh found: how much of the universe has the signal
+    session's bar. Nothing is filled in; a stock without bars is simply not eligible."""
+
+    n_members: int
+    n_with_bar: int  # members with a bar dated `through` after the refresh
+    n_fetched: int  # members a provider supplied bars for in this run
+    n_without_bars: int  # members with no bars at all (the provider does not know them)
+    errors: list[str] = field(default_factory=list)  # distinct provider reasons (capped)
+    n_errors: int = 0
+
+    @property
+    def coverage(self) -> float:
+        return self.n_with_bar / self.n_members if self.n_members else 0.0
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "instruments": self.n_members,
+            "with_bar": self.n_with_bar,
+            "fetched": self.n_fetched,
+            "without_bars": self.n_without_bars,
+            "coverage": finite(round(self.coverage, 4)),
+            "errors": self.n_errors,
+            "error_reasons": list(self.errors),
+        }
+
+
+def refresh_universe(
+    db: Session,
+    members: Sequence[Instrument],
+    through: date,
+    chain: list[MarketDataProvider],
+    years: int,
+) -> UniverseRefresh:
+    """Best-effort `ensure_recent` for every universe member through `through`, then a
+    count of who actually has that session's bar (the two Nifty 500 names the provider
+    does not carry stay without bars and never become candidates)."""
+    fetched = 0
+    reasons: list[str] = []
+    n_errors = 0
+    for inst in members:
+        source, errors = ensure_recent(db, inst, through, chain, years)
+        if source is not None:
+            fetched += 1
+        if errors:
+            n_errors += 1
+            why = errors[-1]
+            if why not in reasons and len(reasons) < MAX_ERROR_REASONS:
+                reasons.append(why)
+    ids = [m.id for m in members]
+    with_bar = db.scalar(
+        select(func.count()).where(DailyBar.instrument_id.in_(ids), DailyBar.trade_date == through)
+    )
+    any_bar = db.scalar(
+        select(func.count(func.distinct(DailyBar.instrument_id))).where(
+            DailyBar.instrument_id.in_(ids)
+        )
+    )
+    return UniverseRefresh(
+        n_members=len(members),
+        n_with_bar=int(with_bar or 0),
+        n_fetched=fetched,
+        n_without_bars=len(members) - int(any_bar or 0),
+        errors=reasons,
+        n_errors=n_errors,
+    )
+
+
+@dataclass
+class IdeasOutcome:
+    """The ideas step of the 07:30 run (`generate_ideas`)."""
+
+    details: dict[str, Any] = field(default_factory=dict)
+    ideas: list[Idea] = field(default_factory=list)  # the session's current ideas, seq order
+    problems: list[str] = field(default_factory=list)
+    recorded: int = 0  # new idea-ledger rows written in this run
+    # horizon -> the line the brief shows when that horizon has no idea ("No edge today",
+    # the training hint, ...). None means the step did not run at all, so the brief
+    # carries no ideas section rather than a made-up verdict.
+    notes: dict[str, str] | None = field(default_factory=dict)
+    summary: str = "ideas: not generated"
+
+
+def _idea_details(i: Idea) -> dict[str, Any]:
+    return {
+        "seq": i.seq,
+        "symbol": i.symbol,
+        "horizon": i.horizon,
+        "setup": i.setup,
+        "strategy": i.strategy,
+        "rank": i.rank,
+        "entry_low": i.entry_low,
+        "entry_high": i.entry_high,
+        "stop": i.stop,
+        "target_1": i.target_1,
+        "target_2": i.target_2,
+        "p_target": i.p_target,
+        "expected_return_low_pct": i.expected_return_low_pct,
+        "expected_return_high_pct": i.expected_return_high_pct,
+        "risk_reward": i.risk_reward,
+        "ev_pct_after_costs": i.ev_pct_after_costs,
+        "position_qty": i.position_qty,
+        "position_value": i.position_value,
+        "risk_amount": i.risk_amount,
+        "is_late": i.is_late,
+        "surveillance_unknown": i.surveillance_unknown,
+    }
+
+
+def _horizon_status(out: IdeasOutcome, horizon: str, status: str, *, problem: bool = False) -> None:
+    out.details[horizon] = {"status": status}
+    if out.notes is not None:
+        out.notes[horizon] = status
+    if problem:
+        out.problems.append(f"{horizon} ideas: {status}")
+
+
+def _ideas_summary(out: IdeasOutcome, horizons: Iterable[str]) -> str:
+    parts: list[str] = []
+    for h in horizons:
+        d = out.details.get(h) or {}
+        status = str(d.get("status", "not generated"))
+        if d.get("ideas"):
+            n = len(d["ideas"])
+            extra = " (already recorded)" if status == "already recorded" else ""
+            parts.append(f"{h} {n} idea{'' if n == 1 else 's'}{extra}")
+        elif status.startswith(ranking.NO_EDGE_TEXT):
+            parts.append(f"{h} {ranking.NO_EDGE_TEXT}")
+        else:
+            parts.append(f"{h} {status}")
+    return "ideas: " + ", ".join(parts)
+
+
+def _candidate_rows(feats: pd.DataFrame, through: date) -> dict[tuple[str, str], pd.Series]:
+    """The candidate frame rows (features at D plus the strategy's columns) keyed by
+    (symbol, strategy), the row `ideas_models.live_features` turns into a model input."""
+    cf = strategies.candidate_frame(feats, through)
+    return {(str(r["symbol"]), str(r["strategy"])): r for _, r in cf.iterrows()}
+
+
+def _score_candidates(
+    mv: ModelVersion,
+    spec: core.HorizonSpec,
+    cands: Sequence[strategies.Candidate],
+    rows: Mapping[tuple[str, str], pd.Series],
+    snapshots: dict[tuple[str, str], FeatureRow],
+    s: Settings,
+) -> tuple[list[ranking.ScoredCandidate], list[str]]:
+    """P(target before stop) for every candidate under one horizon's champion.
+
+    Raises LookupError when the model expects a feature the pipeline no longer produces
+    (the horizon is then not predicted, with the retrain hint). Features the pipeline
+    produces but the model never saw are ignored and returned, for the run details.
+    """
+    artifact = mv.artifact
+    assert artifact, "champion without an artifact"
+    trained = [str(f) for f in mv.feature_names]
+    scored: list[ranking.ScoredCandidate] = []
+    extra: list[str] = []
+    for c in cands:
+        series = rows.get((c.symbol, c.strategy))
+        if series is None:
+            continue
+        row = ideas_models.live_features(series, None, c.strategy)
+        missing = [f for f in trained if f not in row]
+        if missing:
+            raise LookupError(
+                f"{RETRAIN_IDEAS_HINT}: model {mv.version} expects features the pipeline no "
+                f"longer produces ({_names(missing)})"
+            )
+        if not extra:
+            extra = sorted(f for f in row if f not in trained)
+        pred = ideas_models.predict(artifact, trained, row, settings=s)
+        snapshots[(c.symbol, c.strategy)] = row
+        scored.append(
+            ranking.ScoredCandidate(
+                c, pred.p_target, spec, drivers=pred.all_drivers, exchange=STOCK_EXCHANGE
+            )
+        )
+    return scored, extra
+
+
+def generate_ideas(
+    ctx: JobContext,
+    session: date,
+    through: date,
+    chain: list[MarketDataProvider],
+    *,
+    blocked: str | None = None,
+) -> IdeasOutcome:
+    """07:30, after the calls: the stock ideas for `session`, per horizon, into the ledger.
+
+    Steps: (1) ideas already recorded for the session are left alone, per horizon
+    (re-runs are idempotent; the race between two live runs is closed by the idea ledger
+    lock, `LedgerConflict`); (2) `blocked` (the calls' recording guard: unverified
+    calendar, provisional reference close) blocks the ideas too; (3) a horizon without a
+    champion model is reported with the training hint and makes the run partial; (4) the
+    universe's bars are refreshed through `through` (the signal session, best effort,
+    reported), and ideas are only generated when at least UNIVERSE_MIN_COVERAGE of the
+    universe has that bar; (5) point-in-time features at `through`
+    (`ideas_features.stock_features`), the rule-based candidates (`strategies`), the
+    champion's P(target) per candidate (`ideas_models.predict`), the ranking by EV after
+    costs with the p / EV bar, the one-per-symbol rule and the per-horizon cap
+    (`ranking.rank_report`), position size from the paper risk settings, and one ledger
+    row per idea with the full feature snapshot and every driver. A horizon with nothing
+    over the bar gets "No edge today" and no row. `surveillance_unknown` is always True:
+    no ASM/GSM source is reachable.
+    """
+    s, db = ctx.settings, ctx.db
+    specs = core.horizons(s)
+    out = IdeasOutcome(
+        details={"session": session.isoformat(), "signal_session": through.isoformat()}
+    )
+    assert out.notes is not None
+    existing = ledger.ideas_for_session(db, session, current_only=True)
+    out.ideas = list(existing)
+    for h in specs:
+        mine = [i for i in existing if i.horizon == h]
+        if mine:
+            out.details[h] = {
+                "status": "already recorded",
+                "ideas": [_idea_details(i) for i in mine],
+            }
+    todo = [h for h in specs if h not in out.details]
+    if not todo:
+        out.summary = _ideas_summary(out, specs)
+        return out
+    if blocked is not None:
+        for h in todo:
+            _horizon_status(out, h, f"not generated: {blocked}")
+        out.summary = _ideas_summary(out, specs)
+        return out
+
+    champions: dict[str, ModelVersion] = {}
+    for h in todo:
+        mv = ideas_models.ideas_champion(db, h, s)
+        if mv is None or not mv.artifact:
+            _horizon_status(out, h, TRAIN_IDEAS_HINT, problem=True)
+        else:
+            champions[h] = mv
+    if not champions:
+        out.summary = _ideas_summary(out, specs)
+        return out
+
+    members = instruments.universe_instruments(db)
+    if not members:
+        for h in champions:
+            _horizon_status(out, h, f"not generated: {UNIVERSE_HINT}", problem=True)
+        out.summary = _ideas_summary(out, specs)
+        return out
+    refresh = refresh_universe(db, members, through, chain, s.backfill_years)
+    out.details["universe"] = refresh.as_dict()
+    db.commit()  # keep what was fetched even if the scoring step fails and retries
+    if refresh.coverage < UNIVERSE_MIN_COVERAGE:
+        why = (
+            f"only {refresh.n_with_bar} of {refresh.n_members} universe stocks have a bar "
+            f"for {through}"
+        )
+        for h in champions:
+            _horizon_status(out, h, f"not generated: {why}", problem=True)
+        out.summary = _ideas_summary(out, specs)
+        return out
+
+    feats = idf.stock_features(db, [m.id for m in members], through, settings=s, start=through)
+    cands = strategies.candidates(feats, through)
+    rows = _candidate_rows(feats, through)
+    eligible = int(feats["eligible"].fillna(False).astype(bool).sum()) if not feats.empty else 0
+    out.details["candidates"] = {
+        "eligible": eligible,
+        "n": len(cands),
+        "by_strategy": {
+            name: sum(c.strategy == name for c in cands) for name in strategies.STRATEGY_NAMES
+        },
+    }
+    ids_by_symbol = {m.symbol: m.id for m in members}
+    for c in cands:
+        if c.instrument_id is not None:
+            ids_by_symbol[c.symbol] = c.instrument_id
+
+    scored: list[ranking.ScoredCandidate] = []
+    snapshots: dict[tuple[str, str], FeatureRow] = {}
+    scoring: dict[str, ModelVersion] = {}
+    for h, mv in champions.items():
+        try:
+            horizon_scored, extra = _score_candidates(mv, specs[h], cands, rows, snapshots, s)
+        except LookupError as exc:
+            _horizon_status(out, h, f"not predicted: {exc}", problem=True)
+            continue
+        scored += horizon_scored
+        scoring[h] = mv
+        out.details[h] = {
+            "status": "scored",
+            "model_version": mv.version,
+            "n_candidates": len(horizon_scored),
+        }
+        if extra:
+            out.details[h]["features_not_in_model"] = extra
+
+    report = ranking.rank_report(scored, s)
+    out.details["ranking"] = report.as_dict()
+    for h, mv in scoring.items():
+        kept = [o for o in report.ideas if o.horizon == h]
+        if not kept:
+            text = report.no_edge.get(h) or ranking.no_edge_text(h, s)
+            out.details[h]["status"] = text
+            out.notes[h] = text
+            continue
+        recorded_rows: list[dict[str, Any]] = []
+        for rank, o in enumerate(kept, start=1):
+            qty, value, risk = ranking.size_position(ranking.entry_mid(o), o.stop, s)
+            rec = IdeaRecordIn(
+                session_date=session,
+                as_of=ctx.now,
+                instrument_id=ids_by_symbol[o.symbol],
+                output=o,
+                position_qty=qty,
+                position_value=value,
+                risk_amount=risk,
+                rank=rank,
+                feature_snapshot=snapshots[(o.symbol, o.strategy)],
+                model_version_id=mv.id,
+                surveillance_unknown=True,
+            )
+            try:
+                row = ledger.record_idea(db, rec, settings=s)
+                out.recorded += 1
+                status = "recorded"
+            except ledger.LedgerConflict as conflict:
+                # Another run recorded this idea while we were computing: theirs stands.
+                row = conflict.existing
+                status = "already recorded"
+            out.ideas.append(row)
+            recorded_rows.append({**_idea_details(row), "status": status})
+        out.details[h]["status"] = "recorded"
+        out.details[h]["ideas"] = recorded_rows
+    out.ideas.sort(key=lambda i: i.seq)
+    out.summary = _ideas_summary(out, specs)
+    return out
+
+
+def idea_tracks(
+    db: Session, ideas: Sequence[Idea], settings: Settings
+) -> list[tuple[Idea, ideas_scorecard.IdeaTrack]]:
+    """Each idea with the live record of its setup at its horizon (for the brief)."""
+    cache: dict[tuple[str, str], ideas_scorecard.IdeaTrack] = {}
+    out: list[tuple[Idea, ideas_scorecard.IdeaTrack]] = []
+    for i in ideas:
+        key = (i.horizon, i.setup)
+        if key not in cache:
+            cache[key] = ideas_scorecard.idea_track(db, i.horizon, i.setup, settings=settings)
+        out.append((i, cache[key]))
+    return out
+
+
+# --------------------------------------------------------------------------- 09:20 fills
+
+
+@dataclass
+class FillReport:
+    """The ideas part of the 09:20 run (`fill_ideas`)."""
+
+    details: dict[str, Any] = field(default_factory=dict)
+    problems: list[str] = field(default_factory=list)
+    processed: list[tuple[Idea, IdeaOutcome]] = field(default_factory=list)  # decided now
+    filled: int = 0
+    invalidated: int = 0
+    pending: int = 0  # still waiting for the session's open
+
+
+def _outcome_details(o: IdeaOutcome | None) -> dict[str, Any]:
+    if o is None:
+        return {}
+    return {
+        "entry_date": o.entry_date.isoformat() if o.entry_date else None,
+        "entry_price": o.entry_price,
+        "exit_date": o.exit_date.isoformat() if o.exit_date else None,
+        "exit_price": o.exit_price,
+        "gross_return_pct": o.gross_return_pct,
+        "net_return_pct": o.net_return_pct,
+        "r_multiple": o.r_multiple,
+        "days_held": o.days_held,
+        "max_favorable_pct": o.max_favorable_pct,
+        "max_adverse_pct": o.max_adverse_pct,
+        "notes": o.notes,
+    }
+
+
+def fill_ideas(
+    ctx: JobContext, ideas: Sequence[Idea], session: date, chain: list[MarketDataProvider]
+) -> FillReport:
+    """09:20: the entry rule for each of the session's pending ideas at the session's open.
+
+    The open comes from a provider's bar for the session (partial, never stored: see
+    `_session_open`); inside [entry_low, entry_high] the idea is filled at it and its
+    paper position opened (`paper.open_trade_for_idea`), outside it is invalidated
+    (`idea_grading.open_check_fill`). An idea whose open is not available yet stays
+    pending and makes the run partial; ideas already decided are reported as they are.
+    """
+    db = ctx.db
+    rep = FillReport()
+    outcomes = idea_grading.outcomes_for(db, ideas)
+    opens: dict[tuple[str, str], tuple[float, str] | None] = {}
+    for idea in ideas:
+        key = f"seq {idea.seq} {idea.symbol} {idea.horizon}"
+        existing = outcomes.get(idea.id)
+        status = idea_grading.status_of(existing)
+        if status != "pending":
+            rep.details[key] = {"status": f"already {status}", **_outcome_details(existing)}
+            continue
+        ikey = (idea.symbol, idea.exchange)
+        if ikey not in opens:
+            opens[ikey] = _session_open(chain, idea.symbol, session, idea.exchange)
+        found = opens[ikey]
+        if found is None:
+            rep.pending += 1
+            rep.details[key] = {"status": "open not available yet"}
+            rep.problems.append(
+                f"{idea.symbol} ({idea.horizon}): open for {session} not available yet"
+            )
+            continue
+        open_, source = found
+        outcome = idea_grading.open_check_fill(db, idea, open_, now=ctx.now, source=source)
+        entry: dict[str, Any] = {
+            "status": outcome.status,
+            "actual_open": open_,
+            "entry_zone": [idea.entry_low, idea.entry_high],
+            "entry_price": outcome.entry_price,
+            "note": outcome.notes,
+            "source": source,
+        }
+        if outcome.status == "open":
+            rep.filled += 1
+            try:
+                trade = paper.open_trade_for_idea(db, idea, outcome, now=ctx.now)
+                entry["paper_trade_id"] = trade.id
+                entry["qty"] = trade.qty
+            except ValueError as exc:
+                entry["paper_trade"] = f"not opened: {exc}"
+                rep.problems.append(
+                    f"{idea.symbol} ({idea.horizon}): filled but no paper trade: {exc}"
+                )
+        else:
+            rep.invalidated += 1
+        rep.processed.append((idea, outcome))
+        rep.details[key] = entry
+    return rep
+
+
+# --------------------------------------------------------------------------- 15:45 grading
+
+
+@dataclass
+class IdeaGradingReport:
+    """The ideas and paper part of the 15:45 run (`grade_ideas`)."""
+
+    details: dict[str, Any] = field(default_factory=dict)
+    problems: list[str] = field(default_factory=list)
+    graded: list[tuple[Idea, IdeaOutcome]] = field(default_factory=list)  # written this run
+    equity: PaperEquity | None = None
+    summary: str = ""
+
+
+def _bar_dates(bars: pd.DataFrame) -> list[date]:
+    return [pd.Timestamp(d).date() for d in bars.index]
+
+
+def grade_ideas(
+    ctx: JobContext,
+    open_ideas: Sequence[Idea],
+    session: date,
+    chain: list[MarketDataProvider],
+    *,
+    oldest_recent: date,
+) -> IdeaGradingReport:
+    """15:45: settle or advance every open idea, keep the paper book in step, snapshot equity.
+
+    Bars of the ideas' and open positions' instruments and the Nifty 50 are refreshed
+    through the session first (best effort, reported). Each idea is graded on its bars
+    from the entry session on (`idea_grading.grade_idea`: a pending idea is filled from
+    its entry session's open first, a 09:20 run that never happened loses nothing), and
+    `paper.sync_trade_with_outcome` opens or closes its paper trade. An idea whose
+    instrument has no bar for the session yet waits (partial run); one that has waited
+    longer than UNRESOLVED_SESSIONS sessions is listed as unresolvable with the void
+    command. The equity row for the session is written only when every open position has
+    a close (`paper.snapshot_equity`); otherwise the gap is reported, never papered over.
+    """
+    db, s = ctx.db, ctx.settings
+    rep = IdeaGradingReport()
+    insts: dict[int, Instrument] = {}
+    for idea in open_ideas:
+        inst = db.get(Instrument, idea.instrument_id)
+        if inst is not None:
+            insts[inst.id] = inst
+    open_trades = paper.list_trades(db, status="open")
+    for t in open_trades:
+        inst = instruments.get_instrument(db, t.symbol, t.exchange)
+        if inst is not None:
+            insts[inst.id] = inst
+    has_book = db.scalar(select(PaperTrade.id).limit(1)) is not None
+    nifty = instruments.get_instrument(db, idf.NIFTY_SYMBOL, "INDEX")
+    if nifty is not None and (has_book or open_ideas):
+        insts[nifty.id] = nifty  # the equity row's benchmark close
+    if insts:
+        refresh = _refresh_bars(
+            db,
+            list(insts.values()),
+            session,
+            chain,
+            s.backfill_years,
+            session=session,
+            now=ctx.now,
+        )
+        rep.details["refresh"] = refresh.problems or "ok"
+        db.commit()
+
+    waiting: list[str] = []
+    unresolvable: list[str] = []
+    settled = still_open = invalidated = 0
+    for idea in open_ideas:
+        key = f"seq {idea.seq} {idea.symbol} {idea.horizon}"
+        bars = daily_frame(db, idea.instrument_id, start=idea.session_date)
+        dates = _bar_dates(bars)
+        if dates and dates[-1] > session:  # never read past the session being graded
+            keep = [d <= session for d in dates]
+            bars = bars[keep]
+            dates = [d for d in dates if d <= session]
+        latest = dates[-1] if dates else None
+        existing = idea_grading.outcome_of(db, idea.id)
+        pending = idea_grading.status_of(existing) == "pending"
+        no_entry_bar = pending and (not dates or dates[0] != idea.session_date)
+        if latest != session or no_entry_bar:
+            what = (
+                f"no bar for its entry session {idea.session_date}"
+                if no_entry_bar
+                else f"no bar for {session}"
+            )
+            if latest is not None and latest >= oldest_recent and not no_entry_bar:
+                # The stock has traded recently; today's bar is simply not published yet.
+                waiting.append(f"{idea.symbol} {idea.horizon} (seq {idea.seq}): {what} yet")
+            elif idea.session_date < oldest_recent:
+                unresolvable.append(
+                    f"{idea.symbol} {idea.horizon} {idea.session_date} (seq {idea.seq}): {what} "
+                    f"after {UNRESOLVED_SESSIONS} sessions; {IDEA_VOID_HINT.format(seq=idea.seq)}"
+                )
+            else:
+                waiting.append(f"{idea.symbol} {idea.horizon} (seq {idea.seq}): {what} yet")
+            rep.details[key] = {"status": idea_grading.status_of(existing), "problem": what}
+            continue
+        source = str(bars["source"].iloc[-1]) if "source" in bars.columns else "close_grading"
+        try:
+            outcome = idea_grading.grade_idea(
+                db, idea, bars, now=ctx.now, source=source, settings=s
+            )
+        except ValueError as exc:
+            rep.problems.append(f"{idea.symbol} {idea.horizon} (seq {idea.seq}): not graded: {exc}")
+            rep.details[key] = {"status": idea_grading.status_of(existing), "problem": str(exc)}
+            continue
+        entry: dict[str, Any] = {"status": outcome.status, **_outcome_details(outcome)}
+        try:
+            trade = paper.sync_trade_with_outcome(db, idea, outcome, now=ctx.now, settings=s)
+        except ValueError as exc:
+            trade = None
+            entry["paper_trade"] = f"not synced: {exc}"
+            rep.problems.append(
+                f"{idea.symbol} {idea.horizon} (seq {idea.seq}): paper trade not synced: {exc}"
+            )
+        if trade is not None:
+            entry["paper_trade_id"] = trade.id
+            entry["paper_trade_status"] = trade.status
+            entry["net_pnl"] = trade.net_pnl
+        if outcome.status in idea_grading.TERMINAL_STATUSES:
+            settled += 1
+        elif outcome.status == "open":
+            still_open += 1
+        else:
+            invalidated += 1
+        rep.graded.append((idea, outcome))
+        rep.details[key] = entry
+    rep.details["waiting"] = waiting
+    rep.details["unresolvable"] = unresolvable
+    rep.problems += waiting
+
+    has_book = db.scalar(select(PaperTrade.id).limit(1)) is not None
+    if has_book:
+        closes: dict[str, float] = {}
+        for t in paper.list_trades(db, status="open"):
+            inst = instruments.get_instrument(db, t.symbol, t.exchange)
+            bar = db.get(DailyBar, (inst.id, session)) if inst is not None else None
+            close = finite(bar.close) if bar is not None else None
+            if close is not None:
+                closes[t.symbol] = close
+        nifty_bar = db.get(DailyBar, (nifty.id, session)) if nifty is not None else None
+        nifty_close = finite(nifty_bar.close) if nifty_bar is not None else None
+        if nifty_close is None:
+            rep.details["nifty_close"] = f"missing for {session}: equity row without the benchmark"
+        try:
+            eq = paper.snapshot_equity(
+                db, session, closes, nifty_close, source="close_grading", settings=s
+            )
+            rep.equity = eq
+            rep.details["paper_equity"] = {
+                "trade_date": eq.trade_date.isoformat(),
+                "equity": eq.equity,
+                "cash": eq.cash,
+                "invested": eq.invested,
+                "open_positions": eq.open_positions,
+                "nifty_close": eq.nifty_close,
+            }
+        except ValueError as exc:
+            rep.details["paper_equity"] = f"not snapshotted: {exc}"
+            rep.problems.append(f"paper equity for {session} not snapshotted: {exc}")
+
+    parts = [f"{settled} idea(s) settled", f"{still_open} open"]
+    if invalidated:
+        parts.append(f"{invalidated} invalidated")
+    if waiting:
+        parts.append(f"{len(waiting)} waiting for a bar")
+    if unresolvable:
+        parts.append(f"{len(unresolvable)} unresolvable (see details)")
+    if rep.equity is not None:
+        parts.append(f"paper equity {rep.equity.equity:,.0f}")
+    rep.summary = ", ".join(parts)
+    return rep

@@ -1,7 +1,9 @@
-"""API: auth gate, login, Today (incl. the market call), Scorecard, Stock page, Health.
+"""API: auth gate, login, Today (incl. the market call and the ideas), Ideas, Paper,
+Scorecard (market call + ideas), Stock page, Health.
 
 No network: providers are faked. Ledger rows are seeded through
-`app.services.ledger.record_market_call` with a minimal `MarketCallRecordIn`.
+`app.services.ledger.record_market_call` with a minimal `MarketCallRecordIn` and
+`app.services.ledger.record_idea` with `tests.test_idea_ledger.make_idea`.
 """
 
 from __future__ import annotations
@@ -9,33 +11,41 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, time, timedelta
 
 import numpy as np
+import pandas as pd
 import pyotp
 import pytest
 from fastapi.testclient import TestClient
 from sqlalchemy.orm import Session
 
 from app.api.health import market_call_freshness
+from app.api.ideas import STATUS_FILTERS, SURVEILLANCE_NOTE
 from app.cache import get_kv
-from app.config import IST
+from app.config import IST, get_settings
 from app.main import app
 from app.ml.core import (
     BASELINE_NAMES,
     CONFIDENCE_LEVELS,
+    IDEA_STATUSES,
     MODEL_NAME,
+    CostModel,
     Driver,
     MarketCallOutput,
     MarketCallRecordIn,
     session_for,
 )
-from app.models import ModelVersion, Prediction
+from app.ml.ideas_models import model_name, model_target
+from app.models import Idea, ModelVersion, Prediction
 from app.providers.base import Bar
 from app.security.auth import create_user
-from app.services import instruments, ledger
+from app.services import instruments, ledger, paper
 from app.services.calendar import TradingCalendar
 from app.services.flows import store as store_flows
 from app.services.grading import grade_close
+from app.services.idea_grading import grade_idea, open_check_fill
 from app.services.market_data import upsert_daily_bars
 from app.services.scorecard import MIN_PAIRED_N
+from tests.test_idea_ledger import SNAPSHOT, make_idea, make_instrument
+from tests.test_ideas_scorecard import OOS_METRICS as IDEA_OOS_METRICS
 from tests.test_scorecard import OOS_METRICS, captured_sql
 
 PW = "correct horse battery staple"
@@ -98,6 +108,68 @@ def _record_call(
     return row
 
 
+IDEA_NOW = datetime.now(UTC)
+
+
+def _record_idea(
+    db: Session,
+    symbol: str = "RELIANCE",
+    horizon: str = "swing",
+    session: date | None = None,
+    **kw: object,
+) -> Idea:
+    """Append one idea (07:35 IST of its session) to the idea ledger and commit."""
+    session = session or _current_session(db)
+    inst = make_instrument(db, symbol)
+    row = ledger.record_idea(
+        db,
+        make_idea(
+            inst.id,
+            symbol,
+            horizon,
+            session_date=session,
+            as_of=datetime.combine(session, time(7, 35), tzinfo=IST),
+            **kw,  # type: ignore[arg-type]
+        ),
+    )
+    db.commit()
+    return row
+
+
+def _bars(start: date, *rows: tuple[int, float, float, float, float]) -> pd.DataFrame:
+    """Daily bars like `market_data.daily_frame`: (day offset from start, o, h, l, c)."""
+    idx = pd.to_datetime([start + timedelta(days=d) for d, *_ in rows])
+    return pd.DataFrame(
+        {
+            "open": [r[1] for r in rows],
+            "high": [r[2] for r in rows],
+            "low": [r[3] for r in rows],
+            "close": [r[4] for r in rows],
+            "volume": [1.0e6] * len(rows),
+            "delivery_pct": [float("nan")] * len(rows),
+            "source": ["test"] * len(rows),
+        },
+        index=idx,
+    )
+
+
+def _ideas_champion(horizon: str, metrics: dict | None = None) -> ModelVersion:
+    return ModelVersion(
+        name=model_name(horizon),
+        target=model_target(),
+        version=f"lgbm-ideas-{horizon}",
+        kind="lightgbm",
+        params={},
+        feature_names=["ret_20d"],
+        metrics=metrics or {"n_oos": 10},
+        artifact="{" + '"classifier": "' + "x" * 2000 + '"}',
+        trained_through=date(2026, 10, 30),
+        train_rows=5000,
+        is_champion=True,
+        promoted_at=IDEA_NOW,
+    )
+
+
 @pytest.fixture()
 def client(db: Session) -> TestClient:
     return TestClient(app)
@@ -132,6 +204,13 @@ def test_healthz_is_public(client: TestClient) -> None:
         "/api/scorecard",
         "/api/scorecard?target=NIFTY%20BANK",
         "/api/scorecard/ledger",
+        "/api/scorecard/ideas",
+        "/api/ideas",
+        "/api/ideas?status=open&horizon=swing",
+        "/api/ideas/1",
+        "/api/paper",
+        "/api/paper/trades",
+        "/api/today/market-call/1/factors",
     ],
 )
 def test_everything_else_requires_login(client: TestClient, path: str) -> None:
@@ -681,6 +760,530 @@ def test_last_market_call_freshness_is_session_aware() -> None:
     # Empty ledger.
     f = market_call_freshness(cal, at(mon, 8, 0), None, 0, lock)
     assert f.status == "missing" and f.latest is None and f.expected == mon
+
+
+# ----------------------------------------------------------------- ideas on Today
+
+
+def test_today_ideas_say_there_is_no_model_before_training(logged_in: TestClient) -> None:
+    ideas = logged_in.get("/api/today").json()["ideas"]
+    assert ideas["n_ideas"] == 0 and ideas["is_previous"] is False
+    assert [g["horizon"] for g in ideas["by_horizon"]] == ["swing", "positional"]
+    for g in ideas["by_horizon"]:
+        assert g["ideas"] == [] and g["no_edge"] is False and g["champion_version"] is None
+        assert "No ideas model" in g["note"] and "train-ideas" in g["note"]
+    assert (
+        ideas["by_horizon"][0]["horizon_days"] == 10
+        and ideas["by_horizon"][1]["horizon_days"] == 60
+    )
+    assert "train-ideas" in ideas["note"]
+    assert ideas["surveillance_note"] == SURVEILLANCE_NOTE and "not checked" in SURVEILLANCE_NOTE
+    assert ideas["min_p_target"] == 0.55 and ideas["min_ev_pct"] == 0.5
+    assert ideas["max_per_horizon"] == 3
+
+
+def test_today_ideas_say_no_edge_only_when_the_engine_ran(
+    db: Session, logged_in: TestClient
+) -> None:
+    session = _current_session(db)
+    db.add_all([_ideas_champion("swing"), _ideas_champion("positional")])
+    db.commit()
+    # A model, but the 07:30 job has not run for the session: not "No edge".
+    ideas = logged_in.get("/api/today").json()["ideas"]
+    assert ideas["session"] == session.isoformat()
+    for g in ideas["by_horizon"]:
+        assert g["no_edge"] is False and "hasn't run" in g["note"]
+        assert g["champion_version"] == f"lgbm-ideas-{g['horizon']}"
+    assert "hasn't run" in ideas["note"] and "No edge" not in ideas["note"]
+    # The job recorded the session's market call (ideas come right after): no idea = no edge.
+    _record_call(db, "NIFTY 50", session=session)
+    ideas = logged_in.get("/api/today").json()["ideas"]
+    for g in ideas["by_horizon"]:
+        assert g["no_edge"] is True
+        assert g["note"].startswith(f"No edge today ({g['horizon']})")
+        assert "P(target) >= 55%" in g["note"] and "EV >= 0.5%" in g["note"]
+    assert ideas["note"].startswith("No edge today")
+
+
+def test_today_shows_the_sessions_ideas_with_track_record_and_surveillance(
+    db: Session, logged_in: TestClient
+) -> None:
+    session = _current_session(db)
+    db.add(_ideas_champion("swing"))
+    db.commit()
+    _record_call(db, "NIFTY 50", session=session)
+    swing = _record_idea(db, "RELIANCE", "swing", session, rank=1)
+    _record_idea(
+        db,
+        "TCS",
+        "swing",
+        session,
+        rank=2,
+        p_target=0.58,
+        setup="pullback",
+        strategy="pullback_20dma",
+    )
+
+    with captured_sql(db) as sql:
+        body = logged_in.get("/api/today").json()
+    ideas = body["ideas"]
+    assert ideas["session"] == session.isoformat() and ideas["is_previous"] is False
+    assert ideas["n_ideas"] == 2 and ideas["note"] == ""
+    sw, po = ideas["by_horizon"]
+    assert [i["symbol"] for i in sw["ideas"]] == ["RELIANCE", "TCS"]  # by rank
+    assert sw["no_edge"] is False and sw["note"] is None
+    first = sw["ideas"][0]
+    assert first["id"] == swing.id and first["seq"] == 1 and first["is_previous"] is False
+    assert first["horizon"] == "swing" and first["horizon_days"] == 10
+    assert first["setup"] == "breakout" and first["setup_label"] == "Breakout"
+    assert first["strategy_label"] == "20-day breakout"
+    assert first["entry_low"] == 990.0 and first["entry_high"] == 1010.0
+    assert first["stop"] == 980.0 and first["target_1"] == 1040.0 and first["target_2"] == 1060.0
+    assert first["p_target"] == 0.6 and first["position_qty"] == 50
+    assert first["expected_return_low_pct"] == pytest.approx(4.0)
+    assert first["expected_return_high_pct"] == pytest.approx(6.0)
+    assert first["risk_reward"] == pytest.approx(2.0)
+    assert first["ev_pct_after_costs"] == pytest.approx(
+        0.6 * 4.0 - 0.4 * 2.0 - CostModel.from_settings().round_trip_pct()
+    )
+    assert first["is_late"] is False and first["direction"] == "long"
+    assert first["surveillance_unknown"] is True
+    assert first["surveillance_note"] == SURVEILLANCE_NOTE
+    assert first["model_version"] is None and first["corrected_by_seq"] is None
+    assert first["outcome"]["status"] == "pending" and first["outcome"]["entry_price"] is None
+    track = first["track"]
+    assert track == {
+        "horizon": "swing",
+        "setup": "breakout",
+        "n_graded": 0,
+        "hit_rate": None,
+        "win_rate": None,
+        "expectancy_pct": None,
+        "sample_warning": True,
+        "min_sample_size": 100,
+    }
+    assert sw["ideas"][1]["track"]["setup"] == "pullback"
+    # The positional horizon has no idea and no model: the note says so, not "No edge".
+    assert po["ideas"] == [] and po["no_edge"] is False and "No ideas model" in po["note"]
+    # The list never reads the ideas' feature snapshot.
+    selects = [q for q in sql if q.lstrip().upper().startswith("SELECT")]
+    assert selects and all("feature_snapshot" not in q for q in selects)
+
+
+def test_today_ideas_fall_back_to_the_previous_session_with_outcomes(
+    db: Session, logged_in: TestClient
+) -> None:
+    session = _current_session(db)
+    cal = TradingCalendar.load(db)
+    previous = cal.previous_trading_day(session)
+    idea = _record_idea(db, "RELIANCE", "swing", previous)
+    outcome = grade_idea(
+        db, idea, _bars(previous, (0, 1000.0, 1045.0, 998.0, 1030.0)), now=IDEA_NOW, source="test"
+    )
+    db.commit()
+    assert outcome.status == "target"
+
+    ideas = logged_in.get("/api/today").json()["ideas"]
+    assert ideas["session"] == previous.isoformat() and ideas["is_previous"] is True
+    [shown] = ideas["by_horizon"][0]["ideas"]
+    assert shown["seq"] == idea.seq and shown["is_previous"] is True
+    out = shown["outcome"]
+    assert (
+        out["status"] == "target" and out["entry_price"] == 1000.0 and out["exit_price"] == 1040.0
+    )
+    assert out["gross_return_pct"] == pytest.approx(4.0)
+    assert out["net_return_pct"] == pytest.approx(4.0 - CostModel.from_settings().round_trip_pct())
+    assert out["days_held"] == 1 and out["exit_date"] == previous.isoformat()
+    # The track record beside it has moved: one graded breakout at the swing horizon.
+    assert shown["track"]["n_graded"] == 1 and shown["track"]["hit_rate"] == 1.0
+    assert shown["track"]["sample_warning"] is True
+    # Once the upcoming session has an idea, that one is shown instead.
+    _record_idea(db, "TCS", "swing", session)
+    ideas = logged_in.get("/api/today").json()["ideas"]
+    assert ideas["session"] == session.isoformat() and ideas["is_previous"] is False
+    assert [i["symbol"] for i in ideas["by_horizon"][0]["ideas"]] == ["TCS"]
+
+
+# ----------------------------------------------------------------- /api/ideas
+
+
+def test_ideas_list_filters(db: Session, logged_in: TestClient) -> None:
+    session = _current_session(db)
+    cal = TradingCalendar.load(db)
+    previous = cal.previous_trading_day(session)
+    pending = _record_idea(db, "RELIANCE", "swing", session)
+    hit = _record_idea(db, "TCS", "swing", previous, setup="pullback", strategy="pullback_20dma")
+    grade_idea(
+        db, hit, _bars(previous, (0, 1000.0, 1045.0, 998.0, 1030.0)), now=IDEA_NOW, source="t"
+    )
+    gapped = _record_idea(db, "INFY", "positional", previous)
+    open_check_fill(db, gapped, 1020.0, now=IDEA_NOW, source="t")  # above the zone: invalidated
+    original = _record_idea(db, "HDFCBANK", "positional", session, p_target=0.57)
+    fix = _record_idea(db, "HDFCBANK", "positional", session, p_target=0.61, corrects=original.id)
+    db.commit()
+
+    with captured_sql(db) as sql:
+        body = logged_in.get("/api/ideas").json()
+    assert body["n"] == 4 and body["status"] is None and body["horizon"] is None
+    assert body["limit"] == 50 and body["min_sample_size"] == 100
+    assert body["surveillance_note"] == SURVEILLANCE_NOTE
+    assert body["statuses"] == list(STATUS_FILTERS) and body["horizons"] == ["swing", "positional"]
+    assert body["setups"] == ["breakout", "momentum", "mean_reversion", "pullback"]
+    # Newest session first, the correction instead of the superseded original.
+    assert [i["seq"] for i in body["ideas"]] == [fix.seq, pending.seq, gapped.seq, hit.seq]
+    by_seq = {i["seq"]: i for i in body["ideas"]}
+    assert (
+        by_seq[fix.seq]["corrects_idea_id"] == original.id and by_seq[fix.seq]["p_target"] == 0.61
+    )
+    assert by_seq[hit.seq]["outcome"]["status"] == "target"
+    assert by_seq[gapped.seq]["outcome"]["status"] == "invalidated"
+    assert "gapped above the entry zone" in by_seq[gapped.seq]["outcome"]["notes"]
+    assert by_seq[pending.seq]["outcome"]["status"] == "pending"
+    selects = [q for q in sql if q.lstrip().upper().startswith("SELECT")]
+    assert selects and all("feature_snapshot" not in q and "drivers" not in q for q in selects)
+
+    def seqs(query: str) -> list[int]:
+        resp = logged_in.get(f"/api/ideas?{query}")
+        assert resp.status_code == 200, resp.text
+        return [i["seq"] for i in resp.json()["ideas"]]
+
+    assert seqs("status=pending") == [fix.seq, pending.seq]
+    assert seqs("status=active") == [fix.seq, pending.seq]
+    assert seqs("status=target") == [hit.seq]
+    assert seqs("status=graded") == [hit.seq]
+    assert seqs("status=invalidated") == [gapped.seq]
+    assert seqs("horizon=positional") == [fix.seq, gapped.seq]
+    assert seqs("horizon=SWING&status=pending") == [pending.seq]
+    assert seqs("setup=pullback") == [hit.seq]
+    assert seqs("setup=results_play") == []
+    assert seqs("limit=1") == [fix.seq]
+    assert logged_in.get("/api/ideas?limit=0").status_code == 422
+    assert logged_in.get("/api/ideas?status=bogus").status_code == 422
+    resp = logged_in.get("/api/ideas?horizon=weekly")
+    assert resp.status_code == 404
+    assert "Unknown horizon 'weekly'" in resp.json()["detail"]
+    assert "swing, positional" in resp.json()["detail"]
+    assert logged_in.get("/api/scorecard/ideas?horizon=weekly").status_code == 404
+
+
+def test_idea_detail_has_the_full_reasoning_factors_outcome_and_paper_trade(
+    db: Session, logged_in: TestClient
+) -> None:
+    session = _current_session(db)
+    mv = _ideas_champion("swing")
+    db.add(mv)
+    db.commit()
+    champ = mv.id
+    idea = _record_idea(db, "RELIANCE", "swing", session, model_version_id=champ)
+    outcome = open_check_fill(db, idea, 1000.0, now=IDEA_NOW, source="open_check")
+    trade = paper.open_trade_for_idea(db, idea, outcome, now=IDEA_NOW)
+    db.commit()
+
+    body = logged_in.get(f"/api/ideas/{idea.seq}").json()
+    assert body["seq"] == idea.seq and body["symbol"] == "RELIANCE"
+    assert body["model_version"] == "lgbm-ideas-swing" and body["model_version_id"] == champ
+    assert body["hash"] == idea.hash and body["prev_hash"] == "0" * 64
+    assert len(body["reasons"]) == 3 and body["reasons"][0].startswith("Close 1000.00 above")
+    assert body["invalidation"].startswith("A close below 980.00")
+    assert body["surveillance_unknown"] is True and body["surveillance_note"] == SURVEILLANCE_NOTE
+    # Outcome and paper trade.
+    assert body["outcome"]["status"] == "open" and body["outcome"]["entry_price"] == 1000.0
+    assert body["outcome"]["entry_date"] == session.isoformat()
+    assert body["outcome"]["source"] == "open_check" and body["outcome"]["exit_price"] is None
+    pt = body["paper_trade"]
+    assert pt["id"] == trade.id and pt["idea_id"] == idea.id and pt["status"] == "open"
+    assert pt["qty"] == 50 and pt["entry_price"] == 1000.0 and pt["entry_value"] == 50_000.0
+    assert pt["stop"] == 980.0 and pt["target"] == 1040.0 and pt["net_pnl"] is None
+    # Factors: the recorded drivers first (largest |contribution| first), then every other
+    # feature of the snapshot with no contribution (none is invented).
+    f = body["factors"]
+    assert f["drivers_top_n"] == 8
+    assert [d["feature"] for d in f["drivers"]] == ["brk_20d_high_pct", "vol_z20"]
+    assert f["drivers"][0] == {
+        "feature": "brk_20d_high_pct",
+        "value": 1.2,
+        "contribution": 0.08,
+        "text": "Breakout above the 20-day high by 1.2 %",
+    }
+    assert [x["feature"] for x in f["all_factors"]] == [
+        "brk_20d_high_pct",
+        "vol_z20",
+        "ret_20d",
+        "rsi14",
+        "atr14_pct",
+        "nan",
+        "missing",
+    ]
+    assert f["n_features"] == 7 and f["n_with_contribution"] == 2
+    by_name = {x["feature"]: x for x in f["all_factors"]}
+    assert by_name["vol_z20"]["contribution"] == 0.05 and by_name["vol_z20"]["value"] == 1.4
+    assert by_name["vol_z20"]["label"] == "Volume z-score (20 days)"
+    assert by_name["ret_20d"] == {
+        "feature": "ret_20d",
+        "label": "20-day return (%)",
+        "value": 0.3,
+        "contribution": None,
+        "text": None,
+    }
+    assert by_name["rsi14"]["value"] == pytest.approx(61.2345678901)  # finite(): 10 decimals
+    assert by_name["nan"]["value"] is None and by_name["missing"]["value"] is None
+    assert by_name["brk_20d_high_pct"]["label"]  # an unknown name still gets a label
+    snap = f["feature_snapshot"]
+    assert set(snap) == set(SNAPSHOT) and snap["nan"] is None and snap["ret_20d"] == 0.3
+    assert logged_in.get("/api/ideas/999").status_code == 404
+
+
+def test_idea_detail_of_a_superseded_idea_points_at_its_correction(
+    db: Session, logged_in: TestClient
+) -> None:
+    original = _record_idea(db, "RELIANCE", "swing", p_target=0.57)
+    fix = _record_idea(db, "RELIANCE", "swing", p_target=0.62, corrects=original.id)
+    old = logged_in.get(f"/api/ideas/{original.seq}").json()
+    assert old["corrected_by_seq"] == fix.seq and old["corrects_idea_id"] is None
+    new = logged_in.get(f"/api/ideas/{fix.seq}").json()
+    assert new["corrected_by_seq"] is None and new["corrects_idea_id"] == original.id
+    assert new["paper_trade"] is None and new["factors"]["n_with_contribution"] == 2
+    assert [i["seq"] for i in logged_in.get("/api/ideas").json()["ideas"]] == [fix.seq]
+
+
+# ----------------------------------------------------------------- /api/paper
+
+
+def test_paper_endpoint_is_honest_when_empty(logged_in: TestClient) -> None:
+    body = logged_in.get("/api/paper").json()
+    assert body["capital"] == 1_000_000.0 and body["n_trades"] == 0 and body["n_open"] == 0
+    assert body["n_days"] == 0 and body["n_returns"] == 0
+    for key in (
+        "hit_rate",
+        "avg_win",
+        "avg_loss",
+        "avg_win_pct",
+        "avg_loss_pct",
+        "expectancy",
+        "expectancy_pct",
+        "profit_factor",
+        "total_net_pnl",
+        "max_drawdown_pct",
+        "sharpe",
+        "sortino",
+        "total_return_pct",
+        "nifty_return_pct",
+    ):
+        assert body[key] is None, key
+    assert body["equity_curve"] == [] and body["open_trades"] == [] and body["recent_closed"] == []
+    assert body["sample_warning"] is True and body["min_sample_size"] == 100
+    assert "price index" in body["note"] and "Paper" in body["note"]
+    assert body["risk_per_trade_pct"] == 1.0 and body["max_position_pct"] == 10.0
+    assert body["cost_round_trip_pct"] == pytest.approx(0.494142)
+    assert logged_in.get("/api/paper/trades").json() == []
+    assert logged_in.get("/api/paper/trades?status=bogus").status_code == 422
+
+
+def test_paper_endpoint_with_a_closed_trade_and_equity_curve(
+    db: Session, logged_in: TestClient
+) -> None:
+    session = _current_session(db)
+    idea = _record_idea(db, "RELIANCE", "swing", session)
+    filled = open_check_fill(db, idea, 1000.0, now=IDEA_NOW, source="t")
+    paper.sync_trade_with_outcome(db, idea, filled, now=IDEA_NOW)
+    paper.snapshot_equity(db, session, {"RELIANCE": 1010.0}, 25_000.0)
+    db.commit()
+    body = logged_in.get("/api/paper").json()
+    assert body["n_open"] == 1 and body["n_trades"] == 0 and body["n_days"] == 1
+    assert body["open_trades"][0]["symbol"] == "RELIANCE" and body["open_trades"][0]["qty"] == 50
+    assert body["equity_curve"][0] == {
+        "trade_date": session.isoformat(),
+        "equity": 1_000_500.0,  # 50 shares marked from 1000 to 1010
+        "cash": 950_000.0,
+        "invested": 50_500.0,
+        "open_positions": 1,
+        "nifty_close": 25_000.0,
+        "nifty_rebased": 1_000_000.0,
+    }
+    assert body["total_return_pct"] == pytest.approx(0.05)
+    assert body["sharpe"] is None and body["max_drawdown_pct"] == 0.0  # one snapshot: no returns
+
+    graded = grade_idea(
+        db, idea, _bars(session, (0, 1000.0, 1045.0, 998.0, 1030.0)), now=IDEA_NOW, source="t"
+    )
+    paper.sync_trade_with_outcome(db, idea, graded, now=IDEA_NOW)
+    next_day = session + timedelta(days=1)
+    paper.snapshot_equity(db, next_day, {}, 25_250.0)
+    db.commit()
+    body = logged_in.get("/api/paper").json()
+    cost = 50 * 1000.0 * CostModel.from_settings().round_trip_pct() / 100.0
+    assert body["n_trades"] == 1 and body["n_wins"] == 1 and body["n_losses"] == 0
+    assert body["hit_rate"] == 1.0 and body["profit_factor"] is None  # no losing trade yet
+    assert body["total_net_pnl"] == pytest.approx(50 * 40.0 - cost)
+    assert body["expectancy"] == pytest.approx(50 * 40.0 - cost)
+    assert body["avg_win_pct"] == pytest.approx(4.0 - CostModel.from_settings().round_trip_pct())
+    assert body["n_days"] == 2 and body["n_returns"] == 1 and body["sharpe"] is None
+    assert body["nifty_return_pct"] == pytest.approx(1.0)
+    assert body["equity_curve"][1]["nifty_rebased"] == pytest.approx(1_010_000.0)
+    assert body["open_trades"] == [] and len(body["recent_closed"]) == 1
+    closed = body["recent_closed"][0]
+    assert closed["status"] == "closed" and closed["exit_price"] == 1040.0
+    assert closed["net_pnl"] == pytest.approx(50 * 40.0 - cost)
+    assert closed["r_multiple"] == pytest.approx((50 * 40.0 - cost) / (50 * 20.0))
+    assert closed["net_return_pct"] == pytest.approx(
+        4.0 - CostModel.from_settings().round_trip_pct()
+    )
+    assert body["sample_warning"] is True
+    trades = logged_in.get("/api/paper/trades").json()
+    assert [t["status"] for t in trades] == ["closed"]
+    assert logged_in.get("/api/paper/trades?status=open").json() == []
+    assert len(logged_in.get("/api/paper/trades?status=closed").json()) == 1
+
+
+# ----------------------------------------------------------------- /api/scorecard/ideas
+
+
+def test_ideas_scorecard_endpoint_shape_when_empty(logged_in: TestClient) -> None:
+    body = logged_in.get("/api/scorecard/ideas").json()
+    assert body["horizon"] is None and body["horizons"] == ["swing", "positional"]
+    assert body["n_ideas"] == 0 and body["n_graded"] == 0
+    assert body["by_status"] == dict.fromkeys(IDEA_STATUSES, 0)
+    for key in (
+        "hit_rate",
+        "win_rate",
+        "avg_win_pct",
+        "avg_loss_pct",
+        "expectancy_pct",
+        "profit_factor",
+        "avg_r_multiple",
+        "avg_days_held",
+    ):
+        assert body[key] is None, key
+    assert body["by_setup"] == [] and body["calibration"] == [] and body["recent"] == []
+    assert [r["horizon"] for r in body["by_horizon"]] == ["swing", "positional"]
+    assert all(r["n"] == 0 and r["hit_rate"] is None for r in body["by_horizon"])
+    assert body["champions"] == {"swing": None, "positional": None}
+    assert body["sample_warning"] is True and body["min_sample_size"] == 100
+    assert "unproven" in body["verdict"]
+    one = logged_in.get("/api/scorecard/ideas?horizon=Positional").json()
+    assert one["horizon"] == "positional" and one["champions"] == {"positional": None}
+    assert [r["horizon"] for r in one["by_horizon"]] == ["positional"]
+
+
+def test_ideas_scorecard_endpoint_aggregates_graded_ideas_and_the_champion(
+    db: Session, logged_in: TestClient
+) -> None:
+    session = _current_session(db)
+    cal = TradingCalendar.load(db)
+    d1 = cal.previous_trading_day(session)
+    d0 = cal.previous_trading_day(d1)
+    hit = _record_idea(db, "RELIANCE", "swing", d0)
+    grade_idea(db, hit, _bars(d0, (0, 1000.0, 1045.0, 998.0, 1030.0)), now=IDEA_NOW, source="t")
+    miss = _record_idea(
+        db, "TCS", "swing", d1, p_target=0.56, setup="pullback", strategy="pullback_20dma"
+    )
+    grade_idea(db, miss, _bars(d1, (0, 1000.0, 1005.0, 975.0, 990.0)), now=IDEA_NOW, source="t")
+    _record_idea(db, "INFY", "positional", session)  # pending
+    db.add(_ideas_champion("swing", IDEA_OOS_METRICS))
+    db.commit()
+
+    with captured_sql(db) as sql:
+        body = logged_in.get("/api/scorecard/ideas").json()
+    assert body["n_ideas"] == 3 and body["n_graded"] == 2
+    assert body["by_status"]["target"] == 1 and body["by_status"]["stop"] == 1
+    assert body["by_status"]["pending"] == 1
+    assert body["hit_rate"] == 0.5 and body["win_rate"] == 0.5
+    cost = CostModel.from_settings().round_trip_pct()
+    assert body["avg_win_pct"] == pytest.approx(4.0 - cost)
+    assert body["avg_loss_pct"] == pytest.approx(-2.0 - cost)
+    assert body["expectancy_pct"] == pytest.approx((4.0 - cost - 2.0 - cost) / 2)
+    assert body["profit_factor"] == pytest.approx((4.0 - cost) / (2.0 + cost))
+    assert body["avg_days_held"] == 1.0
+    setups = {r["setup"]: r for r in body["by_setup"]}
+    assert setups["breakout"]["n"] == 1 and setups["breakout"]["hit_rate"] == 1.0
+    assert setups["pullback"]["n"] == 1 and setups["pullback"]["hit_rate"] == 0.0
+    by_h = {r["horizon"]: r for r in body["by_horizon"]}
+    assert by_h["swing"]["n"] == 2 and by_h["positional"]["n"] == 0
+    assert sum(b["n"] for b in body["calibration"]) == 2
+    for b in body["calibration"]:
+        assert set(b) == {"bin_lo", "bin_hi", "n", "predicted_mean", "observed"}
+    assert "After 2 graded ideas" in body["verdict"] and "50%" in body["verdict"]
+    assert body["sample_warning"] is True
+    # Recent rows (newest first) mirror ideas_scorecard.row_dict.
+    recent = body["recent"]
+    assert [r["symbol"] for r in recent] == ["INFY", "TCS", "RELIANCE"]
+    assert recent[0]["status"] == "pending" and recent[0]["net_return_pct"] is None
+    assert recent[2]["status"] == "target" and recent[2]["exit_price"] == 1040.0
+    assert recent[2]["surveillance_unknown"] is True
+    # The champion box per horizon, from the stored metrics only (never the artifact).
+    champ = body["champions"]["swing"]
+    assert body["champions"]["positional"] is None
+    assert champ["name"] == "ideas_swing" and champ["horizon"] == "swing"
+    assert champ["version"] == "lgbm-ideas-swing" and champ["train_rows"] == 5000
+    assert champ["trained_through"] == "2026-10-30" and champ["promoted_at"] is not None
+    assert champ["oos"]["hit_rate"] == 0.58 and champ["oos"]["n_selected"] == 410
+    assert champ["oos"]["expectancy_after_costs_pct"] == 0.82 and champ["oos"]["n_oos"] == 3200
+    assert champ["oos"]["n_sessions"] is None  # not stored: not invented
+    assert [b["name"] for b in champ["baselines"]] == ["all_candidates", "random_universe"]
+    assert champ["baselines"][0]["hit_rate"] == 0.41 and champ["baselines"][1]["brier"] is None
+    assert champ["per_strategy"] == {"breakout_20d": {"n": 900, "hit_rate": 0.44}}
+    assert champ["calibration"][0]["n"] == 300
+    assert champ["class_frequencies"] == {"target": 0.41, "stop": 0.47, "expired": 0.12}
+    assert champ["notes"] == IDEA_OOS_METRICS["notes"]
+    assert champ["oos_verdict"].startswith("Out of sample 410 ideas cleared the bar")
+    selects = [q for q in sql if q.lstrip().upper().startswith("SELECT")]
+    assert selects and all("artifact" not in q for q in selects)
+    assert all("feature_snapshot" not in q and "drivers" not in q for q in selects)
+    swing = logged_in.get("/api/scorecard/ideas?horizon=swing").json()
+    assert swing["horizon"] == "swing" and swing["n_ideas"] == 2 and swing["n_graded"] == 2
+    assert list(swing["champions"]) == ["swing"]
+
+
+def test_ideas_scorecard_champion_without_an_oos_hit_rate_says_so(
+    db: Session, logged_in: TestClient
+) -> None:
+    metrics = dict(IDEA_OOS_METRICS)
+    metrics["hit_rate"] = None  # no candidate cleared the bar out of sample (NaN -> null)
+    db.add(_ideas_champion("positional", metrics))
+    db.commit()
+    champ = logged_in.get("/api/scorecard/ideas").json()["champions"]["positional"]
+    assert champ["oos"]["hit_rate"] is None and champ["oos"]["brier"] == 0.231
+    assert champ["oos_verdict"] == "No out-of-sample hit rate was stored with this model."
+
+
+# ----------------------------------------------------------------- factors, ledger chains
+
+
+def test_market_call_factors_endpoint(db: Session, logged_in: TestClient) -> None:
+    row = _record_call(db, "NIFTY 50")
+    body = logged_in.get(f"/api/today/market-call/{row.id}/factors").json()
+    assert body["drivers_top_n"] == get_settings().drivers_top_n == 8
+    assert [d["feature"] for d in body["drivers"]] == ["es_fut_ret_1d", "vix_level"]
+    assert [f["feature"] for f in body["all_factors"]] == ["es_fut_ret_1d", "vix_level", "ret_1d"]
+    first, vix, ret = body["all_factors"]
+    assert first["contribution"] == 0.12 and first["value"] == 0.8
+    assert first["label"] == "S&P 500 futures 1-day return (%)"
+    assert first["text"] == "S&P 500 futures 1-day return at +0.80%"
+    assert vix["value"] is None and vix["contribution"] == -0.02  # missing stays missing
+    assert ret == {
+        "feature": "ret_1d",
+        "label": "1-day return (%)",
+        "value": 0.3,
+        "contribution": None,
+        "text": None,
+    }
+    assert body["feature_snapshot"] == {"ret_1d": 0.3, "vix_level": None}
+    assert body["n_features"] == 3 and body["n_with_contribution"] == 2
+    assert logged_in.get("/api/today/market-call/999/factors").status_code == 404
+
+
+def test_verify_ledger_endpoint_walks_the_idea_chain_too(
+    db: Session, logged_in: TestClient
+) -> None:
+    body = logged_in.post("/api/scorecard/verify-ledger?chain=idea").json()
+    assert body == {"ok": True, "checked": 0, "first_bad_seq": None, "message": "ledger is empty"}
+    _record_idea(db, "RELIANCE", "swing")
+    _record_idea(db, "TCS", "positional")
+    body = logged_in.post("/api/scorecard/verify-ledger?chain=idea").json()
+    assert body["ok"] is True and body["checked"] == 2 and body["message"] == "2 records verified"
+    # The default is still the market-call chain, which is empty here.
+    assert logged_in.post("/api/scorecard/verify-ledger").json()["checked"] == 0
+    assert logged_in.post("/api/scorecard/verify-ledger?chain=bogus").status_code == 404
 
 
 # ----------------------------------------------------------------- web setup

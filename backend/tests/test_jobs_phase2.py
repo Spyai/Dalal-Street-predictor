@@ -68,8 +68,8 @@ SATURDAY_1000 = datetime(2026, 10, 31, 10, 0, tzinfo=IST)
 # A one-year history is enough for three walk-forward folds with this window.
 SETTINGS = Settings(prediction_targets=TARGET, wf_min_train_days=150, wf_step_days=60)
 ALLOWLIST = (
-    "^(migrate|sync-instruments|backfill|test-telegram|train|predict( --force)?|"
-    "verify-ledger|run-job [a-z_]+( --force)?)$"
+    "^(migrate|sync-instruments|backfill|test-telegram|train|train-ideas( --horizon [a-z]+)?|"
+    "predict( --force)?|ideas( --force)?|verify-ledger|run-job [a-z_]+( --force)?)$"
 )
 
 
@@ -168,6 +168,15 @@ class BarProvider(FakeProvider):
         return [b for b in self.bars.get(symbol, []) if start <= b.trade_date <= end]
 
 
+def _ideas_step_stub(ctx: Any, session: date, through: date, chain: Any, **kw: Any) -> Any:
+    """Stand-in for the Phase 3 ideas step of the 07:30 run: this world has no universe
+    and no ideas model, and these tests are about the market call. The real step (and its
+    partial statuses) is exercised in tests/test_jobs_phase3.py."""
+    return tasks.IdeasOutcome(
+        details={"status": "not run in this test"}, notes=None, summary="ideas: not run"
+    )
+
+
 @pytest.fixture()
 def fakes(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     sent: list[str] = []
@@ -175,6 +184,7 @@ def fakes(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     nse = ExchangeStub()
     monkeypatch.setattr(tasks.registry, "market_data_chain", lambda db, **kw: [provider])
     monkeypatch.setattr(tasks.registry, "nse_provider", lambda: nse)
+    monkeypatch.setattr(tasks, "generate_ideas", _ideas_step_stub)
     monkeypatch.setattr(runner.telegram, "send", lambda text, **kw: sent.append(text) or True)
     return {"sent": sent, "provider": provider, "nse": nse}
 
@@ -649,6 +659,8 @@ def test_jobs_workflow_schedules_the_phase2_jobs_and_keeps_the_allowlist() -> No
         "train",
         "predict --force",
         "verify-ledger",
+        "train-ideas",
+        "ideas --force",
     } <= set(options)
     steps = {s.get("id") or s.get("name"): s for s in wf["jobs"]["run"]["steps"]}
     pick, run = steps["pick"]["run"], steps["Run"]["run"]
