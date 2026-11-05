@@ -1302,7 +1302,8 @@ class FillReport:
 
     details: dict[str, Any] = field(default_factory=dict)
     problems: list[str] = field(default_factory=list)
-    processed: list[tuple[Idea, IdeaOutcome]] = field(default_factory=list)  # decided now
+    # Decided now: (idea, outcome, the paper trade opened or None when the book had no cash).
+    processed: list[tuple[Idea, IdeaOutcome, PaperTrade | None]] = field(default_factory=list)
     filled: int = 0
     invalidated: int = 0
     pending: int = 0  # still waiting for the session's open
@@ -1370,6 +1371,7 @@ def fill_ideas(
             "note": outcome.notes,
             "source": source,
         }
+        trade: PaperTrade | None = None
         if outcome.status == "open":
             rep.filled += 1
             try:
@@ -1393,7 +1395,7 @@ def fill_ideas(
                 )
         else:
             rep.invalidated += 1
-        rep.processed.append((idea, outcome))
+        rep.processed.append((idea, outcome, trade))
         rep.details[key] = entry
     return rep
 

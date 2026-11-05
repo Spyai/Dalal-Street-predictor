@@ -568,6 +568,8 @@ class IdeaDetailOut(IdeaOut):
     invalidation: str
     factors: FactorsOut
     paper_trade: PaperTradeOut | None
+    # Why a filled idea has no paper trade (the book had no cash left); None otherwise.
+    paper_note: str | None = None
     hash: str
     prev_hash: str
 
@@ -698,9 +700,24 @@ class IdeaOosOut(BaseModel):
     expectancy_after_costs_pct: float | None
     expectancy_ranked_pct: float | None
     expectancy_all_candidates_pct: float | None
+    # The replay that shows the best ideas every session, bar ignored (None for models
+    # trained before it was recorded).
+    hit_rate_top: float | None = None
+    n_top: int | None = None
+    expectancy_top_pct: float | None = None
     cost_round_trip_pct: float | None
     n_sessions: int | None
     embargo_sessions: int | None
+
+
+class IdeaLiftRowOut(BaseModel):
+    """One decile of out-of-sample P(target) within its session (1 = lowest, 10 = highest)."""
+
+    decile: int
+    n: int
+    p_mean: float | None
+    hit_rate: float | None
+    expectancy_pct: float | None
 
 
 class IdeaOosBaselineOut(BaseModel):
@@ -723,6 +740,7 @@ class IdeaChampionOut(BaseModel):
     baselines: list[IdeaOosBaselineOut]
     per_strategy: dict[str, dict[str, float | int | None]]
     calibration: list[CalibrationBinOut]
+    lift: list[IdeaLiftRowOut] = []
     class_frequencies: dict[str, float | None] | None
     notes: list[str]
     oos_verdict: str

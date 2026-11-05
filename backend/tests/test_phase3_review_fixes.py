@@ -22,7 +22,7 @@ from app.ml import ideas_models as im
 from app.ml.core import ENTRY_ZONE_ATR, HorizonSpec, TrainResult
 from app.ml.ideas_features import LABEL_COLUMNS, triple_barrier_labels
 from app.models import PaperTrade
-from app.services import paper
+from app.services import brief, paper
 from app.services.idea_grading import grade_idea, open_check_fill, session_bars
 from app.services.ledger import record_idea
 from tests.test_idea_grading import bars, quiet
@@ -238,3 +238,21 @@ def test_paper_book_never_borrows(db: Session) -> None:
     # Cash comes back when a position closes.
     paper.close_trade(db, t, SESSION + timedelta(days=1), 1040.0, now=NOW)
     assert paper.cash_as_of(db, SESSION + timedelta(days=1)) > 1_000_000.0
+
+
+# ------------------------------------------------------------ what the 09:20 note says
+
+
+def test_fill_summary_reports_the_paper_position_actually_taken(db: Session) -> None:
+    inst = make_instrument(db)
+    idea = record_idea(db, make_idea(inst.id, qty=1_500))
+    fill = open_check_fill(db, idea, 1000.0, now=OPEN_NOW, source="kite")
+    trade = paper.open_trade_for_idea(db, idea, fill, now=NOW)
+    assert trade is not None and trade.qty == 1_000
+    msg = brief.fill_summary([(idea, fill, trade)], SESSION)
+    assert "1000 shares paper (sized down from 1500: cash)" in msg and "1500 shares" not in msg
+    unfunded = brief.fill_summary([(idea, fill, None)], SESSION)
+    assert "no paper position: no cash left in the paper book" in unfunded
+    assert "shares paper" not in unfunded
+    # The two-tuple form (older callers) still states the idea's own size.
+    assert "1500 shares paper" in brief.fill_summary([(idea, fill)], SESSION)

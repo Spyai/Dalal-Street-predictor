@@ -27,7 +27,7 @@ from datetime import date
 from app.config import Settings, get_settings
 from app.ml import ranking
 from app.ml.core import horizons
-from app.models import Idea, IdeaOutcome, PaperEquity, Prediction, PredictionGrade
+from app.models import Idea, IdeaOutcome, PaperEquity, PaperTrade, Prediction, PredictionGrade
 from app.services.ideas_scorecard import IdeaTrack
 from app.services.scorecard import Scorecard, baseline_label
 
@@ -320,19 +320,37 @@ def equity_line(e: PaperEquity) -> str:
     return line
 
 
-def fill_summary(rows: Iterable[tuple[Idea, IdeaOutcome]], session: date) -> str:
+def fill_summary(
+    rows: Iterable[tuple[Idea, IdeaOutcome] | tuple[Idea, IdeaOutcome, PaperTrade | None]],
+    session: date,
+) -> str:
     """The 09:20 Telegram note: which ideas were filled at the open and which the gap
-    invalidated (brief §3)."""
+    invalidated (brief §3). A third element carries the paper trade actually opened: its
+    quantity is what the note states (sized down to the book's cash when it was), and None
+    means the book had no cash left, which the note says instead of inventing a position."""
     lines = [f"<b>Dalal open check — {_day(session)}</b>"]
     n = 0
-    for i, o in rows:
+    for row in rows:
+        i, o = row[0], row[1]
         n += 1
         if o.status == "open":
-            qty = i.position_qty
+            if len(row) > 2:
+                trade = row[2]
+                if trade is None:
+                    paper_text = "no paper position: no cash left in the paper book"
+                elif trade.qty < i.position_qty:
+                    paper_text = (
+                        f"{trade.qty} share{'' if trade.qty == 1 else 's'} paper "
+                        f"(sized down from {i.position_qty}: cash)"
+                    )
+                else:
+                    paper_text = f"{trade.qty} share{'' if trade.qty == 1 else 's'} paper"
+            else:
+                qty = i.position_qty
+                paper_text = f"{qty} share{'' if qty == 1 else 's'} paper"
             lines.append(
                 f"{_idea_head(i)}: <b>filled</b> at {_price(o.entry_price)} "
-                f"(zone {_price(i.entry_low)}–{_price(i.entry_high)}), "
-                f"{qty} share{'' if qty == 1 else 's'} paper"
+                f"(zone {_price(i.entry_low)}–{_price(i.entry_high)}), {paper_text}"
             )
         else:
             why = f": {_esc(o.notes)}" if o.notes else ""

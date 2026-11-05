@@ -805,6 +805,27 @@ def test_today_ideas_say_no_edge_only_when_the_engine_ran(
     assert ideas["note"].startswith("No edge today")
 
 
+def test_today_prefers_no_edge_over_a_previous_sessions_ideas(
+    db: Session, logged_in: TestClient
+) -> None:
+    session = _current_session(db)
+    previous = session - timedelta(days=7)
+    db.add_all([_ideas_champion("swing"), _ideas_champion("positional")])
+    db.commit()
+    _record_call(db, "NIFTY 50", session=previous)
+    _record_idea(db, "RELIANCE", "swing", previous, rank=1)
+    # The 07:30 run has not happened for this session: the last session's ideas, marked.
+    ideas = logged_in.get("/api/today").json()["ideas"]
+    assert ideas["is_previous"] is True and ideas["session"] == previous.isoformat()
+    assert ideas["n_ideas"] == 1
+    # It has run (the call is recorded) and found nothing: "No edge today", never a stale list.
+    _record_call(db, "NIFTY 50", session=session)
+    ideas = logged_in.get("/api/today").json()["ideas"]
+    assert ideas["is_previous"] is False and ideas["session"] == session.isoformat()
+    assert ideas["n_ideas"] == 0 and all(g["no_edge"] is True for g in ideas["by_horizon"])
+    assert ideas["note"].startswith("No edge today")
+
+
 def test_today_shows_the_sessions_ideas_with_track_record_and_surveillance(
     db: Session, logged_in: TestClient
 ) -> None:

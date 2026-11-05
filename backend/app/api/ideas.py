@@ -447,12 +447,19 @@ def idea_detail(
     i, o = row
     [base] = ideas_out(db, [(i, o)], s)
     trade = paper.trade_for_idea(db, i)
+    paper_note = None
+    if trade is None and o is not None and o.entry_price is not None and o.status != "void":
+        paper_note = (
+            "Filled, but the paper book had no cash left that day: no paper position was "
+            "opened (the idea is still graded against its levels)."
+        )
     return IdeaDetailOut(
         **base.model_dump(),
         reasons=[str(r) for r in (i.reasons or [])],
         invalidation=i.invalidation,
         factors=idea_factors(i, s),
         paper_trade=PaperTradeOut.model_validate(paper.trade_dict(trade)) if trade else None,
+        paper_note=paper_note,
         hash=i.hash,
         prev_hash=i.prev_hash,
     )

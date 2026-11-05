@@ -254,12 +254,16 @@ def today_ideas(
     shown = session
     is_previous = False
     rows = ideas_for(db, session)
-    if not rows:
+    ran = call_recorded(db, session, settings)
+    if not rows and not ran:
+        # The 07:30 run has not happened for this session: show the last session's ideas,
+        # clearly marked. Once it has run, an empty session means "No edge today" and the
+        # previous session's ideas are never shown in its place.
         previous = latest_ideas_session(db, today)
         if previous is not None:
             shown, is_previous, rows = previous, True, ideas_for(db, previous)
+            ran = call_recorded(db, shown, settings)
     outs: list[IdeaOut] = ideas_out(db, rows, settings, is_previous=is_previous)
-    ran = call_recorded(db, shown, settings)
     groups: list[HorizonIdeasOut] = []
     any_model = False
     for name, spec in horizons(settings).items():

@@ -270,6 +270,7 @@ export interface IdeaDetail extends Idea {
   invalidation: string;
   factors: Factors;
   paper_trade: PaperTrade | null;
+  paper_note: string | null; // why a filled idea has no paper trade (no cash that day)
   hash: string;
   prev_hash: string;
 }

@@ -280,7 +280,8 @@ function IdeaTable({
               <td className="py-1.5 text-right whitespace-nowrap">
                 {fmtProb(i.p_target)}
                 <span className={`ml-1 ${i.track.sample_warning ? "text-warn" : "text-muted"}`}>
-                  · {i.track.n_graded > 0 ? fmtProb(i.track.hit_rate) : "—"} (n={i.track.n_graded})
+                  · {i.track.n_graded > 0 ? fmtProb(i.track.hit_rate) : "—"} (n={i.track.n_graded}
+                  {i.track.sample_warning ? ", unproven" : ""})
                 </span>
               </td>
               <td className={`py-1.5 text-right ${tone(i.ev_pct_after_costs)}`}>
@@ -390,7 +391,7 @@ function IdeaDetailView({ idea }: { idea: IdeaDetail }) {
       />
 
       <OutcomeBox idea={idea} />
-      <PaperTradeBox trade={idea.paper_trade} />
+      <PaperTradeBox trade={idea.paper_trade} note={idea.paper_note} />
 
       {idea.note && <p className="text-xs text-muted">Note: {idea.note}</p>}
       <p className="break-all text-[11px] text-faint">
@@ -442,7 +443,7 @@ function OutcomeBox({ idea }: { idea: IdeaDetail }) {
   );
 }
 
-function PaperTradeBox({ trade }: { trade: PaperTrade | null }) {
+function PaperTradeBox({ trade, note }: { trade: PaperTrade | null; note: string | null }) {
   return (
     <div className="rounded-md border border-line p-3">
       <div className="mb-1 flex items-center justify-between">
@@ -452,8 +453,8 @@ function PaperTradeBox({ trade }: { trade: PaperTrade | null }) {
         </Link>
       </div>
       {!trade ? (
-        <p className="text-xs text-muted">
-          No paper trade: one is opened when the idea is filled at the open (never a real order).
+        <p className={`text-xs ${note ? "text-warn" : "text-muted"}`}>
+          {note ?? "No paper trade: one is opened when the idea is filled at the open (never a real order)."}
         </p>
       ) : (
         <dl className="num grid grid-cols-2 gap-x-4 gap-y-1 text-sm">
